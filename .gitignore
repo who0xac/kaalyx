@@ -1,0 +1,48 @@
+# --- Kaalyx runtime output ---
+# Default scan output lives on the user's Desktop (<Desktop>/kaalyx-results/), but guard
+# against it ever landing inside the repo — via the Desktop-absent fallback, or a
+# repo-relative output_dir in config.yaml. Ignore the folder anywhere in the tree, plus
+# every raw artifact type a scan can produce.
+results/
+kaalyx-results/
+**/kaalyx-results/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+checkpoints/
+**/checkpoints/
+kaalyx.log
+**/kaalyx.log
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Local tooling (not part of the project) ---
+.claude/
+
+# --- Internal project notes (not for the public repo) ---
+PROJECT_MEMORY.md

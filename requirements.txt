@@ -1,0 +1,21 @@
+# Kaalyx — Python dependencies
+# Core stack (see PROJECT_MEMORY.md §2). asyncio & sqlite3 are stdlib.
+
+# --- Terminal UI ---
+rich>=13.7,<14
+
+# --- CLI ---
+typer>=0.12,<1.0
+
+# --- Config & secrets ---
+PyYAML>=6.0,<7.0
+python-dotenv>=1.0,<2.0
+
+# --- Web dashboard ---
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+jinja2>=3.1,<4.0
+python-multipart>=0.0.9        # FastAPI form / HTMX POST handling
+
+# --- HTTP (used by a handful of parsers/sources: crt.sh, ipinfo, breach lookups) ---
+httpx>=0.27,<1.0

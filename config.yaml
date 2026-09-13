@@ -1,0 +1,108 @@
+# Kaalyx configuration (settings only — secrets live in .env).
+# Every value here has a code-side default; this file overrides those.
+# CLI flags override this file. Precedence: CLI > config.yaml > built-in defaults.
+
+# --- General ---
+general:
+  # Root output directory. Leave blank to use the sensible default:
+  #   <Desktop>/kaalyx-results   (falls back to ~/kaalyx-results on headless boxes).
+  # Everything for a scan lives under <output_dir>/<domain>/ :
+  #   - raw per-stage .txt files    (<output_dir>/<domain>/<stage>/*.txt)
+  #   - that scan's SQLite database (<output_dir>/<domain>/kaalyx.db)
+  #   - its checkpoint              (<output_dir>/<domain>/checkpoints/)
+  # The DB is per-domain (not one global file) so re-scanning a target can diff against
+  # its own history while still living inside that domain's folder.
+  output_dir: ""
+
+  # Advanced overrides — normally leave blank (derived from output_dir above). Set an
+  # absolute path here only if you want to pin one of these somewhere specific.
+  results_dir: ""
+  database_path: ""
+  checkpoint_dir: ""
+
+# --- Concurrency & resource limits ---
+concurrency:
+  # Max tools running as subprocesses at once, globally.
+  max_parallel_tools: 8
+  # Max concurrent DNS-heavy resolves (puredns/dnsx) — tune to your resolver.
+  max_parallel_dns: 4
+  # Default per-tool timeout in seconds (0 = no timeout). Individual tools can
+  # override this in the tool registry.
+  default_tool_timeout: 900
+
+# --- Adaptive rate limiting (Part 6) ---
+rate_limit:
+  # URLs/requests processed per chunk before re-evaluating pace.
+  chunk_size: 50
+  # Multiplier applied to the delay of the NEXT chunk when 429/503 seen.
+  backoff_factor: 2.0
+  # Ceiling on inter-request delay (seconds) after backoff.
+  max_delay_seconds: 30
+  # How many genuine retry attempts before an item is logged as unresolved.
+  max_retries: 3
+
+# --- Optional / opt-in scan behaviours (all OFF by default; CLI flags flip them) ---
+scan:
+  full_nmap: false      # deep -p- -A -O nmap (auto-skipped on CDN-fronted IPs)
+  brutespray: false     # password spraying
+  ipv6: false           # also scan IPv6 targets
+  sqlmap: false         # sqlmap SQLi (nuclei -tags sqli always runs regardless)
+
+# --- Notifications ---
+telegram:
+  enabled: true         # if token/chat id missing in .env, auto-disabled at runtime
+  # Only critical/high findings trigger immediate alerts; info/low are saved silently.
+  alert_min_severity: high
+
+# --- Web dashboard ---
+web:
+  host: 127.0.0.1
+  port: 8787
+
+# --- OSINT sub-check toggles (Part 1) ---
+# Every OSINT source can be disabled here or via a --no-<source> CLI flag (CLI wins).
+# Sources whose external tool or API key is absent skip themselves regardless.
+osint:
+  whois: true
+  dns: true                    # dnsx DNS records
+  mail_dns: true               # SPF/DMARC/CAA/BIMI/MTA-STS/TLS-RPT
+  m365: true                   # Microsoft 365 / Entra tenant mapping
+  email_harvest: true          # keyless (email-format.com, skymem.info)
+  breach_lookup: true          # h8mail enrichment (needs key; else skips)
+  github_subdomains: true
+  trufflehog: true             # GitHub org secret scan (needs GITHUB_TOKEN)
+  cloud_enum: true
+  s3scanner: true
+  badsecrets: true
+  retirejs: true
+  theharvester: true           # emails/employees/hosts (external tool)
+  third_party_misconfig: true  # misconfig-mapper (external tool)
+  api_leaks: true              # porch-pirate (Postman) + SwaggerSpy (external tools)
+  exposed_git: true            # in-process /.git/config detection (keyless)
+  github_actions: true         # gato — GitHub Actions audit (needs GITHUB_TOKEN)
+  google_dorks: true           # dork URL generation (no scraping)
+
+# --- Interesting-subdomain auto-flagging (Part 6) ---
+flagging:
+  # Substrings that mark a subdomain as "interesting" (case-insensitive).
+  interesting_keywords:
+    - dev
+    - staging
+    - stage
+    - test
+    - qa
+    - uat
+    - admin
+    - internal
+    - intranet
+    - vpn
+    - jenkins
+    - gitlab
+    - jira
+    - api
+    - beta
+    - demo
+    - backup
+    - old
+    - legacy
+    - portal

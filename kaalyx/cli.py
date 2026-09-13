@@ -33,6 +33,10 @@ from .stages.osint import OsintStage
 app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
+    # Accept both -h and --help at the root AND on every subcommand. Typer/Click use each
+    # command's own context_settings for its help option, so this is set here on the app
+    # (which the root group uses) and again on each @app.command via _HELP_CTX below.
+    context_settings={"help_option_names": ["-h", "--help"]},
     help=(
         "[bold cyan]Kaalyx[/] — automated bug-bounty recon & vulnerability-discovery pipeline.\n\n"
         "Run [bold]kaalyx scan <domain>[/] to start. Use [bold]kaalyx osint-sources[/] to list "
@@ -43,10 +47,21 @@ app = typer.Typer(
 console = get_console()
 logger = get_logger("cli")
 
+# Every subcommand gets this so `-h` works identically to `--help` at every level
+# (Click does not propagate the group's help_option_names to subcommands).
+_HELP_CTX = {"help_option_names": ["-h", "--help"]}
+
 
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"Kaalyx {__version__}")
+        raise typer.Exit()
+
+
+def _update_callback(value: bool) -> None:
+    if value:
+        setup_logging()
+        _do_update()
         raise typer.Exit()
 
 
@@ -62,6 +77,10 @@ def main(
     _version: bool = typer.Option(
         False, "--version", "-V", callback=_version_callback, is_eager=True,
         help="Show version and exit.",
+    ),
+    _update: bool = typer.Option(
+        False, "--update", "-u", callback=_update_callback, is_eager=True,
+        help="Update Kaalyx to the latest version from GitHub and exit.",
     ),
 ) -> None:
     """Automated bug-bounty reconnaissance & vulnerability-discovery pipeline.
@@ -303,7 +322,7 @@ def _run_scan(
         )
 
 
-@app.command(rich_help_panel="Pipeline")
+@app.command(rich_help_panel="Pipeline", context_settings=_HELP_CTX)
 def scan(
     positional_target: Optional[str] = typer.Argument(
         None, metavar="[TARGET]",
@@ -464,7 +483,7 @@ def scan(
     )
 
 
-@app.command()
+@app.command(context_settings=_HELP_CTX)
 def resume(
     target: str = typer.Argument(..., help="Target of the scan to resume."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
@@ -498,7 +517,7 @@ _OSINT_SOURCE_INFO: dict[str, tuple[str, str, str]] = {
 }
 
 
-@app.command(name="osint-sources", rich_help_panel="Info")
+@app.command(name="osint-sources", rich_help_panel="Info", context_settings=_HELP_CTX)
 def osint_sources() -> None:
     """List every OSINT sub-check and how to enable/disable it.
 
@@ -524,16 +543,89 @@ def osint_sources() -> None:
     )
 
 
-@app.command(rich_help_panel="Info")
+@app.command(rich_help_panel="Info", context_settings=_HELP_CTX)
 def tools(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
+    install: bool = typer.Option(
+        False, "--install", "-i",
+        help="After reporting, install missing tools via scripts/install.sh.",
+    ),
+    check_only: bool = typer.Option(
+        False, "--check-only",
+        help="Report status only and exit (explicit alias for the default).",
+    ),
+    osint: bool = typer.Option(False, "--osint", help="With --install: OSINT-phase tools only."),
+    subdomains: bool = typer.Option(False, "--subdomains", help="With --install: Subdomains-phase tools only."),
+    hosts: bool = typer.Option(False, "--hosts", help="With --install: Hosts-phase tools only."),
+    web_phase: bool = typer.Option(False, "--web", help="With --install: Web-phase tools only."),
+    vuln: bool = typer.Option(False, "--vuln", help="With --install: Vuln-phase tools only."),
 ) -> None:
-    """Pre-flight check: report which external tools are available on PATH."""
+    """Report which external tools are on PATH, and optionally install the missing ones.
+
+    [bold]kaalyx tools[/]                    report status (default).
+    [bold]kaalyx tools --check-only[/]       same as default, stated explicitly.
+    [bold]kaalyx tools --install[/]          report, then install everything missing.
+    [bold]kaalyx tools --install --osint[/]  install only the OSINT-phase tools.
+
+    Installation is delegated to [bold]scripts/install.sh[/] (apt/pacman; Linux/Kali/Arch),
+    so there is one source of truth for how each tool is installed.
+    """
     setup_logging()
     load_config(config)  # validate the config file even though its values aren't used here
 
+    # Which phase to (optionally) install. Multiple phase flags are not combined — pick one.
+    phase_flags = [
+        ("osint", osint), ("subdomains", subdomains), ("hosts", hosts),
+        ("web", web_phase), ("vuln", vuln),
+    ]
+    selected = [name for name, on in phase_flags if on]
+    if len(selected) > 1:
+        console.print(
+            f"[red]Pick a single phase for --install[/] (got: {', '.join(selected)})."
+        )
+        raise typer.Exit(code=2)
+    phase = selected[0] if selected else "all"
+
+    _report_tool_status(phase if selected else None)
+
+    missing = [s.key for s in tool_registry.missing_tools()]
+    if not missing:
+        console.print("[green]All registered tools are available.[/]")
+        return
+
+    if check_only or not install:
+        console.print(
+            f"[yellow]{len(missing)} tool(s) not found on PATH:[/] {', '.join(missing)}"
+        )
+        console.print(
+            "Kaalyx skips missing tools gracefully. Run [bold]kaalyx tools --install[/] "
+            "to install them (or [bold]--install --osint[/] for just one phase)."
+        )
+        return
+
+    # --install: delegate to scripts/install.sh for the chosen phase.
+    from .core import installer
+
+    label = "all phases" if phase == "all" else f"the {phase} phase"
+    console.print(f"\n[cyan]Installing missing tools for {label} via scripts/install.sh…[/]")
+    code = installer.run_install(phase)
+    if code == 0:
+        console.print("[green]Installer finished. Re-run 'kaalyx tools' to confirm.[/]")
+    else:
+        console.print(
+            f"[yellow]Installer exited with code {code}.[/] "
+            "See the messages above; you can also run scripts/install.sh manually."
+        )
+        raise typer.Exit(code=code)
+
+
+def _report_tool_status(phase: Optional[str]) -> None:
+    """Print the tool-availability table, optionally filtered to one pipeline phase."""
     report = tool_registry.availability_report()
-    table = Table(title="Kaalyx external tool availability")
+    title = "Kaalyx external tool availability"
+    if phase:
+        title += f"  ({phase} phase)"
+    table = Table(title=title)
     table.add_column("Tool", style="cyan")
     table.add_column("Part")
     table.add_column("On PATH")
@@ -541,24 +633,14 @@ def tools(
     for key, available in sorted(report.items()):
         spec = tool_registry.get(key)
         assert spec is not None
+        if phase and spec.part.value != phase:
+            continue
         status = "[green]yes[/]" if available else "[red]no[/]"
-        key_note = spec.requires_secret or ""
-        table.add_row(key, spec.part.value, status, key_note)
+        table.add_row(key, spec.part.value, status, spec.requires_secret or "")
     console.print(table)
 
-    missing = [s.key for s in tool_registry.missing_tools()]
-    if missing:
-        console.print(
-            f"[yellow]{len(missing)} tool(s) not found on PATH:[/] {', '.join(missing)}"
-        )
-        console.print(
-            "Kaalyx will skip missing tools gracefully; install the ones you need."
-        )
-    else:
-        console.print("[green]All registered tools are available.[/]")
 
-
-@app.command()
+@app.command(context_settings=_HELP_CTX)
 def web(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
@@ -568,6 +650,52 @@ def web(
         "It will serve the SQLite results at the configured host/port."
     )
     raise typer.Exit(code=1)
+
+
+def _do_update() -> None:
+    """Check GitHub for a newer Kaalyx and, if found, reinstall via pipx.
+
+    Shared by both `kaalyx update` and the root `-u/--update` flag.
+    """
+    from .core import updater
+
+    current = updater.current_version()
+    console.print(f"Current version : [cyan]Kaalyx {current}[/]")
+    console.print(f"Repository      : {updater.REPO_URL} (branch: {updater.BRANCH})")
+
+    latest = updater.latest_remote_commit()
+    if latest is None:
+        console.print(
+            "[yellow]Could not check the latest version on GitHub[/] "
+            "(no network, or the API was unreachable). Try again later."
+        )
+        raise typer.Exit(code=1)
+
+    sha, date = latest
+    console.print(f"Latest on GitHub: [cyan]commit {sha}[/]" + (f"  ({date})" if date else ""))
+
+    # Without version tags we can't cheaply prove local==latest, so updating always pulls
+    # the newest main. pipx --force is idempotent: on an up-to-date install it simply
+    # rebuilds the same code. Be explicit about that rather than falsely claiming "newer".
+    console.print("\n[cyan]Updating to the latest main via pipx…[/]")
+    code = updater.reinstall_from_repo()
+    if code == 0:
+        console.print(
+            f"[green]✔ Update complete.[/] Kaalyx now reflects GitHub commit {sha}. "
+            "Run [bold]kaalyx --version[/] to confirm."
+        )
+    else:
+        console.print(
+            f"[yellow]Update did not complete (exit {code}).[/] See the messages above."
+        )
+        raise typer.Exit(code=code)
+
+
+@app.command(rich_help_panel="Info", context_settings=_HELP_CTX)
+def update() -> None:
+    """Update Kaalyx to the latest version from GitHub (reinstalls via pipx)."""
+    setup_logging()
+    _do_update()
 
 
 def run() -> None:

@@ -42,6 +42,9 @@ _THEME = Theme(
 _console: Console | None = None
 _LOGGER_NAME = "kaalyx"
 _console_level: int = logging.INFO  # remembered so we can restore after a Live board
+# Console handler temporarily detached while a rich.Live board owns the screen (see
+# set_console_logging); held here so it can be re-attached, not lost.
+_detached_console_handler: logging.Handler | None = None
 
 
 def _ensure_utf8_streams() -> None:
@@ -110,11 +113,27 @@ def set_console_logging(enabled: bool) -> None:
 
     Used to silence interleaved log lines while a ``rich.Live`` board owns the screen —
     the rotating file log keeps capturing everything regardless.
+
+    Disabling DETACHES the console handler entirely (not merely raises its level): a handler
+    left attached at CRITICAL+1 still lets a genuine CRITICAL record slip through, and any
+    console write while a non-transient ``rich.Live`` is active makes Live checkpoint the
+    current frame permanently and start a fresh board below — which is exactly the
+    "board printed twice" bug. Full detach guarantees nothing reaches the shared console
+    while the board owns it. Re-enabling re-attaches the same handler object.
     """
+    global _detached_console_handler
     logger = logging.getLogger(_LOGGER_NAME)
-    for handler in logger.handlers:
-        if getattr(handler, "_kaalyx_console", False):
-            handler.setLevel(_console_level if enabled else logging.CRITICAL + 1)
+    if enabled:
+        # Re-attach a previously-detached handler (if any and not already present).
+        h = _detached_console_handler
+        if h is not None and h not in logger.handlers:
+            logger.addHandler(h)
+        _detached_console_handler = None
+    else:
+        for handler in list(logger.handlers):
+            if getattr(handler, "_kaalyx_console", False):
+                _detached_console_handler = handler
+                logger.removeHandler(handler)
 
 
 def attach_file_handler(log_path: Path) -> None:

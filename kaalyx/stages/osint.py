@@ -228,9 +228,14 @@ class OsintStage(Stage):
 
         source_states = [(r.name, _state(r), r.total, r.note) for r in results]
         duration = sum(r.duration_s for r in results)
+        # Verified/unverified split — for credential findings (TruffleHog live-tests each
+        # secret), 'confirmed' means the secret actually authenticated; everything else is a
+        # pattern match not yet validated. Surfaced so a big org scan's real hits stand out.
+        verified = sum(1 for r in finding_rows if (r["confidence"] or "").lower() == "confirmed")
+        verified_counts = {"verified": verified, "unverified": len(finding_rows) - verified}
         console.print()
         console.print(osint_ui.summary_panel(
-            ctx.domain, counts, sev_counts, source_states, duration
+            ctx.domain, counts, sev_counts, source_states, duration, verified_counts
         ))
 
     def _write_osint_files(self, records: list[OsintRecord]) -> None:

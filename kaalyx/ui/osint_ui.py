@@ -28,6 +28,23 @@ from rich.text import Text
 from ..core.logging import get_console
 from . import ACCENT, ACCENT_DIM, MUTED, severity_style
 
+
+def format_duration(seconds: float) -> str:
+    """Human duration: plain seconds below 60s (``4.2s``), MM:SS at/above 60s (``2:16``).
+
+    Used everywhere elapsed time is shown — per-source rows, the board header, and the final
+    summary panel — so the format is consistent. At/above an hour it rolls to H:MM:SS.
+    """
+    secs = max(0.0, seconds)
+    if secs < 60:
+        return f"{secs:0.1f}s"
+    total = int(round(secs))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
 # The OSINT phase header: a fixed double-line box drawn by hand so it renders identically
 # on every terminal, regardless of font metrics.
 _HEADER_LINES = [
@@ -124,8 +141,7 @@ class OsintProgress:
         if st.started <= 0:
             return ""
         end = st.finished if st.finished > 0 else now
-        secs = max(0.0, end - st.started)
-        return f"{secs:0.1f}s"
+        return format_duration(max(0.0, end - st.started))
 
     def _render(self):
         table = Table.grid(padding=(0, 1))
@@ -164,7 +180,7 @@ class OsintProgress:
         header = Text.assemble(
             ("running OSINT sources  ", "bold white"),
             (f"{done}/{len(self._states)}", ACCENT),
-            (f"   {elapsed:0.1f}s", MUTED),
+            (f"   {format_duration(elapsed)}", MUTED),
         )
         return Panel(table, title=header, title_align="left",
                      border_style=ACCENT_DIM, box=ROUNDED, padding=(0, 1))
@@ -189,6 +205,12 @@ class OsintProgress:
             refresh_per_second=12,
             auto_refresh=True,
             transient=False,
+            # Capture any stray stdout/stderr write (a library print/warning during the
+            # fan-out) so it can't make the non-transient board checkpoint and reprint as a
+            # duplicate. The console log handler is fully detached separately; this covers
+            # anything that bypasses logging.
+            redirect_stdout=True,
+            redirect_stderr=True,
         )
         return self._live
 
@@ -266,6 +288,7 @@ def findings_table(rows: list, limit: int = 25) -> Table | None:
     table = Table(title="Findings", box=ROUNDED, border_style=ACCENT_DIM,
                   title_style=f"bold {ACCENT}", header_style="bold white")
     table.add_column("Sev", width=9)
+    table.add_column("Verified", width=10, justify="center")
     table.add_column("Category", style="magenta")
     table.add_column("Title", style="white", overflow="fold")
     table.add_column("Target", style=MUTED, overflow="fold")
@@ -273,9 +296,34 @@ def findings_table(rows: list, limit: int = 25) -> Table | None:
         sev = r["severity"]
         table.add_row(
             Text(sev.upper(), style=severity_style(sev)),
+            _verified_cell(r),
             r["category"], r["title"], r["target"],
         )
     return table
+
+
+def _verified_cell(row) -> "Text":
+    """Verified indicator for a finding, from its confidence.
+
+    For tools that actively validate a credential (TruffleHog live-tests each secret against
+    its service, badsecrets/h8mail-recovered creds), ``confidence == confirmed`` means the
+    finding was VERIFIED — the secret actually authenticates / the value was recovered. Lower
+    confidence means unverified (pattern match only, not live-tested). Making this an explicit
+    column lets the user separate the ~real from the noise at a glance rather than trusting the
+    row blindly.
+    """
+    try:
+        conf = row["confidence"]
+    except (KeyError, IndexError, TypeError):
+        conf = "unknown"
+    conf = (conf or "unknown").lower()
+    if conf == "confirmed":
+        return Text("✔ verified", style="bold green")
+    if conf == "firm":
+        return Text("~ firm", style="yellow")
+    if conf in ("tentative", "unknown"):
+        return Text("unverified", style=MUTED)
+    return Text(conf, style=MUTED)
 
 
 # --- Summary panel ----------------------------------------------------------------------
@@ -287,6 +335,7 @@ def summary_panel(
     sev_counts: dict[str, int],
     source_states: list[tuple[str, str, int, str]],
     duration_s: float,
+    verified_counts: dict[str, int] | None = None,
 ) -> Panel:
     """Build the bordered end-of-phase summary panel.
 
@@ -296,6 +345,7 @@ def summary_panel(
         sev_counts: findings by severity.
         source_states: list of (name, state, items, note) for the per-source roll-up.
         duration_s: how long the stage took.
+        verified_counts: optional {verified, unverified} finding split (TruffleHog etc.).
     """
     # Left: headline numbers.
     numbers = Table.grid(padding=(0, 2))
@@ -334,6 +384,15 @@ def summary_panel(
         Text(""),
         Text("findings:", style="bold white"),
         sev_line,
+    ]
+    # Verified/unverified split — makes a big credential scan's real hits legible at a glance.
+    if verified_counts and (verified_counts.get("verified") or verified_counts.get("unverified")):
+        v, u = verified_counts.get("verified", 0), verified_counts.get("unverified", 0)
+        body_parts.append(Text.assemble(
+            (f"{v} verified", "bold green" if v else MUTED), ("  ", ""),
+            (f"{u} unverified", "yellow" if u else MUTED),
+        ))
+    body_parts += [
         Text(""),
         Text("sources:", style="bold white"),
         rollup,
@@ -344,7 +403,7 @@ def summary_panel(
 
     title = Text.assemble(
         ("✔ OSINT complete", "bold green"), ("   ", ""),
-        (domain, f"bold {ACCENT}"), ("   ", ""), (f"{duration_s:0.1f}s", MUTED),
+        (domain, f"bold {ACCENT}"), ("   ", ""), (format_duration(duration_s), MUTED),
     )
     return Panel(body, title=title, title_align="left", border_style="green",
                  box=HEAVY, padding=(1, 2))

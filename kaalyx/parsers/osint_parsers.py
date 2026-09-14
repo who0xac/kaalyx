@@ -23,6 +23,67 @@ from ..data.models import (
 )
 
 
+def _target_labels(target: str) -> tuple[str, str]:
+    """Return ``(registrable, base_label)`` for *target*, both lower-cased.
+
+    e.g. ``"Stripe.com"`` -> ``("stripe.com", "stripe")``. Empty target yields ``("", "")``.
+    """
+    t = (target or "").strip().lower().strip(".")
+    if not t:
+        return "", ""
+    base = t.split(".")[0]
+    return t, base
+
+
+def assess_target_relevance(text: str, target: str) -> str:
+    """How strongly a discovered artifact (bucket name, URL, workspace text) ties to *target*.
+
+    Keyword-seeded sources (cloud_enum, s3scanner, porch-pirate, SwaggerSpy) are fed the
+    target's *name* and match on it, so a hit can be a generic-word over-match rather than a
+    genuinely target-owned resource — the same class of risk as the GitHub-org bug, just
+    milder. This grades that tie so callers can verify where possible and, where not, mark the
+    finding as keyword-match rather than presenting it like an exact-match source (whois/dnsx):
+
+      * ``"direct"``  — text contains the full registrable domain (``stripe.com``) or a
+        subdomain of it (``x.stripe.com``). Strong tie to the target; keep confidence as-is.
+      * ``"keyword"`` — text contains only the bare base label (``stripe``) but not the full
+        domain. Plausible but unverified; downgrade + flag.
+      * ``"none"``    — no visible tie at all (tool matched something for the seed keyword).
+        Weakest; downgrade + flag most explicitly.
+    """
+    reg, base = _target_labels(target)
+    low = (text or "").lower()
+    if not reg or not low:
+        return "none"
+    # Full-domain mention: as a bare domain, or as the host part of a subdomain. Word-ish
+    # boundaries so "notstripe.com" doesn't count as stripe.com.
+    if re.search(r"(?:^|[^a-z0-9.-])(?:[a-z0-9-]+\.)*" + re.escape(reg) + r"(?:[^a-z0-9.-]|$)", low):
+        return "direct"
+    if base and re.search(r"(?:^|[^a-z0-9])" + re.escape(base) + r"(?:[^a-z0-9]|$)", low):
+        return "keyword"
+    return "none"
+
+
+# Confidence must never exceed TENTATIVE for a keyword/none-relevance finding — it isn't
+# verified as target-owned. Callers pass their intended confidence and get it capped.
+def _cap_for_relevance(intended: Confidence, relevance: str) -> Confidence:
+    if relevance == "direct":
+        return intended
+    return Confidence.TENTATIVE
+
+
+def _relevance_note(relevance: str, target: str) -> str:
+    """Human-readable caveat appended to a keyword-seeded finding's description."""
+    reg, _ = _target_labels(target)
+    if relevance == "direct":
+        return ""
+    if relevance == "keyword":
+        return (f" [keyword-match: name resembles '{reg}' but the resource does not "
+                f"reference {reg} directly — verify it is target-owned]")
+    return (f" [keyword-match only: matched the search seed for '{reg}' but shows no direct "
+            f"reference to {reg} — verify it is target-owned]")
+
+
 def parse_dnsx(stdout: str, source: str = "dnsx") -> list[OsintRecord]:
     """Parse ``dnsx -json`` output into DNS OSINT records.
 
@@ -154,11 +215,20 @@ def parse_trufflehog(
     return findings
 
 
-def parse_s3scanner(stdout: str, source: str = "s3scanner") -> list[Finding]:
+def parse_s3scanner(stdout: str, source: str = "s3scanner",
+                    target: str = "") -> list[Finding]:
     """Parse s3scanner output into bucket findings.
 
     s3scanner prints lines describing bucket existence/permissions. We flag buckets that
     are reported as existing and (especially) open/listable.
+
+    Buckets are found by brute-forcing keyword variants of the target name, so a matched
+    bucket may not actually belong to the target. When *target* is given we grade the bucket
+    line's tie to it (:func:`assess_target_relevance`): a bucket name that only matches the
+    base keyword — the common case, since bucket names rarely contain a full domain — is
+    capped at TENTATIVE and flagged as a keyword match, so an unverified bucket is never
+    presented with exact-match confidence. (Nothing is dropped: a bucket named ``stripe-prod``
+    may well be the target's, so we keep it and flag it rather than lose a real finding.)
     """
     findings: list[Finding] = []
     seen: set[str] = set()
@@ -180,15 +250,19 @@ def parse_s3scanner(stdout: str, source: str = "s3scanner") -> list[Finding]:
             continue
         seen.add(text)
         open_bucket = any(k in low for k in ("open", "public", "listable", "read", "write"))
+        relevance = assess_target_relevance(text, target) if target else "direct"
+        confidence = _cap_for_relevance(
+            Confidence.FIRM if open_bucket else Confidence.TENTATIVE, relevance)
         findings.append(
             Finding(
                 title="S3 bucket exposure" if open_bucket else "S3 bucket discovered",
                 category="cloud",
                 severity=Severity.HIGH if open_bucket else Severity.INFO,
-                confidence=Confidence.FIRM if open_bucket else Confidence.TENTATIVE,
+                confidence=confidence,
                 target=text[:200],
                 tool=source,
-                description="s3scanner reported this bucket.",
+                description="s3scanner reported this bucket."
+                            + _relevance_note(relevance, target),
                 evidence=text[:300],
                 raw=text[:500],
             )
@@ -270,12 +344,19 @@ def parse_retirejs(stdout: str, source: str = "retirejs") -> list[Finding]:
     return findings
 
 
-def parse_cloud_enum(stdout: str, source: str = "cloud_enum") -> list[Finding]:
+def parse_cloud_enum(stdout: str, source: str = "cloud_enum",
+                     target: str = "") -> list[Finding]:
     """Parse cloud_enum output into one finding per discovered cloud resource.
 
     cloud_enum prints ``[+] ...`` for genuine finds and a lot of progress/status text. The
     reliable signal for a real resource is a URL on the line, so we only create a finding
     from a ``[+]`` line that contains a URL, dedup by that URL, and skip progress/negatives.
+
+    cloud_enum is seeded with the target's name, so a hit can be a generic-word over-match.
+    When *target* is given we grade each resource's tie to it (:func:`assess_target_relevance`
+    on the resource URL): a URL that references the target domain keeps its confidence; one
+    that only matches the base keyword is capped at TENTATIVE and flagged, so it is never
+    presented with the same confidence as an exact-match source.
     """
     findings: list[Finding] = []
     seen: set[str] = set()
@@ -295,15 +376,19 @@ def parse_cloud_enum(stdout: str, source: str = "cloud_enum") -> list[Finding]:
             continue
         seen.add(url)
         open_res = "open" in low or "public" in low
+        relevance = assess_target_relevance(url, target) if target else "direct"
+        confidence = _cap_for_relevance(
+            Confidence.FIRM if open_res else Confidence.TENTATIVE, relevance)
         findings.append(
             Finding(
                 title="Open cloud resource" if open_res else "Cloud resource discovered",
                 category="cloud",
                 severity=Severity.MEDIUM if open_res else Severity.INFO,
-                confidence=Confidence.FIRM if open_res else Confidence.TENTATIVE,
+                confidence=confidence,
                 target=url[:200],
                 tool=source,
-                description="cloud_enum reported this cloud resource.",
+                description="cloud_enum reported this cloud resource."
+                            + _relevance_note(relevance, target),
                 evidence=text[:300],
                 raw=text[:500],
             )
@@ -460,7 +545,8 @@ def parse_misconfig_mapper(stdout: str, source: str = "misconfig-mapper") -> lis
     return findings
 
 
-def parse_porch_pirate(stdout: str, source: str = "porch-pirate") -> list[Finding]:
+def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
+                       target: str = "") -> list[Finding]:
     """Parse porch-pirate ``--raw`` JSON into ONE finding per public Postman workspace.
 
     Run with ``--raw``, porch-pirate emits JSON describing the public Postman workspaces /
@@ -504,28 +590,43 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate") -> list[Findin
         # Heuristic: does the structured data hint at embedded credentials?
         blob = json.dumps(ws).lower() if isinstance(ws, dict) else str(ws).lower()
         leaky = any(k in blob for k in ("apikey", "api_key", "token", "secret", "bearer", "authorization", "password"))
+        # porch-pirate searches Postman for the target *name*, so a workspace may be an
+        # unrelated match. Grade the whole workspace blob's tie to the target: one that
+        # references the target domain keeps its confidence; a bare name match is capped at
+        # TENTATIVE and flagged, so it isn't presented like a verified target-owned leak.
+        relevance = assess_target_relevance(blob, target) if target else "direct"
+        confidence = _cap_for_relevance(
+            Confidence.FIRM if leaky else Confidence.TENTATIVE, relevance)
         findings.append(Finding(
             title="Potential API leak in public Postman workspace" if leaky
                   else "Public Postman workspace references target",
             category="api-leak",
             severity=Severity.HIGH if leaky else Severity.LOW,
-            confidence=Confidence.FIRM if leaky else Confidence.TENTATIVE,
+            confidence=confidence,
             target=f"{name} ({ws_id})"[:200],
             tool=source,
             description=(f"Public Postman workspace '{name}'"
-                        + (f": {desc}" if desc else "") + "."),
+                        + (f": {desc}" if desc else "") + "."
+                        + _relevance_note(relevance, target)),
             evidence=desc[:300],
             raw=json.dumps(ws)[:800],
         ))
     return findings
 
 
-def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy") -> list[Finding]:
+def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy",
+                     target: str = "") -> list[Finding]:
     """Parse SwaggerSpy output (exposed Swagger/OpenAPI specs) into findings.
 
     Exposed API documentation reveals endpoints, parameters and sometimes embedded creds.
     We treat each discovered spec URL as an informational finding (endpoint-surface), and
     bump severity when the line hints at secrets.
+
+    SwaggerSpy searches by the target name, so a spec URL may belong to an unrelated host.
+    When *target* is given we grade the spec URL's tie to it: a spec hosted on the target
+    domain keeps its confidence; one that only matches the base keyword is capped at
+    TENTATIVE and flagged, so an unverified spec is never presented with exact-match
+    confidence.
     """
     findings: list[Finding] = []
     seen: set[str] = set()
@@ -545,15 +646,18 @@ def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy") -> list[Finding]:
             continue
         seen.add(url)
         leaky = any(k in low for k in ("key", "token", "secret", "password", "credential"))
+        relevance = assess_target_relevance(url, target) if target else "direct"
+        confidence = _cap_for_relevance(Confidence.FIRM, relevance)
         findings.append(Finding(
             title="Exposed API secret in Swagger/OpenAPI" if leaky
                   else "Exposed Swagger/OpenAPI documentation",
             category="api-leak",
             severity=Severity.HIGH if leaky else Severity.INFO,
-            confidence=Confidence.FIRM,
+            confidence=confidence,
             target=url[:200],
             tool=source,
-            description="SwaggerSpy found exposed API documentation for the target.",
+            description="SwaggerSpy found exposed API documentation for the target."
+                        + _relevance_note(relevance, target),
             evidence=text[:300],
             raw=text[:500],
         ))

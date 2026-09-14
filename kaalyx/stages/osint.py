@@ -451,7 +451,7 @@ class OsintStage(Stage):
             res.skipped, res.note = True, "skipped: cloud_enum not on PATH"
             return res
         self.ctx.writer.raw_tool_output(self.name, "cloud_enum", out.stdout)
-        res.findings = P.parse_cloud_enum(out.stdout)
+        res.findings = P.parse_cloud_enum(out.stdout, target=self.ctx.target.registrable)
         res.note = f"keywords={','.join(keywords)}"
         return res
 
@@ -474,7 +474,7 @@ class OsintStage(Stage):
             return res
         combined = "\n".join(all_out)
         self.ctx.writer.raw_tool_output(self.name, "s3scanner", combined)
-        res.findings = P.parse_s3scanner(combined)
+        res.findings = P.parse_s3scanner(combined, target=self.ctx.target.registrable)
         res.note = f"keywords={','.join(keywords)}"
         return res
 
@@ -560,7 +560,7 @@ class OsintStage(Stage):
         if pp.started:
             ran_any = True
             self.ctx.writer.raw_tool_output(self.name, "porch-pirate", pp.stdout)
-            res.findings.extend(P.parse_porch_pirate(pp.stdout))
+            res.findings.extend(P.parse_porch_pirate(pp.stdout, target=self.ctx.target.registrable))
 
         ss = await self.ctx.runner.run(
             ["swaggerspy", keyword], timeout=600, label="swaggerspy",
@@ -568,7 +568,7 @@ class OsintStage(Stage):
         if ss.started:
             ran_any = True
             self.ctx.writer.raw_tool_output(self.name, "swaggerspy", ss.stdout)
-            res.findings.extend(P.parse_swaggerspy(ss.stdout))
+            res.findings.extend(P.parse_swaggerspy(ss.stdout, target=self.ctx.target.registrable))
 
         if not ran_any:
             res.skipped = True

@@ -89,3 +89,45 @@ def print_main_banner() -> None:
     from ..core.logging import get_console
 
     get_console().print(main_banner())
+
+
+# --- Dot progress bar (used by `kaalyx update`) -----------------------------------------
+
+# Number of dots in the bar. 20 gives clean 5%-per-dot resolution.
+_DOT_BAR_WIDTH = 20
+_DOT_FILLED = "●"
+_DOT_EMPTY = "○"
+
+
+def dot_progress():
+    """Build a :class:`rich.progress.Progress` with a dot-style bar: ``●●●●○○○○  62%``.
+
+    rich's built-in :class:`BarColumn` draws a block bar and can't be given custom fill
+    glyphs, so we render the bar as a small custom column: filled dots in the accent colour,
+    empty dots muted, followed by the percentage. Use it as::
+
+        with dot_progress() as progress:
+            task = progress.add_task("Updating Kaalyx", total=100)
+            progress.update(task, completed=62)
+    """
+    from rich.progress import Progress, ProgressColumn, TextColumn
+    from rich.text import Text
+
+    from ..core.logging import get_console
+
+    class _DotBarColumn(ProgressColumn):
+        def render(self, task) -> Text:
+            fraction = 0.0 if not task.total else max(0.0, min(1.0, task.completed / task.total))
+            filled = round(fraction * _DOT_BAR_WIDTH)
+            bar = Text()
+            bar.append(_DOT_FILLED * filled, style=ACCENT)
+            bar.append(_DOT_EMPTY * (_DOT_BAR_WIDTH - filled), style=MUTED)
+            return bar
+
+    return Progress(
+        TextColumn("[bold white]{task.description}[/]"),
+        _DotBarColumn(),
+        TextColumn(f"[{ACCENT_DIM}]{{task.percentage:>3.0f}}%[/]"),
+        console=get_console(),
+        transient=True,   # clear the bar line when done; final status is printed after
+    )

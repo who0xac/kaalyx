@@ -180,6 +180,7 @@ class OsintStage(Stage):
         osint_rows = ctx.repo.list_osint(ctx.scan_id)
         finding_rows = ctx.repo.list_findings(ctx.scan_id)
 
+        # One blank line before each result table so the blocks don't run together.
         for table in (
             osint_ui.mail_hygiene_table(osint_rows),
             osint_ui.emails_table(email_rows),
@@ -187,6 +188,7 @@ class OsintStage(Stage):
             osint_ui.findings_table(finding_rows),
         ):
             if table is not None:
+                console.print()
                 console.print(table)
 
         counts = ctx.repo.scan_counts(ctx.scan_id)
@@ -200,6 +202,7 @@ class OsintStage(Stage):
             for r in results
         ]
         duration = sum(r.duration_s for r in results)
+        console.print()
         console.print(osint_ui.summary_panel(
             ctx.domain, counts, sev_counts, source_states, duration
         ))

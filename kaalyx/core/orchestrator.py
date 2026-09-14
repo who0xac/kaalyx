@@ -254,6 +254,8 @@ class Orchestrator:
     def _print_summary(
         self, scan_id: int, results: list[StageResult], counts: dict[str, int]
     ) -> None:
+        # A blank line separates this block from the stage's own summary panel above.
+        self.console.print()
         table = Table(title=f"Kaalyx scan #{scan_id} — {self.target.domain}")
         table.add_column("Stage", style="cyan")
         table.add_column("Status")
@@ -269,6 +271,7 @@ class Orchestrator:
             table.add_row(r.stage, status, items, f"{r.duration_s:.1f}s")
         self.console.print(table)
 
+        self.console.print()
         totals = Table(title="Totals", show_header=False)
         for key in ("subdomains", "hosts", "web_urls", "findings", "osint"):
             totals.add_row(key, str(counts.get(key, 0)))
@@ -277,6 +280,7 @@ class Orchestrator:
             if n:
                 totals.add_row(f"findings.{sev}", str(n))
         self.console.print(totals)
+        self.console.print()
 
     def close(self) -> None:
         try:

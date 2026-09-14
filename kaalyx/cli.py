@@ -39,9 +39,8 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
     help=(
         "[bold cyan]Kaalyx[/] — automated bug-bounty recon & vulnerability-discovery pipeline.\n\n"
-        "Run [bold]kaalyx scan <domain>[/] to start. Use [bold]kaalyx osint-sources[/] to list "
-        "the OSINT sub-checks you can enable/disable, and [bold]kaalyx tools[/] to see which "
-        "external tools are installed."
+        "Run [bold]kaalyx scan <domain>[/] to start, and [bold]kaalyx tools[/] to check or "
+        "install the external tools it drives."
     ),
 )
 console = get_console()
@@ -97,6 +96,51 @@ def _print_quickstart() -> None:
     )
 
 
+# Command reference shown in the main help: each command's one-line summary plus its key
+# flags with short descriptions, so a new user sees the essentials without running each
+# subcommand's own -h (which remains the full reference). Grouped like Typer's panels.
+_COMMAND_REFERENCE: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("Pipeline", [
+        ("scan", "Run the Kaalyx pipeline against a target.", ""),
+        ("", "", "--osint-only        OSINT phase only"),
+        ("", "", "--no-vuln           Run up to Web Analysis, skip Vuln"),
+        ("", "", "--all               Everything, including OSINT"),
+        ("", "", "-t, --target        Single domain"),
+        ("", "", "-l, --target-list   File with multiple domains"),
+    ]),
+    ("Info", [
+        ("tools", "Check which external tools are installed.", ""),
+        ("", "", "-i, --install       Install missing tools"),
+        ("", "", "--check-only        Report only (no install)"),
+        ("update", "Update Kaalyx to the latest version from GitHub.", ""),
+        ("", "", "--verbose           Show technical detail"),
+    ]),
+]
+
+
+def _print_command_reference() -> None:
+    """Print the custom, flag-aware command reference panels for the main help screen."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    for title, entries in _COMMAND_REFERENCE:
+        lines: list[Text] = []
+        for name, summary, flag_line in entries:
+            if name:  # a command header row
+                if lines:
+                    lines.append(Text(""))  # blank line between commands
+                row = Text(f"{name:<8}", style="bold cyan")
+                row.append(summary, style="white")
+                lines.append(row)
+            else:      # an indented flag row
+                lines.append(Text(f"        {flag_line}", style="dim"))
+        body = Text("\n").join(lines)
+        console.print(
+            Panel(body, title=f"[bold]{title}[/]", title_align="left",
+                  border_style="cyan", padding=(0, 1))
+        )
+
+
 def _show_help(ctx: typer.Context) -> None:
     """Print the standard help, then exit. The banner + quick-start are printed by ``run()``."""
     console.print(ctx.get_help())
@@ -117,8 +161,8 @@ def main(
 ) -> None:
     """Automated bug-bounty reconnaissance & vulnerability-discovery pipeline.
 
-    Run [bold]kaalyx scan <domain>[/] to start a scan. See [bold]kaalyx osint-sources[/]
-    for the OSINT sub-checks and [bold]kaalyx tools[/] for external-tool availability.
+    Run [bold]kaalyx scan <domain>[/] to start a scan, and [bold]kaalyx tools[/] to check
+    or install the external tools it drives.
     """
     # Show the banner + help on a bare `kaalyx` invocation. (`kaalyx --help` is handled by
     # the root help callback below so the banner also appears there.)
@@ -355,7 +399,7 @@ def _run_scan(
         )
 
 
-@app.command(rich_help_panel="Pipeline", context_settings=_HELP_CTX)
+@app.command(rich_help_panel="Pipeline", context_settings=_HELP_CTX, hidden=True)
 def scan(
     positional_target: Optional[str] = typer.Argument(
         None, metavar="[TARGET]",
@@ -526,7 +570,7 @@ def scan(
     )
 
 
-@app.command(context_settings=_HELP_CTX)
+@app.command(context_settings=_HELP_CTX, hidden=True)
 def resume(
     target: str = typer.Argument(..., help="Target of the scan to resume."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
@@ -560,7 +604,7 @@ _OSINT_SOURCE_INFO: dict[str, tuple[str, str, str]] = {
 }
 
 
-@app.command(name="osint-sources", rich_help_panel="Info", context_settings=_HELP_CTX)
+@app.command(name="osint-sources", context_settings=_HELP_CTX, hidden=True)
 def osint_sources() -> None:
     """List every OSINT sub-check and how to enable/disable it.
 
@@ -586,7 +630,7 @@ def osint_sources() -> None:
     )
 
 
-@app.command(rich_help_panel="Info", context_settings=_HELP_CTX)
+@app.command(rich_help_panel="Info", context_settings=_HELP_CTX, hidden=True)
 def tools(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     install: bool = typer.Option(
@@ -683,7 +727,7 @@ def _report_tool_status(phase: Optional[str]) -> None:
     console.print(table)
 
 
-@app.command(context_settings=_HELP_CTX)
+@app.command(context_settings=_HELP_CTX, hidden=True)
 def web(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
@@ -695,50 +739,94 @@ def web(
     raise typer.Exit(code=1)
 
 
+def _run_while_advancing(progress, task, fn, start_pct: int, target_pct: int):
+    """Run blocking *fn* in a thread while the dot-bar creeps from start→target.
+
+    The bar advances a little at a time as long as the work is still running, then snaps to
+    ``target_pct`` when it finishes — so the dots genuinely fill during the real step
+    (network fetch, pipx install) instead of jumping straight to 100%.
+    """
+    import threading
+    import time
+
+    result: dict = {}
+
+    def _worker():
+        result["value"] = fn()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    pct = float(start_pct)
+    # Creep toward, but never quite reach, the target while the step runs.
+    ceiling = target_pct - 1
+    while thread.is_alive():
+        if pct < ceiling:
+            pct += max(0.5, (ceiling - pct) * 0.08)  # ease-out toward the ceiling
+            progress.update(task, completed=min(pct, ceiling))
+        time.sleep(0.1)
+    thread.join()
+    progress.update(task, completed=target_pct)
+    return result.get("value")
+
+
 def _do_update(verbose: bool = False) -> None:
     """Check GitHub for a newer Kaalyx and, if found, reinstall via pipx.
 
-    Clean UX by default: a spinner and one of two final lines — "already up to date" or
-    "updated: <old> → <new>". Internals (commit hashes, the pipx command, install log) are
-    shown only with --verbose. Shared by `kaalyx update` and the root `-u/--update` flag.
+    Shows a dot-style progress bar mapped to real milestones (check → prepare → pull →
+    reinstall → done). Ends with one clear line — "already up to date" or "updated: old →
+    new". Internals (commit hashes, pipx output) are shown only with --verbose. Shared by
+    `kaalyx update` and the root `-u/--update` flag.
     """
     from .core import updater
+    from .ui import dot_progress
 
     current = updater.current_version()
 
-    # 1) Check for updates (spinner while we hit the GitHub API).
-    with console.status("[cyan]Checking for updates…", spinner="dots"):
-        latest = updater.latest_remote_commit()
+    # --- Step 1: check for updates (0% → 20%), bar filling while the API call runs. ---
+    with dot_progress() as progress:
+        task = progress.add_task("Updating Kaalyx", total=100)
+
+        latest = _run_while_advancing(
+            progress, task, updater.latest_remote_commit, 0, 20
+        )
         local_sha = updater.installed_commit()
 
-    if verbose:
-        console.print(f"[dim]current version : {current}[/]")
-        console.print(f"[dim]repository      : {updater.REPO_URL} (branch {updater.BRANCH})[/]")
+        if latest is None:
+            progress.stop()
+            console.print(
+                "[yellow]⚠ Couldn't check for updates[/] — no network or GitHub was "
+                "unreachable. Try again later."
+            )
+            raise typer.Exit(code=1)
 
-    if latest is None:
-        console.print(
-            "[yellow]⚠ Couldn't check for updates[/] — no network or GitHub was unreachable. "
-            "Try again later."
+        remote_sha, remote_date = latest
+
+        # Already up to date → skip the bar entirely (stop it, print the one line).
+        if local_sha and local_sha == remote_sha:
+            progress.stop()
+            if verbose:
+                console.print(f"[dim]installed commit: {local_sha} == latest {remote_sha}[/]")
+            console.print(f"[green]✔ Already up to date[/] (v{current})")
+            return
+
+        # --- Step 2: update found, preparing (20% → 40%). ---
+        progress.update(task, description="Update found, preparing", completed=40)
+
+        # --- Step 3: pulling + reinstalling via pipx (40% → 70% → 100%). ---
+        progress.update(task, description="Pulling latest changes", completed=45)
+        progress.update(task, description="Reinstalling via pipx")
+        code, output = _run_while_advancing(
+            progress, task, lambda: updater.reinstall_from_repo(capture=True), 45, 100
         )
-        raise typer.Exit(code=1)
+        progress.update(task, description="Done", completed=100)
 
-    remote_sha, remote_date = latest
     if verbose:
         console.print(f"[dim]installed commit: {local_sha or 'unknown (not a git checkout)'}[/]")
         console.print(f"[dim]latest commit   : {remote_sha}"
                       + (f"  ({remote_date})" if remote_date else "") + "[/]")
-
-    # 2) Already up to date? (only provable when we know the installed commit).
-    if local_sha and local_sha == remote_sha:
-        console.print(f"[green]✔ Already up to date[/] (v{current})")
-        return
-
-    # 3) Update via pipx (spinner; capture output unless --verbose).
-    with console.status("[cyan]Updating…", spinner="dots"):
-        code, output = updater.reinstall_from_repo(capture=not verbose)
-
-    if verbose and output:
-        console.print(f"[dim]{output.strip()}[/]")
+        if output:
+            console.print(f"[dim]{output.strip()}[/]")
 
     if code != 0:
         console.print(f"[yellow]⚠ Update failed[/] (exit {code}). Run with --verbose for details.")
@@ -746,13 +834,12 @@ def _do_update(verbose: bool = False) -> None:
 
     new_version = updater.installed_version_via_pipx() or current
     if new_version != current:
-        console.print(f"[green]✔ Updated successfully:[/] v{current} → v{new_version}")
+        console.print(f"[green]✔ Updated to the latest version[/] (v{current} → v{new_version})")
     else:
-        # Same version string (no version bump), but code was refreshed to latest main.
         console.print(f"[green]✔ Updated to the latest version[/] (v{new_version})")
 
 
-@app.command(rich_help_panel="Info", context_settings=_HELP_CTX)
+@app.command(rich_help_panel="Info", context_settings=_HELP_CTX, hidden=True)
 def update(
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
@@ -782,6 +869,7 @@ def run() -> None:
 
         print_main_banner()
         _print_quickstart()
+        _print_command_reference()
     app()
 
 

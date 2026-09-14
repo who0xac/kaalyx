@@ -198,17 +198,14 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
         )
 
     spec = f"git+{REPO_URL}.git@{target}"
-    # Primary command pins the exact commit and forces a no-cache rebuild via --pip-args.
-    # Some older pipx builds mishandle a multi-flag --pip-args string, so if the primary
-    # fails we retry with a plain pinned install (still the exact commit, so still a genuine
-    # update — just without the belt-and-braces pip flags). Each attempt's output is captured
-    # so the caller can show the REAL underlying pip/git error under -vv.
-    primary = [
-        "pipx", "install", "--force",
-        "--pip-args=--no-cache-dir --force-reinstall",
-        spec,
-    ]
-    fallback = ["pipx", "install", "--force", spec]
+
+    # Force a fresh venv even when pipx's backend is `uv` (Kali's default). On `pipx install
+    # --force`, uv's `uv venv` REFUSES to overwrite the existing venv unless told to, failing
+    # with "A virtual environment already exists" — pipx's own --force does not pass this
+    # through. UV_VENV_CLEAR=1 makes uv clear it; it is simply ignored when the backend is pip,
+    # so it's safe to set unconditionally.
+    env = dict(os.environ)
+    env["UV_VENV_CLEAR"] = "1"
 
     def _run(cmd: list[str]) -> tuple[int, str]:
         try:
@@ -217,25 +214,45 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
                 # default cp1252 pipe reader on Windows.
                 completed = subprocess.run(
                     cmd, check=False, capture_output=True,
-                    encoding="utf-8", errors="replace",
+                    encoding="utf-8", errors="replace", env=env,
                 )
                 out = (completed.stdout or "") + (completed.stderr or "")
                 return completed.returncode, f"$ {' '.join(cmd)}\n{out}"
-            completed = subprocess.run(cmd, check=False)
+            completed = subprocess.run(cmd, check=False, env=env)
             return completed.returncode, ""
         except OSError as exc:  # pragma: no cover
             return 4, f"Failed to launch pipx ({' '.join(cmd)}): {exc}"
 
-    code, output = _run(primary)
-    if code != 0:
-        # Retry without --pip-args (covers pipx versions that reject the multi-flag string),
-        # unless the failure is clearly a network problem where a retry won't help.
-        if not is_network_error(output):
-            code2, output2 = _run(fallback)
-            # Keep both attempts' output so -vv shows what actually failed.
-            output = output + "\n--- retry without --pip-args ---\n" + output2
-            code = code2
-    return code, output
+    # Attempts, most-preferred first. Each pins the exact commit (genuine update). If one
+    # fails for anything other than a network problem, fall through to the next:
+    #   1. pinned + --pip-args (no-cache, force-reinstall) — the belt-and-braces path.
+    #   2. plain pinned --force — covers older pipx that mishandle the multi-flag --pip-args.
+    #   3. uninstall THEN install — sidesteps the uv venv-overwrite check entirely (no --force,
+    #      so there's no existing venv for uv to refuse to clear), the surest recovery.
+    attempts = [
+        (["pipx", "install", "--force",
+          "--pip-args=--no-cache-dir --force-reinstall", spec], "pinned + --pip-args"),
+        (["pipx", "install", "--force", spec], "plain --force"),
+    ]
+
+    output_parts: list[str] = []
+    code = 1
+    for cmd, label in attempts:
+        code, out = _run(cmd)
+        output_parts.append(f"[attempt: {label}]\n{out}")
+        if code == 0:
+            return code, "\n".join(output_parts)
+        if is_network_error(out):
+            # A retry won't fix a network/DNS problem — stop and report it.
+            return code, "\n".join(output_parts)
+
+    # Final recovery: uninstall then install. `pipx uninstall` removes the venv cleanly, so the
+    # subsequent install creates a brand-new one and uv has nothing to overwrite.
+    unc, unout = _run(["pipx", "uninstall", "kaalyx"])
+    output_parts.append(f"[attempt: uninstall kaalyx]\n{unout}")
+    code, out = _run(["pipx", "install", spec])
+    output_parts.append(f"[attempt: reinstall after uninstall]\n{out}")
+    return code, "\n".join(output_parts)
 
 
 def installed_version_via_pipx(timeout: float = 10.0) -> str | None:

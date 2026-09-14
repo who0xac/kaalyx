@@ -64,90 +64,6 @@ def _update_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-def _print_quickstart() -> None:
-    """Print the quick-start block shown at the top of root help / bare invocation.
-
-    This is the first thing a new user sees after the banner: exactly what to type given
-    what actually works today (OSINT only), so nobody has to guess.
-    """
-    from rich.panel import Panel
-    from rich.text import Text
-
-    body = Text()
-    rows = [
-        ("kaalyx scan <domain>", "Run an OSINT recon scan on a target"),
-        ("kaalyx tools", "Check which external tools are installed"),
-        ("kaalyx tools --install", "Install any missing tools"),
-        ("kaalyx update", "Update Kaalyx to the latest version"),
-    ]
-    for i, (cmd, desc) in enumerate(rows):
-        if i:
-            body.append("\n")
-        body.append(f"  {cmd:<28}", style="bold cyan")
-        body.append(desc, style="white")
-    body.append("\n\n")
-    body.append(
-        "Only the OSINT phase is implemented so far — other phases are in progress.",
-        style="yellow",
-    )
-    console.print(
-        Panel(body, title="[bold]Quick start[/]", title_align="left",
-              border_style="cyan", padding=(0, 1))
-    )
-
-
-# Command reference shown in the main help: each command's one-line summary plus its key
-# flags with short descriptions, so a new user sees the essentials without running each
-# subcommand's own -h (which remains the full reference). Grouped like Typer's panels.
-_COMMAND_REFERENCE: list[tuple[str, list[tuple[str, str, str]]]] = [
-    ("Pipeline", [
-        ("scan", "Run the Kaalyx pipeline against a target.", ""),
-        ("", "", "--osint-only        OSINT phase only"),
-        ("", "", "--no-vuln           Run up to Web Analysis, skip Vuln"),
-        ("", "", "--all               Everything, including OSINT"),
-        ("", "", "-t, --target        Single domain"),
-        ("", "", "-l, --target-list   File with multiple domains"),
-    ]),
-    ("Info", [
-        ("tools", "Check which external tools are installed.", ""),
-        ("", "", "-i, --install       Install missing tools"),
-        ("", "", "--check-only        Report only (no install)"),
-        ("update", "Update Kaalyx to the latest version from GitHub.", ""),
-        ("", "", "-vv, --verbose      Show technical detail"),
-    ]),
-]
-
-
-def _print_command_reference() -> None:
-    """Print the custom, flag-aware command reference panels for the main help screen.
-
-    Each command's flags are shown under a ``kaalyx <cmd> [FLAGS]`` usage line and indented,
-    so it is unmistakable the flags belong to that command — you type them AFTER the command
-    name, they are not standalone options on bare ``kaalyx``.
-    """
-    from rich.panel import Panel
-    from rich.text import Text
-
-    for title, entries in _COMMAND_REFERENCE:
-        lines: list[Text] = []
-        for name, summary, flag_line in entries:
-            if name:  # a command header row: "kaalyx <cmd>   <summary>"
-                if lines:
-                    lines.append(Text(""))  # blank line between commands
-                row = Text("kaalyx ", style="dim")
-                row.append(f"{name}", style="bold cyan")
-                row.append("   " + summary, style="white")
-                lines.append(row)
-            else:      # a flag row, indented under its command
-                lines.append(Text(f"    {flag_line}", style="dim"))
-        body = Text("\n").join(lines)
-        console.print(
-            Panel(body, title=f"[bold]{title}[/]", title_align="left",
-                  subtitle="[dim]flags go after the command name[/]", subtitle_align="right",
-                  border_style="cyan", padding=(0, 1))
-        )
-
-
 def _show_help(ctx: typer.Context) -> None:
     """Print the standard help, then exit. The banner + quick-start are printed by ``run()``."""
     console.print(ctx.get_help())
@@ -406,7 +322,7 @@ def _run_scan(
         )
 
 
-@app.command(rich_help_panel="Pipeline", context_settings=_HELP_CTX, hidden=True)
+@app.command(context_settings=_HELP_CTX, short_help="Run a recon scan against a target.")
 def scan(
     positional_target: Optional[str] = typer.Argument(
         None, metavar="[TARGET]",
@@ -577,7 +493,7 @@ def scan(
     )
 
 
-@app.command(context_settings=_HELP_CTX, hidden=True)
+@app.command(context_settings=_HELP_CTX, short_help="Resume an interrupted scan.")
 def resume(
     target: str = typer.Argument(..., help="Target of the scan to resume."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
@@ -637,7 +553,7 @@ def osint_sources() -> None:
     )
 
 
-@app.command(rich_help_panel="Info", context_settings=_HELP_CTX, hidden=True)
+@app.command(context_settings=_HELP_CTX, short_help="Check or install external tools.")
 def tools(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     install: bool = typer.Option(
@@ -734,7 +650,7 @@ def _report_tool_status(phase: Optional[str]) -> None:
     console.print(table)
 
 
-@app.command(context_settings=_HELP_CTX, hidden=True)
+@app.command(context_settings=_HELP_CTX, short_help="Launch the local web dashboard.")
 def web(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
@@ -866,13 +782,23 @@ def _do_update(verbose: bool = False) -> None:
         )
         raise typer.Exit(code=1)
 
+    # Record the commit we just installed so the next run can tell "already up to date" from
+    # a genuine update (a pipx install has no .git to read a HEAD from).
+    updater.write_installed_commit(remote_sha)
+
     if new_version != current:
-        console.print(f"[green]✔ Updated to the latest version[/] (v{current} → v{new_version})")
+        # Version string actually changed — the clearest signal of a real update.
+        console.print(f"[green]✔ Updated:[/] v{current} → v{new_version}")
+    elif local_sha and local_sha != remote_sha:
+        # Same version string but the code moved to a newer commit.
+        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version}, {remote_sha})")
     else:
+        # We could not prove the prior commit (first self-update on a pipx install); we did
+        # reinstall the latest. State is now recorded, so subsequent runs report accurately.
         console.print(f"[green]✔ Updated to the latest version[/] (v{new_version})")
 
 
-@app.command(rich_help_panel="Info", context_settings=_HELP_CTX, hidden=True)
+@app.command(context_settings=_HELP_CTX, short_help="Update Kaalyx to the latest version.")
 def update(
     verbose: bool = typer.Option(
         False, "--verbose", "-vv",
@@ -901,8 +827,6 @@ def run() -> None:
         from .ui import print_main_banner
 
         print_main_banner()
-        _print_quickstart()
-        _print_command_reference()
     app()
 
 

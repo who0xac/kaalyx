@@ -1,24 +1,23 @@
 """Self-update: pull the latest Kaalyx from GitHub and reinstall via pipx.
 
-Kaalyx is distributed as a pipx-installed package from the GitHub repo (there are no formal
-PyPI releases or version tags yet), so "up to date" is defined against the latest commit on
-the repo's default branch rather than a release tag. The updater:
+Kaalyx is distributed as a pipx install from the GitHub repo (no PyPI releases or version
+tags yet), so "up to date" is defined against the latest commit on the repo's default branch
+rather than a release tag.
 
-1. reads the locally installed version and the current commit it was built from (if the
-   install is a git checkout),
-2. asks GitHub for the latest commit on ``main``,
-3. if they differ (or the state can't be compared), reinstalls from the repo with
-   ``pipx install --force``,
-4. reports current vs latest and whether an update happened.
-
-Everything is best-effort and non-destructive: network or tooling failures are reported and
-the command exits cleanly rather than leaving a half-updated install.
+Knowing *which* commit the current install was built from is the crux of reporting
+honestly. A pipx install has NO ``.git`` directory, so we cannot read a local git HEAD.
+Instead, after every successful update we record the commit we just installed in a small
+state file (``~/.local/state/kaalyx/installed_commit``). On the next run we compare that
+recorded commit against the remote's latest: equal => already up to date; different (or no
+record yet) => update. A dev git checkout falls back to reading ``.git`` HEAD directly.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import httpx
 
@@ -31,6 +30,36 @@ REPO = "who0xac/kaalyx"
 BRANCH = "main"
 REPO_URL = f"https://github.com/{REPO}"
 _LATEST_COMMIT_API = f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"
+
+
+def _state_file() -> Path:
+    """Path of the file recording the commit the current install was built from.
+
+    Uses ``$XDG_STATE_HOME`` when set, else ``~/.local/state`` (Linux/mac convention; on
+    Windows it lands under the user's home, which is fine and writable).
+    """
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "kaalyx" / "installed_commit"
+
+
+def read_installed_commit() -> str | None:
+    """Return the commit recorded from the last successful update, if any."""
+    path = _state_file()
+    try:
+        sha = path.read_text(encoding="utf-8").strip()
+        return sha or None
+    except OSError:
+        return None
+
+
+def write_installed_commit(sha: str) -> None:
+    """Record *sha* as the commit the current install was built from (best-effort)."""
+    path = _state_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sha.strip(), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - non-fatal
+        logger.debug("Could not record installed commit: %s", exc)
 
 
 def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str] | None:
@@ -67,27 +96,28 @@ def pipx_available() -> bool:
 
 
 def installed_commit(timeout: float = 5.0) -> str | None:
-    """Return the short git commit this Kaalyx was built from, if discoverable.
+    """Return the short commit this Kaalyx install was built from, or ``None`` if unknown.
 
-    Kaalyx ships from a git checkout, so when the working tree is a repo we can read HEAD to
-    decide whether the install already matches the latest remote commit. Returns ``None`` if
-    the install isn't a git checkout (e.g. a pipx build has no .git), in which case the
-    caller can't prove up-to-date and updates unconditionally.
+    Order of truth:
+      1. a dev git checkout — read ``.git`` HEAD directly (always authoritative locally), else
+      2. the recorded state file from the last successful update (the pipx-install case).
+
+    ``None`` only when neither is available (a fresh pipx install that has never self-updated
+    through this tool) — the caller then can't prove up-to-date and treats it as "update".
     """
-    from pathlib import Path
-
     repo_dir = Path(__file__).resolve().parent.parent.parent
-    if not (repo_dir / ".git").exists():
-        return None
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=timeout, check=False,
-        )
-        sha = out.stdout.strip()
-        return sha or None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    if (repo_dir / ".git").exists():
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            sha = out.stdout.strip()
+            if sha:
+                return sha
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return read_installed_commit()
 
 
 def reinstall_from_repo(capture: bool = True) -> tuple[int, str]:

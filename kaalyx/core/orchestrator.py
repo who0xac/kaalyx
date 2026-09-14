@@ -6,7 +6,7 @@ Responsibilities:
 * Decide the stage sequence based on target type (an apex runs every stage; a bare
   subdomain skips subdomain enumeration).
 * Create or resume a scan via the checkpoint store, so a crashed run continues from the
-  last completed stage instead of restarting from zero (Part 6).
+  last completed stage instead of restarting from zero.
 * Run each stage inside a guard that records ``stage_runs`` state, isolates exceptions
   (one failed stage never aborts the scan), times execution, and checkpoints on success.
 * Emit start / progress / final Telegram notifications and print a rich summary.

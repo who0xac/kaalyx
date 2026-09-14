@@ -65,29 +65,77 @@ def pipx_available() -> bool:
     return shutil.which("pipx") is not None
 
 
-def reinstall_from_repo() -> int:
+def installed_commit(timeout: float = 5.0) -> str | None:
+    """Return the short git commit this Kaalyx was built from, if discoverable.
+
+    Kaalyx ships from a git checkout, so when the working tree is a repo we can read HEAD to
+    decide whether the install already matches the latest remote commit. Returns ``None`` if
+    the install isn't a git checkout (e.g. a pipx build has no .git), in which case the
+    caller can't prove up-to-date and updates unconditionally.
+    """
+    from pathlib import Path
+
+    repo_dir = Path(__file__).resolve().parent.parent.parent
+    if not (repo_dir / ".git").exists():
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        sha = out.stdout.strip()
+        return sha or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def reinstall_from_repo(capture: bool = True) -> tuple[int, str]:
     """Reinstall Kaalyx from the GitHub repo via ``pipx install --force``.
 
-    Uses pipx's git spec so a user who installed with pipx gets an in-place upgrade to the
-    latest ``main`` without re-cloning. Returns the pipx exit code (non-zero sentinel if it
-    could not be launched).
+    Uses pipx's git spec so a pipx user gets an in-place upgrade to the latest ``main``.
+    When *capture* is True, pipx's output is captured (hidden) and returned so the caller can
+    show it only under --verbose; when False it streams to the terminal. Returns
+    ``(exit_code, captured_output)``.
     """
     if not pipx_available():
-        logger.error(
+        return 3, (
             "pipx is not on PATH. Kaalyx self-update uses pipx; install pipx, or update "
-            "manually with: pip install --force-reinstall 'git+%s@%s'.", REPO_URL, BRANCH
+            f"manually with: pip install --force-reinstall 'git+{REPO_URL}.git@{BRANCH}'."
         )
-        return 3
 
     spec = f"git+{REPO_URL}.git@{BRANCH}"
     cmd = ["pipx", "install", "--force", spec]
-    logger.info("Reinstalling via: %s", " ".join(cmd))
     try:
+        if capture:
+            # Decode as UTF-8 with replacement: pipx prints emoji (✨🌟) that crash the
+            # default cp1252 pipe reader on Windows.
+            completed = subprocess.run(
+                cmd, check=False, capture_output=True,
+                encoding="utf-8", errors="replace",
+            )
+            return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
         completed = subprocess.run(cmd, check=False)
-        return completed.returncode
+        return completed.returncode, ""
     except OSError as exc:  # pragma: no cover
-        logger.error("Failed to launch pipx: %s", exc)
-        return 4
+        return 4, f"Failed to launch pipx: {exc}"
+
+
+def installed_version_via_pipx(timeout: float = 10.0) -> str | None:
+    """Best-effort read of the version pipx currently reports for kaalyx (post-update)."""
+    if not pipx_available():
+        return None
+    try:
+        out = subprocess.run(
+            ["pipx", "list", "--short"], capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "kaalyx":
+                return parts[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 def current_version() -> str:

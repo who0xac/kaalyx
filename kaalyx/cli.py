@@ -65,8 +65,40 @@ def _update_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _print_quickstart() -> None:
+    """Print the quick-start block shown at the top of root help / bare invocation.
+
+    This is the first thing a new user sees after the banner: exactly what to type given
+    what actually works today (OSINT only), so nobody has to guess.
+    """
+    from rich.panel import Panel
+    from rich.text import Text
+
+    body = Text()
+    rows = [
+        ("kaalyx scan <domain>", "Run an OSINT recon scan on a target"),
+        ("kaalyx tools", "Check which external tools are installed"),
+        ("kaalyx tools --install", "Install any missing tools"),
+        ("kaalyx update", "Update Kaalyx to the latest version"),
+    ]
+    for i, (cmd, desc) in enumerate(rows):
+        if i:
+            body.append("\n")
+        body.append(f"  {cmd:<28}", style="bold cyan")
+        body.append(desc, style="white")
+    body.append("\n\n")
+    body.append(
+        "Only the OSINT phase is implemented so far — other phases are in progress.",
+        style="yellow",
+    )
+    console.print(
+        Panel(body, title="[bold]Quick start[/]", title_align="left",
+              border_style="cyan", padding=(0, 1))
+    )
+
+
 def _show_help(ctx: typer.Context) -> None:
-    """Print the standard help, then exit. The banner is printed by ``run()``."""
+    """Print the standard help, then exit. The banner + quick-start are printed by ``run()``."""
     console.print(ctx.get_help())
     raise typer.Exit()
 
@@ -75,7 +107,7 @@ def _show_help(ctx: typer.Context) -> None:
 def main(
     ctx: typer.Context,
     _version: bool = typer.Option(
-        False, "--version", "-V", callback=_version_callback, is_eager=True,
+        False, "--version", "-V", "-v", callback=_version_callback, is_eager=True,
         help="Show version and exit.",
     ),
     _update: bool = typer.Option(
@@ -207,17 +239,18 @@ def _scan_one(
         return  # in a list run, skip this one and keep going
 
     factories, pending = _build_stage_factories(mode)
-    if pending:
-        console.print(
-            f"[yellow]Note:[/] stage(s) not yet implemented, skipped this run: "
-            f"{', '.join(pending)}."
-        )
     if not factories:
+        # The selected mode's stages aren't built yet (e.g. explicit --full today). Point
+        # the user at what actually works instead of leaving them stuck.
         console.print(
-            f"[yellow]Nothing to run for '{target.domain}':[/] the selected mode's "
-            f"stages ({', '.join(_MODE_STAGES[mode])}) are not implemented yet."
+            "[yellow]Only the OSINT phase is currently implemented.[/] Run:\n"
+            f"  [bold cyan]kaalyx scan {target.domain} --osint-only[/]"
         )
         return
+    if pending:
+        console.print(
+            f"[dim]Skipping stages not implemented yet: {', '.join(pending)}.[/]"
+        )
 
     orchestrator = Orchestrator(target, options, config, secrets, factories)
     try:
@@ -458,7 +491,17 @@ def scan(
             f"--osint-only / --full / --no-vuln / --all (got: {', '.join(selected_modes)})."
         )
         raise typer.Exit(code=2)
-    mode = selected_modes[0] if selected_modes else "full"
+    # Default mode. TODO(parts 2-5): once Subdomains/Hosts/Web/Vuln land, change the
+    # no-flag default back to "full". Today only OSINT is implemented, so defaulting to
+    # "full" would error on the common no-flag case — default to the one mode that works
+    # and tell the user what happened, rather than making them guess a flag.
+    default_mode = "osint-only"
+    mode = selected_modes[0] if selected_modes else default_mode
+    if not selected_modes:
+        console.print(
+            "[dim]No scan mode given — running [cyan]--osint-only[/] "
+            "(the only phase implemented so far). Use --full/--all once more phases land.[/]"
+        )
 
     # Resolve the target source.
     chosen_target = target or positional_target
@@ -652,50 +695,73 @@ def web(
     raise typer.Exit(code=1)
 
 
-def _do_update() -> None:
+def _do_update(verbose: bool = False) -> None:
     """Check GitHub for a newer Kaalyx and, if found, reinstall via pipx.
 
-    Shared by both `kaalyx update` and the root `-u/--update` flag.
+    Clean UX by default: a spinner and one of two final lines — "already up to date" or
+    "updated: <old> → <new>". Internals (commit hashes, the pipx command, install log) are
+    shown only with --verbose. Shared by `kaalyx update` and the root `-u/--update` flag.
     """
     from .core import updater
 
     current = updater.current_version()
-    console.print(f"Current version : [cyan]Kaalyx {current}[/]")
-    console.print(f"Repository      : {updater.REPO_URL} (branch: {updater.BRANCH})")
 
-    latest = updater.latest_remote_commit()
+    # 1) Check for updates (spinner while we hit the GitHub API).
+    with console.status("[cyan]Checking for updates…", spinner="dots"):
+        latest = updater.latest_remote_commit()
+        local_sha = updater.installed_commit()
+
+    if verbose:
+        console.print(f"[dim]current version : {current}[/]")
+        console.print(f"[dim]repository      : {updater.REPO_URL} (branch {updater.BRANCH})[/]")
+
     if latest is None:
         console.print(
-            "[yellow]Could not check the latest version on GitHub[/] "
-            "(no network, or the API was unreachable). Try again later."
+            "[yellow]⚠ Couldn't check for updates[/] — no network or GitHub was unreachable. "
+            "Try again later."
         )
         raise typer.Exit(code=1)
 
-    sha, date = latest
-    console.print(f"Latest on GitHub: [cyan]commit {sha}[/]" + (f"  ({date})" if date else ""))
+    remote_sha, remote_date = latest
+    if verbose:
+        console.print(f"[dim]installed commit: {local_sha or 'unknown (not a git checkout)'}[/]")
+        console.print(f"[dim]latest commit   : {remote_sha}"
+                      + (f"  ({remote_date})" if remote_date else "") + "[/]")
 
-    # Without version tags we can't cheaply prove local==latest, so updating always pulls
-    # the newest main. pipx --force is idempotent: on an up-to-date install it simply
-    # rebuilds the same code. Be explicit about that rather than falsely claiming "newer".
-    console.print("\n[cyan]Updating to the latest main via pipx…[/]")
-    code = updater.reinstall_from_repo()
-    if code == 0:
-        console.print(
-            f"[green]✔ Update complete.[/] Kaalyx now reflects GitHub commit {sha}. "
-            "Run [bold]kaalyx --version[/] to confirm."
-        )
-    else:
-        console.print(
-            f"[yellow]Update did not complete (exit {code}).[/] See the messages above."
-        )
+    # 2) Already up to date? (only provable when we know the installed commit).
+    if local_sha and local_sha == remote_sha:
+        console.print(f"[green]✔ Already up to date[/] (v{current})")
+        return
+
+    # 3) Update via pipx (spinner; capture output unless --verbose).
+    with console.status("[cyan]Updating…", spinner="dots"):
+        code, output = updater.reinstall_from_repo(capture=not verbose)
+
+    if verbose and output:
+        console.print(f"[dim]{output.strip()}[/]")
+
+    if code != 0:
+        console.print(f"[yellow]⚠ Update failed[/] (exit {code}). Run with --verbose for details.")
         raise typer.Exit(code=code)
+
+    new_version = updater.installed_version_via_pipx() or current
+    if new_version != current:
+        console.print(f"[green]✔ Updated successfully:[/] v{current} → v{new_version}")
+    else:
+        # Same version string (no version bump), but code was refreshed to latest main.
+        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version})")
 
 
 @app.command(rich_help_panel="Info", context_settings=_HELP_CTX)
-def update() -> None:
+def update(
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show technical detail (commit hashes, pipx output).",
+    ),
+) -> None:
     """Update Kaalyx to the latest version from GitHub (reinstalls via pipx)."""
     setup_logging()
-    _do_update()
+    _do_update(verbose=verbose)
 
 
 def run() -> None:
@@ -715,6 +781,7 @@ def run() -> None:
         from .ui import print_main_banner
 
         print_main_banner()
+        _print_quickstart()
     app()
 
 

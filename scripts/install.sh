@@ -141,8 +141,8 @@ want_phase() {
 parse_args "$@"
 
 # ============================================================================
-#  Phase → tool mapping (for --check and for the per-phase verification report)
-#  Kept in sync with PROJECT_MEMORY.md §10 (OSINT) and §4 (other phases).
+#  Phase → tool mapping (for --check and for the per-phase verification report).
+#  Kept in sync with the tools each pipeline phase actually invokes.
 # ============================================================================
 
 # Part 1 — OSINT (final spec incl. the 5 gap-closing additions).
@@ -509,10 +509,9 @@ pipx_install() {
         ln -sf "${HOME}/.local/bin/${cmd}" "${BIN_DIR}/${cmd}"
 }
 
-# Clone a repo + build a venv + write a wrapper script into ~/bin. `req` is the pip
-# install target: a requirements.txt path, "." for `pip install .`, or a space-list of
-# packages. `entry` is the python file/module the wrapper runs (omit for pip-installed
-# console entrypoints — then `bin_in_venv` names the venv-bin script to link instead).
+# Clone a repo, build a venv, and write a wrapper script into ~/bin that runs `entry`
+# (the repo's main .py) through that venv. `req` selects dependency install: "req" =
+# requirements.txt, "self" = `pip install .`, or a space-separated package list.
 git_venv_tool() {
     local name="$1" repo="$2" entry="$3" req="${4:-}"
 

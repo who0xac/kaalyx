@@ -46,7 +46,7 @@ def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str] | None:
             follow_redirects=True,
         )
         if resp.status_code != 200:
-            logger.warning("GitHub API returned HTTP %s", resp.status_code)
+            logger.debug("GitHub API returned HTTP %s", resp.status_code)
             return None
         data = resp.json()
         sha = str(data.get("sha", ""))[:7]
@@ -57,7 +57,8 @@ def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str] | None:
         )
         return (sha, date) if sha else None
     except (httpx.HTTPError, ValueError, KeyError) as exc:
-        logger.warning("Could not reach GitHub to check for updates: %s", exc)
+        # The caller reports this cleanly to the user; keep it at debug to avoid double noise.
+        logger.debug("Could not reach GitHub to check for updates: %s", exc)
         return None
 
 
@@ -136,6 +137,32 @@ def installed_version_via_pipx(timeout: float = 10.0) -> str | None:
     except (OSError, subprocess.SubprocessError):
         pass
     return None
+
+
+# Substrings that mark a pipx/pip/git failure as a network-reachability problem rather than
+# a genuine build/packaging error — so the CLI can show the clear "couldn't reach GitHub"
+# message instead of a generic failure.
+_NETWORK_ERROR_HINTS = (
+    "could not resolve host",
+    "failed to connect",
+    "connection timed out",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "getaddrinfo",
+    "name or service not known",
+    "connection refused",
+    "ssl",
+    "timed out",
+    "unable to access",
+    "operation timed out",
+    "no address associated with hostname",
+)
+
+
+def is_network_error(output: str) -> bool:
+    """True if *output* from a failed pipx/git run looks like a network/DNS problem."""
+    low = output.lower()
+    return any(hint in low for hint in _NETWORK_ERROR_HINTS)
 
 
 def current_version() -> str:

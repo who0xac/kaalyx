@@ -739,12 +739,12 @@ def web(
     raise typer.Exit(code=1)
 
 
-def _run_while_advancing(progress, task, fn, start_pct: int, target_pct: int):
-    """Run blocking *fn* in a thread while the dot-bar creeps from start→target.
+def _run_while_advancing(progress, task, fn, start_pct: int, ceiling_pct: int):
+    """Run blocking *fn* in a thread while the dot-bar creeps from start toward a ceiling.
 
-    The bar advances a little at a time as long as the work is still running, then snaps to
-    ``target_pct`` when it finishes — so the dots genuinely fill during the real step
-    (network fetch, pipx install) instead of jumping straight to 100%.
+    The bar advances a little at a time while the work runs but never passes
+    ``ceiling_pct`` — the caller decides the final value based on whether the step actually
+    succeeded, so a failed step never fills the bar to 100%. Returns *fn*'s result.
     """
     import threading
     import time
@@ -758,15 +758,13 @@ def _run_while_advancing(progress, task, fn, start_pct: int, target_pct: int):
     thread.start()
 
     pct = float(start_pct)
-    # Creep toward, but never quite reach, the target while the step runs.
-    ceiling = target_pct - 1
+    ceiling = max(start_pct, ceiling_pct - 1)
     while thread.is_alive():
         if pct < ceiling:
             pct += max(0.5, (ceiling - pct) * 0.08)  # ease-out toward the ceiling
             progress.update(task, completed=min(pct, ceiling))
         time.sleep(0.1)
     thread.join()
-    progress.update(task, completed=target_pct)
     return result.get("value")
 
 
@@ -783,26 +781,35 @@ def _do_update(verbose: bool = False) -> None:
 
     current = updater.current_version()
 
-    # --- Step 1: check for updates (0% → 20%), bar filling while the API call runs. ---
+    def _network_message() -> None:
+        console.print(
+            "[yellow]⚠ Couldn't reach GitHub to check for updates[/] (no network or DNS "
+            "issue). Try again when you have a connection."
+        )
+
+    # --- Step 1: check reachability + latest commit (bar fills while the API call runs). ---
     with dot_progress() as progress:
-        task = progress.add_task("Updating Kaalyx", total=100)
+        task = progress.add_task("Checking for updates", total=100)
 
         latest = _run_while_advancing(
             progress, task, updater.latest_remote_commit, 0, 20
         )
         local_sha = updater.installed_commit()
 
+        # No response from GitHub's API => network/DNS problem. Clear message, by default.
+        # (Leave the bar where it stopped — do not fill it.)
         if latest is None:
             progress.stop()
-            console.print(
-                "[yellow]⚠ Couldn't check for updates[/] — no network or GitHub was "
-                "unreachable. Try again later."
-            )
+            if verbose:
+                console.print("[dim]GitHub commits API returned no result (see logs).[/]")
+            _network_message()
             raise typer.Exit(code=1)
 
+        progress.update(task, completed=20)  # check succeeded
         remote_sha, remote_date = latest
 
-        # Already up to date → skip the bar entirely (stop it, print the one line).
+        # Already up to date (provable only when we know the installed commit) => skip the
+        # reinstall entirely.
         if local_sha and local_sha == remote_sha:
             progress.stop()
             if verbose:
@@ -810,16 +817,19 @@ def _do_update(verbose: bool = False) -> None:
             console.print(f"[green]✔ Already up to date[/] (v{current})")
             return
 
-        # --- Step 2: update found, preparing (20% → 40%). ---
+        # --- Step 2/3: prepare + reinstall via pipx (bar fills during the real reinstall). ---
         progress.update(task, description="Update found, preparing", completed=40)
-
-        # --- Step 3: pulling + reinstalling via pipx (40% → 70% → 100%). ---
         progress.update(task, description="Pulling latest changes", completed=45)
         progress.update(task, description="Reinstalling via pipx")
         code, output = _run_while_advancing(
             progress, task, lambda: updater.reinstall_from_repo(capture=True), 45, 100
         )
-        progress.update(task, description="Done", completed=100)
+        # Fill to 100% only on genuine success; on failure leave it partial so the dots
+        # never imply a completed update.
+        if code == 0:
+            progress.update(task, description="Done", completed=100)
+        else:
+            progress.stop()
 
     if verbose:
         console.print(f"[dim]installed commit: {local_sha or 'unknown (not a git checkout)'}[/]")
@@ -828,11 +838,27 @@ def _do_update(verbose: bool = False) -> None:
         if output:
             console.print(f"[dim]{output.strip()}[/]")
 
+    # --- Failure handling: distinguish a network problem from a genuine failure. ---
     if code != 0:
-        console.print(f"[yellow]⚠ Update failed[/] (exit {code}). Run with --verbose for details.")
+        if updater.is_network_error(output):
+            _network_message()
+        else:
+            console.print(
+                f"[yellow]⚠ Update failed[/] (exit {code})."
+                + ("" if verbose else " Run [bold]kaalyx update --verbose[/] for details.")
+            )
         raise typer.Exit(code=code)
 
-    new_version = updater.installed_version_via_pipx() or current
+    # --- Success is reported ONLY when pipx exited 0 AND the package is verifiably present. ---
+    new_version = updater.installed_version_via_pipx()
+    if new_version is None:
+        # pipx returned 0 but we can't confirm the install — do not claim success.
+        console.print(
+            "[yellow]⚠ Update finished but couldn't be verified.[/] "
+            "Run [bold]kaalyx --version[/] to check."
+        )
+        raise typer.Exit(code=1)
+
     if new_version != current:
         console.print(f"[green]✔ Updated to the latest version[/] (v{current} → v{new_version})")
     else:

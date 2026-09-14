@@ -129,5 +129,5 @@ def dot_progress():
         _DotBarColumn(),
         TextColumn(f"[{ACCENT_DIM}]{{task.percentage:>3.0f}}%[/]"),
         console=get_console(),
-        transient=True,   # clear the bar line when done; final status is printed after
+        transient=False,  # keep the completed bar visible; the final status prints below it
     )

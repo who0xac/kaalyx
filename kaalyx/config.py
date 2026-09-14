@@ -88,17 +88,18 @@ def ensure_config_dir() -> tuple[Path, list[Path]]:
     directory = config_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        cfg = config_file()
-        if not cfg.exists():
-            cfg.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
-            created.append(cfg)
-        env = env_file()
-        if not env.exists():
-            env.write_text(_ENV_TEMPLATE, encoding="utf-8")
-            created.append(env)
     except OSError:
-        # Non-fatal: fall back to built-in defaults / env-only secrets.
-        pass
+        return directory, created  # can't create the dir at all — nothing to do
+
+    # Write each template independently so a failure on one never blocks the other.
+    for path, template in ((config_file(), _CONFIG_TEMPLATE), (env_file(), _ENV_TEMPLATE)):
+        try:
+            if not path.exists():
+                path.write_text(template, encoding="utf-8")
+                created.append(path)
+        except OSError:
+            # Non-fatal: fall back to built-in defaults / env-only secrets for this file.
+            pass
     return directory, created
 
 
@@ -403,22 +404,19 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
 
 
 def _collect_github_tokens() -> list[str]:
-    """Gather all configured GitHub tokens for rotation (#6).
+    """Gather all configured GitHub tokens for rotation.
 
-    Accepts, in priority order and merged (deduplicated, order-preserving):
-      * ``GITHUB_TOKENS`` — a comma-separated list (the documented multi-token form), and
-      * ``GITHUB_TOKEN`` / ``GITHUB_TOKEN_2`` / ``GITHUB_TOKEN_3`` … — numbered singles.
-    A single ``GITHUB_TOKEN`` behaves exactly as before (a one-element list).
+    Uses the numbered form only: ``GITHUB_TOKEN``, then ``GITHUB_TOKEN_2``,
+    ``GITHUB_TOKEN_3`` … (contiguous). One token behaves exactly as a single-token setup.
+    (The earlier comma-separated ``GITHUB_TOKENS`` form was removed — one clear format.)
     """
     tokens: list[str] = []
 
     def _add(value: str | None) -> None:
-        for part in (value or "").split(","):
-            part = part.strip()
-            if part and part not in tokens:
-                tokens.append(part)
+        value = (value or "").strip()
+        if value and value not in tokens:
+            tokens.append(value)
 
-    _add(os.environ.get("GITHUB_TOKENS"))
     _add(os.environ.get("GITHUB_TOKEN"))
     i = 2
     while True:
@@ -481,22 +479,35 @@ osint:
 """
 
 _ENV_TEMPLATE = """\
-# Kaalyx secrets. A blank value simply disables the source/feature that needs it.
+# Kaalyx secrets. A blank value simply disables the source/feature that needs it —
+# Kaalyx skips it gracefully, it never crashes for a missing key.
 
-SHODAN_API_KEY=
-CENSYS_API_ID=
-CENSYS_API_SECRET=
-CHAOS_API_KEY=
-IPINFO_TOKEN=
-
-# GitHub tokens (github-subdomains, trufflehog, GitHub Actions audit). One is enough;
-# provide several to rotate and avoid rate limits. Comma-separated or numbered — both work.
-GITHUB_TOKENS=
+# GitHub (used by: github-subdomains, trufflehog, GitHub Actions audit)
+# Get a token at: https://github.com/settings/tokens  (classic; scopes: repo, read:org)
+# Multiple tokens are rotated to avoid rate limits — add GITHUB_TOKEN_2, _3, ... as needed.
 GITHUB_TOKEN=
 GITHUB_TOKEN_2=
 GITHUB_TOKEN_3=
 
-# Telegram notifications (create a bot via @BotFather).
+# Shodan (used by: subdomain discovery, domain-scoped host/ssl search)
+# Get a key at: https://account.shodan.io
+SHODAN_API_KEY=
+
+# Censys (used by: subdomain discovery)
+# Get credentials at: https://search.censys.io/account/api
+CENSYS_API_ID=
+CENSYS_API_SECRET=
+
+# ProjectDiscovery Chaos (used by: subdomain discovery — Chaos dataset)
+# Get a key at: https://cloud.projectdiscovery.io
+CHAOS_API_KEY=
+
+# ipinfo.io (used by: host stage — IP geolocation / ASN)
+# Get a token at: https://ipinfo.io/account/token
+IPINFO_TOKEN=
+
+# Telegram notifications (used by: --notify scan alerts)
+# Create a bot via @BotFather, then get your numeric chat id (e.g. via @userinfobot).
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 """

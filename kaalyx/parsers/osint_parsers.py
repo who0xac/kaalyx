@@ -8,6 +8,9 @@ schema.
 
 from __future__ import annotations
 
+import json
+import re
+
 from . import iter_json_lines, try_load_json
 from ..data.models import (
     Confidence,
@@ -125,13 +128,24 @@ def parse_s3scanner(stdout: str, source: str = "s3scanner") -> list[Finding]:
     are reported as existing and (especially) open/listable.
     """
     findings: list[Finding] = []
+    seen: set[str] = set()
     for line in stdout.splitlines():
         text = line.strip()
         low = text.lower()
+        # Skip blanks, non-existent buckets, and progress/status noise.
         if not text or "not_exist" in low or "not exist" in low:
             continue
+        if any(w in low for w in ("scanning", "checking", "loading", "usage:", "error")):
+            continue
+        # Only lines that actually name a bucket resource (existing/permission report).
         if "bucket" not in low and "s3" not in low and "://" not in low:
             continue
+        if "exists" not in low and "://" not in low and "permission" not in low \
+                and "open" not in low and "public" not in low:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
         open_bucket = any(k in low for k in ("open", "public", "listable", "read", "write"))
         findings.append(
             Finding(
@@ -224,26 +238,39 @@ def parse_retirejs(stdout: str, source: str = "retirejs") -> list[Finding]:
 
 
 def parse_cloud_enum(stdout: str, source: str = "cloud_enum") -> list[Finding]:
-    """Parse cloud_enum textual output into cloud-resource findings.
+    """Parse cloud_enum output into one finding per discovered cloud resource.
 
-    cloud_enum prints ``[+] ...`` lines for found resources and flags open ones.
+    cloud_enum prints ``[+] ...`` for genuine finds and a lot of progress/status text. The
+    reliable signal for a real resource is a URL on the line, so we only create a finding
+    from a ``[+]`` line that contains a URL, dedup by that URL, and skip progress/negatives.
     """
     findings: list[Finding] = []
+    seen: set[str] = set()
+    url_re = re.compile(r"https?://[^\s\"'<>]+")
     for line in stdout.splitlines():
         text = line.strip()
         low = text.lower()
-        if not text.startswith("[+]") and "found" not in low and "open" not in low:
+        if not text.startswith("[+]"):
             continue
+        if any(neg in low for neg in ("not found", "no results", "nothing")):
+            continue
+        m = url_re.search(text)
+        if not m:
+            continue
+        url = m.group(0).rstrip(".,)")
+        if url in seen:
+            continue
+        seen.add(url)
         open_res = "open" in low or "public" in low
         findings.append(
             Finding(
                 title="Open cloud resource" if open_res else "Cloud resource discovered",
                 category="cloud",
                 severity=Severity.MEDIUM if open_res else Severity.INFO,
-                confidence=Confidence.TENTATIVE,
-                target=text[:200],
+                confidence=Confidence.FIRM if open_res else Confidence.TENTATIVE,
+                target=url[:200],
                 tool=source,
-                description="cloud_enum reported this resource.",
+                description="cloud_enum reported this cloud resource.",
                 evidence=text[:300],
                 raw=text[:500],
             )
@@ -401,47 +428,62 @@ def parse_misconfig_mapper(stdout: str, source: str = "misconfig-mapper") -> lis
 
 
 def parse_porch_pirate(stdout: str, source: str = "porch-pirate") -> list[Finding]:
-    """Parse porch-pirate output (public Postman workspace/collection leaks) into findings.
+    """Parse porch-pirate ``--raw`` JSON into ONE finding per public Postman workspace.
 
-    porch-pirate surfaces public Postman workspaces, collections and requests mentioning the
-    target, which frequently embed API keys, bearer tokens and internal URLs. Output format
-    varies by version (text or JSON), so we read defensively: JSON objects first, then any
-    text line that references a Postman entity.
+    Run with ``--raw``, porch-pirate emits JSON describing the public Postman workspaces /
+    collections that reference the target. We create exactly one finding per workspace with
+    structured fields (id, name, a truncated description) — NOT one finding per line of a
+    workspace's free-text description (the earlier bug). Non-JSON output yields nothing
+    rather than a line-by-line text dump.
     """
     findings: list[Finding] = []
     seen: set[str] = set()
 
-    def _add(target: str, evidence: str) -> None:
-        key = target[:200]
-        if key in seen:
-            return
-        seen.add(key)
-        low = evidence.lower()
-        leaky = any(k in low for k in ("key", "token", "secret", "authorization", "bearer", "password"))
+    def _walk(node) -> list[dict]:
+        """Collect workspace/collection-like dicts from arbitrary nested JSON."""
+        out: list[dict] = []
+        if isinstance(node, dict):
+            # A workspace/collection object has an id and (usually) a name/slug/type.
+            if node.get("id") and any(k in node for k in ("name", "slug", "type", "publicHandle")):
+                out.append(node)
+            for v in node.values():
+                out.extend(_walk(v))
+        elif isinstance(node, list):
+            for item in node:
+                out.extend(_walk(item))
+        return out
+
+    # Parse the whole document (porch-pirate --raw is a single JSON doc, not JSON-lines).
+    doc = try_load_json(stdout)
+    if doc is None:
+        # Not JSON (e.g. an older text build or an error) — don't fabricate findings.
+        return findings
+
+    for ws in _walk(doc):
+        ws_id = str(ws.get("id", "")).strip()
+        if not ws_id or ws_id in seen:
+            continue
+        seen.add(ws_id)
+        name = str(ws.get("name") or ws.get("slug") or "workspace").strip()
+        desc = " ".join(str(ws.get("description", "")).split())  # collapse whitespace/newlines
+        if len(desc) > 160:
+            desc = desc[:157] + "…"
+        # Heuristic: does the structured data hint at embedded credentials?
+        blob = json.dumps(ws).lower() if isinstance(ws, dict) else str(ws).lower()
+        leaky = any(k in blob for k in ("apikey", "api_key", "token", "secret", "bearer", "authorization", "password"))
         findings.append(Finding(
-            title="Potential API leak in public Postman data" if leaky
-                  else "Public Postman workspace/collection references target",
+            title="Potential API leak in public Postman workspace" if leaky
+                  else "Public Postman workspace references target",
             category="api-leak",
             severity=Severity.HIGH if leaky else Severity.LOW,
-            confidence=Confidence.TENTATIVE,
-            target=target[:200],
+            confidence=Confidence.FIRM if leaky else Confidence.TENTATIVE,
+            target=f"{name} ({ws_id})"[:200],
             tool=source,
-            description="porch-pirate found public Postman data referencing the target.",
-            evidence=evidence[:400],
-            raw=evidence[:800],
+            description=(f"Public Postman workspace '{name}'"
+                        + (f": {desc}" if desc else "") + "."),
+            evidence=desc[:300],
+            raw=json.dumps(ws)[:800],
         ))
-
-    for obj in iter_json_lines(stdout):
-        ref = str(obj.get("url") or obj.get("id") or obj.get("name") or obj)[:200]
-        _add(ref, str(obj)[:400])
-    if not findings:
-        for line in stdout.splitlines():
-            text = line.strip()
-            low = text.lower()
-            if not text:
-                continue
-            if "postman" in low or "workspace" in low or "collection" in low or "getpostman" in low:
-                _add(text, text)
     return findings
 
 
@@ -453,21 +495,30 @@ def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy") -> list[Finding]:
     bump severity when the line hints at secrets.
     """
     findings: list[Finding] = []
+    seen: set[str] = set()
+    url_re = re.compile(r"https?://[^\s\"'<>]+")
     for line in stdout.splitlines():
         text = line.strip()
         low = text.lower()
-        if not text:
+        # A discovered spec is a URL; that's the reliable signal. Lines without a URL are
+        # banners/progress and must not become findings (one finding per discovered spec).
+        m = url_re.search(text)
+        if not m:
             continue
-        if "swagger" not in low and "openapi" not in low and "://" not in low:
+        if "swagger" not in low and "openapi" not in low and "api-docs" not in low and "api/docs" not in low:
             continue
+        url = m.group(0).rstrip(".,)")
+        if url in seen:
+            continue
+        seen.add(url)
         leaky = any(k in low for k in ("key", "token", "secret", "password", "credential"))
         findings.append(Finding(
             title="Exposed API secret in Swagger/OpenAPI" if leaky
                   else "Exposed Swagger/OpenAPI documentation",
             category="api-leak",
             severity=Severity.HIGH if leaky else Severity.INFO,
-            confidence=Confidence.TENTATIVE,
-            target=text[:200],
+            confidence=Confidence.FIRM,
+            target=url[:200],
             tool=source,
             description="SwaggerSpy found exposed API documentation for the target.",
             evidence=text[:300],

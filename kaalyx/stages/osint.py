@@ -465,8 +465,11 @@ class OsintStage(Stage):
         keyword = self.ctx.target.registrable
         ran_any = False
 
+        # --raw emits JSON so we get structured workspace/collection objects (one finding
+        # each) instead of free-text we'd otherwise have to guess at line by line.
         pp = await self.ctx.runner.run(
-            ["porch-pirate", "-s", keyword, "-l", "25"], timeout=600, label="porch-pirate",
+            ["porch-pirate", "-s", keyword, "-l", "25", "--raw"],
+            timeout=600, label="porch-pirate",
         )
         if pp.started:
             ran_any = True

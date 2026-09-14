@@ -120,16 +120,16 @@ the built-in defaults.
 
 `github-subdomains`, `trufflehog`, and the GitHub Actions audit all use a GitHub token, so a
 single token can hit GitHub's API rate limit quickly. Provide several and Kaalyx rotates
-across them. One token behaves exactly as before. In `.env`, use either form (they merge):
+across them. One token behaves exactly as a single-token setup. Use the numbered form:
 
 ```dotenv
-# comma-separated list…
-GITHUB_TOKENS=token1,token2,token3
-# …and/or numbered singles
 GITHUB_TOKEN=token1
 GITHUB_TOKEN_2=token2
 GITHUB_TOKEN_3=token3
 ```
+
+The generated `~/.config/kaalyx/.env` documents every key — which tool uses it and where to
+get it — so it's clear what to fill in on first open.
 
 ---
 

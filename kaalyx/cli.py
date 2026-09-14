@@ -506,12 +506,26 @@ def scan(
 
 @app.command(context_settings=_HELP_CTX, short_help="Resume an interrupted scan.")
 def resume(
-    target: str = typer.Argument(..., help="Target of the scan to resume."),
+    positional_target: Optional[str] = typer.Argument(
+        None, metavar="[TARGET]",
+        help="Target whose scan to resume (shortcut for -t/--target).",
+    ),
+    target: Optional[str] = typer.Option(
+        None, "--target", "-t", metavar="DOMAIN",
+        help="Target whose scan to resume (same as the positional argument).",
+    ),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-vv"),
 ) -> None:
-    """Resume the last interrupted scan for TARGET from its last completed stage."""
-    _run_scan(target, config_path=config, verbose=verbose, resume=True)
+    """Resume the last interrupted scan for a target from its last completed stage.
+
+    Accepts the target as a positional argument or via -t/--target, exactly like `scan`.
+    """
+    chosen = target or positional_target
+    if not chosen:
+        console.print("[red]No target given.[/] Provide a domain or use -t/--target.")
+        raise typer.Exit(code=2)
+    _run_scan(chosen, config_path=config, verbose=verbose, resume=True)
 
 
 # Per-source metadata for the osint-sources listing: name -> (kind, needs, description).
@@ -698,6 +712,14 @@ def config(
         f"  .env        : {env}  "
         + ("[green](exists)[/]" if env.exists() else "[yellow](missing)[/]")
     )
+    # `.env` is a dotfile, hidden by a plain `ls` — list the real contents so the user can
+    # confirm it's genuinely there without needing `ls -a`.
+    try:
+        contents = sorted(p.name for p in directory.iterdir())
+        console.print(f"\n[dim]Directory contents (incl. dotfiles): {', '.join(contents)}[/]")
+        console.print("[dim]Note: .env is a hidden dotfile — use `ls -a` to see it, not plain `ls`.[/]")
+    except OSError:
+        pass
     if created:
         console.print(
             f"\n[green]Created {len(created)} template file(s).[/] "

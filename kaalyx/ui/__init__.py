@@ -66,8 +66,8 @@ _BANNER_AUTHOR = "who0xac"
 def main_banner():
     """Build the Kaalyx startup banner as a rich renderable.
 
-    Styling: bold accent on the ASCII art, a dim divider, the version/tagline in the
-    secondary accent colour, and a muted author line.
+    Styling: the ASCII art is RED, the version/tagline line YELLOW, the divider dim, and
+    the author line muted.
     """
     from rich.console import Group
     from rich.text import Text
@@ -75,10 +75,10 @@ def main_banner():
     from .. import __version__
 
     return Group(
-        Text(_BANNER_ART, style=f"bold {ACCENT}"),
+        Text(_BANNER_ART, style="bold red"),
         Text(""),
         Text(f"    {_BANNER_DIVIDER}", style=MUTED),
-        Text(f"    v{__version__}  |  Automated Recon & Vulnerability Engine", style=ACCENT_DIM),
+        Text(f"    v{__version__}  |  Automated Recon & Vulnerability Engine", style="yellow"),
         Text(f"    Author: {_BANNER_AUTHOR}", style=MUTED),
         Text(""),
     )

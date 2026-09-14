@@ -38,9 +38,9 @@ app = typer.Typer(
     # (which the root group uses) and again on each @app.command via _HELP_CTX below.
     context_settings={"help_option_names": ["-h", "--help"]},
     help=(
-        "[bold cyan]Kaalyx[/] — automated bug-bounty recon & vulnerability-discovery pipeline.\n\n"
-        "Run [bold]kaalyx scan <domain>[/] to start, and [bold]kaalyx tools[/] to check or "
-        "install the external tools it drives."
+        "[green]Kaalyx — automated bug-bounty recon & vulnerability-discovery pipeline.[/]\n\n"
+        "[green]Run [bold]kaalyx scan <domain>[/bold] to start, and [bold]kaalyx tools[/bold] "
+        "to check or install the external tools it drives.[/]"
     ),
 )
 console = get_console()
@@ -260,6 +260,17 @@ def _run_scan(
     import logging
 
     setup_logging(logging.DEBUG if verbose else logging.INFO)
+    # First-run bootstrap: create ~/.config/kaalyx/{config.yaml,.env} templates if missing,
+    # so a fresh pipx install has a config location without the user creating folders.
+    from .config import ensure_config_dir
+
+    _, created = ensure_config_dir()
+    if created:
+        from .config import config_dir
+        console.print(
+            f"[dim]First run: created config templates in {config_dir()} "
+            "— edit .env there to add API keys. See 'kaalyx config --path'.[/]"
+        )
     config = load_config(config_path)
     secrets = load_secrets()
     _apply_osint_selection(config, only_osint, skip_osint)
@@ -660,6 +671,42 @@ def web(
         "It will serve the SQLite results at the configured host/port."
     )
     raise typer.Exit(code=1)
+
+
+@app.command(context_settings=_HELP_CTX, short_help="Show where config.yaml and .env live.")
+def config(
+    path: bool = typer.Option(
+        False, "--path", help="Print the exact config.yaml and .env paths and exit.",
+    ),
+) -> None:
+    """Show (and create) Kaalyx's config directory, config.yaml and .env locations.
+
+    Running this creates ~/.config/kaalyx/ with template config.yaml and .env if they
+    don't exist yet, so a fresh pipx install can be configured without guessing paths.
+    """
+    from .config import config_file, env_file, ensure_config_dir
+
+    directory, created = ensure_config_dir()
+    cfg, env = config_file(), env_file()
+
+    console.print(f"[bold]Config directory:[/] {directory}")
+    console.print(
+        f"  config.yaml : {cfg}  "
+        + ("[green](exists)[/]" if cfg.exists() else "[yellow](missing)[/]")
+    )
+    console.print(
+        f"  .env        : {env}  "
+        + ("[green](exists)[/]" if env.exists() else "[yellow](missing)[/]")
+    )
+    if created:
+        console.print(
+            f"\n[green]Created {len(created)} template file(s).[/] "
+            "Edit them to add your settings and API keys."
+        )
+    console.print(
+        "\n[dim]Lookup order: a --config path > ./config.yaml (in the current dir) > "
+        "the config directory above. A local ./.env also takes precedence over the one here.[/]"
+    )
 
 
 def _run_while_advancing(progress, task, fn, start_pct: int, ceiling_pct: int):

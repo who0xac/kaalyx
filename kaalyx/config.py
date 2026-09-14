@@ -22,6 +22,87 @@ from dotenv import load_dotenv
 from .core.exceptions import ConfigError
 
 # --------------------------------------------------------------------------------------
+# Standard config location (works the same whether run from source or pipx-installed).
+# --------------------------------------------------------------------------------------
+
+
+def config_dir() -> Path:
+    """Return Kaalyx's config directory: ``$XDG_CONFIG_HOME/kaalyx`` or ``~/.config/kaalyx``.
+
+    The conventional Linux location for a CLI tool's config. Independent of the current
+    working directory, so a pipx-installed ``kaalyx`` always looks in the same place.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "kaalyx"
+
+
+def config_file() -> Path:
+    """Path of the config file in the standard config directory."""
+    return config_dir() / "config.yaml"
+
+
+def env_file() -> Path:
+    """Path of the secrets file in the standard config directory."""
+    return config_dir() / ".env"
+
+
+def resolve_config_path(explicit: str | Path | None) -> Path | None:
+    """Resolve which config.yaml to load. Precedence:
+
+    1. an explicit ``--config`` path (must exist — a bad path is an error),
+    2. ``./config.yaml`` in the CWD (convenient when working inside a source checkout),
+    3. ``~/.config/kaalyx/config.yaml`` (the standard location for a pipx install).
+
+    Returns the chosen path, or ``None`` when none exists (built-in defaults are then used).
+    """
+    if explicit is not None:
+        return Path(explicit)
+    cwd = Path("config.yaml")
+    if cwd.is_file():
+        return cwd
+    standard = config_file()
+    if standard.is_file():
+        return standard
+    return None
+
+
+def resolve_env_path() -> Path | None:
+    """Resolve which .env to load: ``./.env`` in the CWD if present, else the standard
+    ``~/.config/kaalyx/.env``. Returns ``None`` if neither exists (env-only secrets then)."""
+    cwd = Path(".env")
+    if cwd.is_file():
+        return cwd
+    standard = env_file()
+    if standard.is_file():
+        return standard
+    return None
+
+
+def ensure_config_dir() -> tuple[Path, list[Path]]:
+    """Create the config dir with template config.yaml and .env if they're missing.
+
+    Idempotent and non-destructive: only writes a file that does not already exist, so a
+    user's edited config/secrets are never overwritten. Returns ``(dir, created_files)``.
+    """
+    created: list[Path] = []
+    directory = config_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        cfg = config_file()
+        if not cfg.exists():
+            cfg.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+            created.append(cfg)
+        env = env_file()
+        if not env.exists():
+            env.write_text(_ENV_TEMPLATE, encoding="utf-8")
+            created.append(env)
+    except OSError:
+        # Non-fatal: fall back to built-in defaults / env-only secrets.
+        pass
+    return directory, created
+
+
+# --------------------------------------------------------------------------------------
 # Settings dataclasses (mirror config.yaml). Defaults here ARE the built-in defaults.
 # --------------------------------------------------------------------------------------
 
@@ -202,14 +283,12 @@ def load_config(config_path: str | Path | None = None) -> Config:
     """Load settings from a YAML file, falling back to built-in defaults.
 
     Args:
-        config_path: Path to a YAML config. If ``None``, ``config.yaml`` in the current
-            working directory is used when present; otherwise pure defaults are returned.
+        config_path: Path to a YAML config. If ``None``, resolution follows
+            :func:`resolve_config_path` (explicit > ``./config.yaml`` > standard config dir);
+            if nothing is found, pure built-in defaults are returned.
     """
     config = Config()
-
-    if config_path is None:
-        candidate = Path("config.yaml")
-        config_path = candidate if candidate.is_file() else None
+    config_path = resolve_config_path(config_path)
 
     if config_path is not None:
         path = Path(config_path)
@@ -244,10 +323,13 @@ class Secrets:
     censys_api_id: str | None = None
     censys_api_secret: str | None = None
     chaos_api_key: str | None = None
-    github_token: str | None = None
+    github_tokens: list[str] = field(default_factory=list)
     ipinfo_token: str | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+
+    # Round-robin cursor for GitHub token rotation (not persisted; per-process).
+    _gh_cursor: int = 0
 
     @property
     def has_shodan(self) -> bool:
@@ -263,7 +345,25 @@ class Secrets:
 
     @property
     def has_github(self) -> bool:
-        return bool(self.github_token)
+        return bool(self.github_tokens)
+
+    @property
+    def github_token(self) -> str | None:
+        """The first GitHub token (back-compat for callers that want a single value)."""
+        return self.github_tokens[0] if self.github_tokens else None
+
+    def next_github_token(self) -> str | None:
+        """Return the next GitHub token round-robin, to spread API usage (#6).
+
+        With one token this always returns that token (identical to the old behaviour);
+        with several it hands out a different one on each call so GitHub-dependent sources
+        don't all hammer a single token's rate limit.
+        """
+        if not self.github_tokens:
+            return None
+        token = self.github_tokens[self._gh_cursor % len(self.github_tokens)]
+        self._gh_cursor += 1
+        return token
 
     @property
     def has_ipinfo(self) -> bool:
@@ -277,10 +377,14 @@ class Secrets:
 def load_secrets(env_path: str | Path | None = None) -> Secrets:
     """Load secrets from a ``.env`` file (if present) plus the process environment.
 
-    Values already set in the environment take precedence over the ``.env`` file, which
-    is the conventional ``python-dotenv`` behaviour and lets CI / shell exports override.
+    If *env_path* is ``None``, resolution follows :func:`resolve_env_path` (``./.env`` >
+    standard config dir). Values already in the environment take precedence over the file
+    (conventional ``python-dotenv`` behaviour; lets shell exports / CI override).
     """
-    load_dotenv(dotenv_path=env_path, override=False)
+    if env_path is None:
+        env_path = resolve_env_path()
+    if env_path is not None:
+        load_dotenv(dotenv_path=str(env_path), override=False)
 
     def _get(name: str) -> str | None:
         value = os.environ.get(name)
@@ -291,8 +395,108 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
         censys_api_id=_get("CENSYS_API_ID"),
         censys_api_secret=_get("CENSYS_API_SECRET"),
         chaos_api_key=_get("CHAOS_API_KEY"),
-        github_token=_get("GITHUB_TOKEN"),
+        github_tokens=_collect_github_tokens(),
         ipinfo_token=_get("IPINFO_TOKEN"),
         telegram_bot_token=_get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_get("TELEGRAM_CHAT_ID"),
     )
+
+
+def _collect_github_tokens() -> list[str]:
+    """Gather all configured GitHub tokens for rotation (#6).
+
+    Accepts, in priority order and merged (deduplicated, order-preserving):
+      * ``GITHUB_TOKENS`` — a comma-separated list (the documented multi-token form), and
+      * ``GITHUB_TOKEN`` / ``GITHUB_TOKEN_2`` / ``GITHUB_TOKEN_3`` … — numbered singles.
+    A single ``GITHUB_TOKEN`` behaves exactly as before (a one-element list).
+    """
+    tokens: list[str] = []
+
+    def _add(value: str | None) -> None:
+        for part in (value or "").split(","):
+            part = part.strip()
+            if part and part not in tokens:
+                tokens.append(part)
+
+    _add(os.environ.get("GITHUB_TOKENS"))
+    _add(os.environ.get("GITHUB_TOKEN"))
+    i = 2
+    while True:
+        val = os.environ.get(f"GITHUB_TOKEN_{i}")
+        if val is None:
+            break
+        _add(val)
+        i += 1
+    return tokens
+
+
+# --------------------------------------------------------------------------------------
+# First-run templates written into ~/.config/kaalyx/ when the files don't exist yet.
+# --------------------------------------------------------------------------------------
+
+_CONFIG_TEMPLATE = """\
+# Kaalyx configuration (settings only — secrets live in .env alongside this file).
+# Precedence: CLI flags > this file > built-in defaults. Delete any key to use its default.
+
+general:
+  # Root output directory. Leave blank for the default: <Desktop>/kaalyx-results
+  # (falls back to ~/kaalyx-results on headless machines).
+  output_dir: ""
+
+concurrency:
+  max_parallel_tools: 8
+  max_parallel_dns: 4
+  default_tool_timeout: 900
+
+rate_limit:
+  chunk_size: 50
+  backoff_factor: 2.0
+  max_delay_seconds: 30
+  max_retries: 3
+
+telegram:
+  enabled: true          # auto-disabled if the bot token / chat id are missing in .env
+  alert_min_severity: high
+
+# OSINT sub-checks — set any to false to skip it (a --skip-osint CLI flag also works).
+osint:
+  whois: true
+  dns: true
+  mail_dns: true
+  m365: true
+  email_harvest: true
+  breach_lookup: true
+  github_subdomains: true
+  trufflehog: true
+  cloud_enum: true
+  s3scanner: true
+  badsecrets: true
+  retirejs: true
+  theharvester: true
+  third_party_misconfig: true
+  api_leaks: true
+  exposed_git: true
+  github_actions: true
+  google_dorks: true
+"""
+
+_ENV_TEMPLATE = """\
+# Kaalyx secrets. A blank value simply disables the source/feature that needs it.
+
+SHODAN_API_KEY=
+CENSYS_API_ID=
+CENSYS_API_SECRET=
+CHAOS_API_KEY=
+IPINFO_TOKEN=
+
+# GitHub tokens (github-subdomains, trufflehog, GitHub Actions audit). One is enough;
+# provide several to rotate and avoid rate limits. Comma-separated or numbered — both work.
+GITHUB_TOKENS=
+GITHUB_TOKEN=
+GITHUB_TOKEN_2=
+GITHUB_TOKEN_3=
+
+# Telegram notifications (create a bot via @BotFather).
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+"""

@@ -289,9 +289,11 @@ def parse_theharvester(stdout_or_json: str, domain: str,
 def parse_h8mail(stdout_or_json: str, source: str = "h8mail") -> dict[str, tuple[int, str]]:
     """Parse h8mail JSON output into a map of email -> (breach_count, breach_detail).
 
-    h8mail (run with ``--json out.json``) writes ``{"targets": [{"target": email,
-    "pwn_num": N, "data": [...]}]}``. The stage uses this to enrich already-harvested
-    emails with breach counts (reNgine's h8mail chaining), rather than as standalone rows.
+    h8mail (run with ``-j out.json``) writes ``{"targets": [{"target": email, "pwned": N,
+    "data": [[source, value], ...]}]}``. NOTE: the count field is ``pwned`` (h8mail's
+    attribute name), NOT ``pwn_num`` — and ``data`` entries are 2-item ``[source, value]``
+    lists/tuples, so the breach source is the FIRST element (not a ``str.split(":")``). The
+    stage uses this map to enrich already-harvested emails (reNgine's h8mail chaining).
     """
     result: dict[str, tuple[int, str]] = {}
     doc = try_load_json(stdout_or_json)
@@ -303,47 +305,98 @@ def parse_h8mail(stdout_or_json: str, source: str = "h8mail") -> dict[str, tuple
         email = str(target.get("target", "")).strip().lower()
         if not email:
             continue
-        count = int(target.get("pwn_num", 0) or 0)
-        data = target.get("data") or []
-        # `data` entries are typically "source:detail" strings; summarise the breach names.
-        names = []
-        for entry in data if isinstance(data, list) else []:
-            text = str(entry)
-            names.append(text.split(":")[0][:40])
-        detail = ", ".join(dict.fromkeys(names))[:300]
+        # h8mail's count attribute is `pwned`; accept `pwn_num` too for other versions.
+        count = int(target.get("pwned", target.get("pwn_num", 0)) or 0)
+
+        # `data` is a list of [source, value] pairs; the breach source is element 0. Fall
+        # back to string handling for older/variant shapes.
+        names: list[str] = []
+        for entry in target.get("data") or []:
+            if isinstance(entry, (list, tuple)) and entry:
+                names.append(str(entry[0])[:40])
+            elif isinstance(entry, str):
+                names.append(entry.split(":")[0][:40])
+        detail = ", ".join(dict.fromkeys(n for n in names if n))[:300]
+
+        # A target counts as breached if the count is positive OR it carries breach data.
+        if count == 0 and names:
+            count = len(names)
         result[email] = (count, detail)
     return result
 
 
 def parse_misconfig_mapper(stdout: str, source: str = "misconfig-mapper") -> list[Finding]:
-    """Parse misconfig-mapper output (ReconFTW's third-party misconfig tool) into findings.
+    """Parse misconfig-mapper output into findings — ONLY genuine positive detections.
 
-    misconfig-mapper reports third-party SaaS services that may be misconfigured for the
-    target (e.g. an open Atlassian/Jira/GitHub org). Its text output marks hits with
-    ``[+]``/``vulnerable``/``misconfigured``; we surface those as medium findings.
+    Run with ``-output-json``, so the reliable path is JSON: each result carries a boolean
+    (``vulnerable``/``exists``); a finding is created only when that is true.
+
+    The text fallback is deliberately strict. misconfig-mapper's plain output mixes real
+    hits with progress lines (``[+] Checking 100 possible target URLs...``) and NEGATIVE
+    results (``[-] No vulnerable ... instance found``). We therefore require an explicit
+    positive phrase AND reject anything that is a progress line or a negative result — never
+    matching on the bare word "vulnerable" (which appears in "No vulnerable ... found").
     """
     findings: list[Finding] = []
+
+    def _finding(target: str, detail: str) -> Finding:
+        return Finding(
+            title="Third-party service misconfiguration",
+            category="third-party-misconfig",
+            severity=Severity.MEDIUM,
+            confidence=Confidence.FIRM,
+            target=target[:200],
+            tool=source,
+            description="misconfig-mapper detected a misconfigured third-party service.",
+            evidence=detail[:300],
+            raw=detail[:500],
+        )
+
+    # --- JSON path (preferred): report only entries explicitly flagged vulnerable. ---
+    doc = try_load_json(stdout)
+    if doc is not None:
+        # Output shape varies by version: a list of results, or {"results": [...]} /
+        # {"services": [...]}. Walk defensively and key off a truthy vulnerable/exists flag.
+        entries = []
+        if isinstance(doc, list):
+            entries = doc
+        elif isinstance(doc, dict):
+            entries = doc.get("results") or doc.get("services") or doc.get("data") or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            vulnerable = bool(
+                entry.get("vulnerable") or entry.get("exists") or entry.get("misconfigured")
+            )
+            if not vulnerable:
+                continue
+            name = (
+                entry.get("service") or entry.get("name") or entry.get("target")
+                or entry.get("url") or "third-party service"
+            )
+            findings.append(_finding(str(name), str(entry)))
+        return findings  # JSON parsed — trust it, don't fall through to text heuristics
+
+    # --- Strict text fallback (only if JSON wasn't available). ---
+    negative_markers = (
+        "no vulnerable", "not vulnerable", "no misconfig", "not found",
+        "0 vulnerable", "nothing found", "no instance",
+    )
+    progress_markers = ("checking", "possible target", "scanning", "loading", "trying")
+    positive_markers = (
+        "is vulnerable", "misconfigured", "vulnerable instance found",
+        "found a vulnerable", "open signup", "exposed instance", "detected a misconfig",
+    )
     for line in stdout.splitlines():
         text = line.strip()
         low = text.lower()
         if not text:
             continue
-        hit = text.startswith("[+]") or "misconfig" in low or "vulnerable" in low or "exposed" in low
-        if not hit:
+        if any(m in low for m in negative_markers) or any(m in low for m in progress_markers):
             continue
-        findings.append(
-            Finding(
-                title="Third-party service misconfiguration",
-                category="third-party-misconfig",
-                severity=Severity.MEDIUM,
-                confidence=Confidence.TENTATIVE,
-                target=text[:200],
-                tool=source,
-                description="misconfig-mapper flagged a third-party service.",
-                evidence=text[:300],
-                raw=text[:500],
-            )
-        )
+        if not any(m in low for m in positive_markers):
+            continue
+        findings.append(_finding(text, text))
     return findings
 
 

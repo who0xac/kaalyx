@@ -87,10 +87,49 @@ kaalyx scan example.com --skip-osint trufflehog,cloud_enum
 kaalyx scan example.com --only-osint whois,dns,mail_dns,m365
 ```
 
-Secrets (API keys, tokens) go in a `.env` file — copy `.env.example` to `.env` and fill
-in what you have. Any missing key simply disables that source; Kaalyx never crashes for a
-missing key. Settings live in `config.yaml` (CLI flags override it, which overrides the
-built-in defaults).
+---
+
+## Configuration
+
+Kaalyx reads two files: **`config.yaml`** (settings) and **`.env`** (API keys/secrets).
+
+When installed with pipx, both live in the standard config directory:
+
+```
+~/.config/kaalyx/config.yaml
+~/.config/kaalyx/.env
+```
+
+(`$XDG_CONFIG_HOME/kaalyx/` is honoured if set.) The first time you run a scan — or any
+time you run the command below — Kaalyx creates that directory with template files if they
+don't exist yet, so a fresh install just works. To see the exact paths on your machine:
+
+```bash
+kaalyx config --path
+```
+
+**Lookup order** (highest wins): a `--config PATH` flag → `./config.yaml` in the current
+directory (handy inside a source checkout) → `~/.config/kaalyx/config.yaml`. A local `./.env`
+likewise takes precedence over `~/.config/kaalyx/.env`.
+
+Edit `~/.config/kaalyx/.env` to add keys. Any missing key simply disables that source —
+Kaalyx never crashes for a missing key. CLI flags override `config.yaml`, which overrides
+the built-in defaults.
+
+### Multiple GitHub tokens (rate-limit rotation)
+
+`github-subdomains`, `trufflehog`, and the GitHub Actions audit all use a GitHub token, so a
+single token can hit GitHub's API rate limit quickly. Provide several and Kaalyx rotates
+across them. One token behaves exactly as before. In `.env`, use either form (they merge):
+
+```dotenv
+# comma-separated list…
+GITHUB_TOKENS=token1,token2,token3
+# …and/or numbered singles
+GITHUB_TOKEN=token1
+GITHUB_TOKEN_2=token2
+GITHUB_TOKEN_3=token3
+```
 
 ---
 

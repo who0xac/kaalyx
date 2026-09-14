@@ -154,14 +154,24 @@ class OsintProgress:
 
     def _refresh(self) -> None:
         if self._live is not None:
-            self._live.update(self._render())
+            self._live.refresh()
 
     def live(self):
-        """Context manager yielding a ``rich.Live`` bound to this progress board."""
+        """Context manager yielding an auto-refreshing ``rich.Live`` for this board.
+
+        ``get_renderable=self._render`` makes Live recompute the board on every one of its
+        ``refresh_per_second`` ticks (not only on start/finish events), so the spinner frame
+        — derived from the clock in ``_render`` — animates continuously even while a slow
+        source (e.g. theHarvester) blocks between events.
+        """
         from rich.live import Live
 
         self._live = Live(
-            self._render(), console=self._console, refresh_per_second=12, transient=False
+            get_renderable=self._render,
+            console=self._console,
+            refresh_per_second=12,
+            auto_refresh=True,
+            transient=False,
         )
         return self._live
 

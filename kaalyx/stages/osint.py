@@ -337,9 +337,10 @@ class OsintStage(Stage):
             res.skipped, res.note = True, "skipped: GITHUB_TOKEN not set"
             return res
         # Pass the token via env, not argv, so it never appears in the process list.
+        # next_github_token() rotates across configured tokens to spread rate-limit usage.
         cmd = ["github-subdomains", "-d", self.ctx.target.registrable]
         out = await self.ctx.runner.run(
-            cmd, env={"GITHUB_TOKEN": self.ctx.secrets.github_token or ""},
+            cmd, env={"GITHUB_TOKEN": self.ctx.secrets.next_github_token() or ""},
             timeout=300, label="github-subdomains",
         )
         if not out.started:
@@ -356,7 +357,7 @@ class OsintStage(Stage):
         org = self.ctx.target.registrable.split(".")[0]
         cmd = ["trufflehog", "github", "--org", org, "--json"]
         out = await self.ctx.runner.run(
-            cmd, env={"GITHUB_TOKEN": self.ctx.secrets.github_token or ""},
+            cmd, env={"GITHUB_TOKEN": self.ctx.secrets.next_github_token() or ""},
             timeout=1800, label="trufflehog",
         )
         if not out.started:
@@ -442,8 +443,10 @@ class OsintStage(Stage):
 
     async def _src_misconfig(self) -> SourceResult:
         res = SourceResult(name="third_party_misconfig")
+        # -output-json gives structured, reliable results; without it the tool's progress
+        # and "not found" log lines are indistinguishable from real hits in plain text.
         cmd = ["misconfig-mapper", "-target", self.ctx.target.registrable,
-               "-as-domain", "-service", "*"]
+               "-as-domain", "-service", "*", "-output-json"]
         out = await self.ctx.runner.run(cmd, timeout=600, label="misconfig-mapper")
         if not out.started:
             res.skipped, res.note = True, "skipped: misconfig-mapper not on PATH"
@@ -521,10 +524,10 @@ class OsintStage(Stage):
             return res
         org = self.ctx.target.registrable.split(".")[0]
         json_out = self.ctx.writer.stage_dir(self.name) / "_gato.json"
+        gh = self.ctx.secrets.next_github_token() or ""
         out = await self.ctx.runner.run(
             ["gato", "enumerate", "-t", org, "--output-json", str(json_out)],
-            env={"GITHUB_TOKEN": self.ctx.secrets.github_token or "",
-                 "GH_TOKEN": self.ctx.secrets.github_token or ""},
+            env={"GITHUB_TOKEN": gh, "GH_TOKEN": gh},
             timeout=900, label="gato",
         )
         if not out.started:

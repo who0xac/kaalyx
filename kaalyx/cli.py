@@ -57,13 +57,6 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-def _update_callback(value: bool) -> None:
-    if value:
-        setup_logging()
-        _do_update()
-        raise typer.Exit()
-
-
 def _show_help(ctx: typer.Context) -> None:
     """Print the standard help, then exit. The banner + quick-start are printed by ``run()``."""
     console.print(ctx.get_help())
@@ -78,8 +71,12 @@ def main(
         help="Show version and exit.",
     ),
     _update: bool = typer.Option(
-        False, "--update", "-u", callback=_update_callback, is_eager=True,
+        False, "--update", "-u",
         help="Update Kaalyx to the latest version from GitHub and exit.",
+    ),
+    _verbose: bool = typer.Option(
+        False, "--verbose", "-vv",
+        help="With -u/--update: show technical detail (commit hashes, pipx output).",
     ),
 ) -> None:
     """Automated bug-bounty reconnaissance & vulnerability-discovery pipeline.
@@ -87,6 +84,14 @@ def main(
     Run [bold]kaalyx scan <domain>[/] to start a scan, and [bold]kaalyx tools[/] to check
     or install the external tools it drives.
     """
+    # `-u/--update` is handled here (not via an eager callback) so it can read the sibling
+    # `-vv/--verbose` flag — an eager callback runs before other options are parsed and so
+    # can't see verbose. This makes `kaalyx -u -vv` work and match `kaalyx update -vv`.
+    if _update:
+        setup_logging()
+        _do_update(verbose=_verbose)
+        raise typer.Exit()
+
     # Show the banner + help on a bare `kaalyx` invocation. (`kaalyx --help` is handled by
     # the root help callback below so the banner also appears there.)
     if ctx.invoked_subcommand is None and not ctx.resilient_parsing:
@@ -837,7 +842,7 @@ def _do_update(verbose: bool = False) -> None:
         else:
             console.print(
                 f"[yellow]⚠ Update failed[/] (exit {code})."
-                + ("" if verbose else " Run [bold]kaalyx update --verbose[/] for details.")
+                + ("" if verbose else " Run [bold]kaalyx update -vv[/] for details.")
             )
         raise typer.Exit(code=code)
 
@@ -865,7 +870,7 @@ def _do_update(verbose: bool = False) -> None:
         console.print(
             f"[yellow]⚠ Update did not take effect[/] — still on {installed_now}, "
             f"expected {remote_sha}."
-            + ("" if verbose else " Run [bold]kaalyx update --verbose[/] for details.")
+            + ("" if verbose else " Run [bold]kaalyx update -vv[/] for details.")
         )
         raise typer.Exit(code=1)
 

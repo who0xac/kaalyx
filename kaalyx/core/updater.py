@@ -189,28 +189,53 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
             f"'git+{REPO_URL}.git@{target}'."
         )
 
+    # Installing a git+ spec requires git on PATH to clone the repo. Without it pip fails deep
+    # in its output with an opaque clone error; check up front and say so plainly.
+    if shutil.which("git") is None:
+        return 5, (
+            "git is not on PATH. Installing from GitHub needs git to clone the repo. "
+            "Install it (e.g. `sudo apt install git`) and retry."
+        )
+
     spec = f"git+{REPO_URL}.git@{target}"
-    # --pip-args forwards flags to the pip that pipx runs inside the venv: --no-cache-dir
-    # forbids reusing a cached wheel, --force-reinstall rebuilds even if the version string
-    # is unchanged (it rarely bumps during active development).
-    cmd = [
+    # Primary command pins the exact commit and forces a no-cache rebuild via --pip-args.
+    # Some older pipx builds mishandle a multi-flag --pip-args string, so if the primary
+    # fails we retry with a plain pinned install (still the exact commit, so still a genuine
+    # update — just without the belt-and-braces pip flags). Each attempt's output is captured
+    # so the caller can show the REAL underlying pip/git error under -vv.
+    primary = [
         "pipx", "install", "--force",
         "--pip-args=--no-cache-dir --force-reinstall",
         spec,
     ]
-    try:
-        if capture:
-            # Decode as UTF-8 with replacement: pipx prints emoji (✨🌟) that crash the
-            # default cp1252 pipe reader on Windows.
-            completed = subprocess.run(
-                cmd, check=False, capture_output=True,
-                encoding="utf-8", errors="replace",
-            )
-            return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
-        completed = subprocess.run(cmd, check=False)
-        return completed.returncode, ""
-    except OSError as exc:  # pragma: no cover
-        return 4, f"Failed to launch pipx: {exc}"
+    fallback = ["pipx", "install", "--force", spec]
+
+    def _run(cmd: list[str]) -> tuple[int, str]:
+        try:
+            if capture:
+                # Decode as UTF-8 with replacement: pipx prints emoji (✨🌟) that crash the
+                # default cp1252 pipe reader on Windows.
+                completed = subprocess.run(
+                    cmd, check=False, capture_output=True,
+                    encoding="utf-8", errors="replace",
+                )
+                out = (completed.stdout or "") + (completed.stderr or "")
+                return completed.returncode, f"$ {' '.join(cmd)}\n{out}"
+            completed = subprocess.run(cmd, check=False)
+            return completed.returncode, ""
+        except OSError as exc:  # pragma: no cover
+            return 4, f"Failed to launch pipx ({' '.join(cmd)}): {exc}"
+
+    code, output = _run(primary)
+    if code != 0:
+        # Retry without --pip-args (covers pipx versions that reject the multi-flag string),
+        # unless the failure is clearly a network problem where a retry won't help.
+        if not is_network_error(output):
+            code2, output2 = _run(fallback)
+            # Keep both attempts' output so -vv shows what actually failed.
+            output = output + "\n--- retry without --pip-args ---\n" + output2
+            code = code2
+    return code, output
 
 
 def installed_version_via_pipx(timeout: float = 10.0) -> str | None:

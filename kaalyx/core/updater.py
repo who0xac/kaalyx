@@ -62,10 +62,27 @@ def write_installed_commit(sha: str) -> None:
         logger.debug("Could not record installed commit: %s", exc)
 
 
-def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str] | None:
-    """Return ``(short_sha, iso_date)`` of the latest commit on the repo's branch.
+def short_sha(sha: str | None) -> str | None:
+    """Normalise any commit SHA to a common 7-char prefix for comparison/display.
 
-    ``None`` on any network/parse failure (the caller reports it and exits cleanly).
+    ``git rev-parse --short`` returns a *variable*-length abbreviation (git widens it as a
+    repo grows to keep it unambiguous), while the GitHub API gives a full 40-char SHA. Both
+    must be reduced to the same width or equality checks misfire — a full SHA and its own
+    abbreviation would compare unequal. 7 is git's conventional floor and unambiguous for a
+    repo this size.
+    """
+    if not sha:
+        return None
+    return sha.strip()[:7] or None
+
+
+def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str, str] | None:
+    """Return ``(short_sha, full_sha, iso_date)`` of the latest commit on the repo's branch.
+
+    The *full* SHA matters: we pin the pipx install to it (``@<full_sha>``) so the install
+    URL changes per commit — which is what actually defeats pip's URL-keyed clone/wheel
+    cache — and we record it verbatim as install state. ``None`` on any network/parse
+    failure (the caller reports it and exits cleanly).
     """
     try:
         resp = httpx.get(
@@ -78,13 +95,13 @@ def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str] | None:
             logger.debug("GitHub API returned HTTP %s", resp.status_code)
             return None
         data = resp.json()
-        sha = str(data.get("sha", ""))[:7]
+        full = str(data.get("sha", "")).strip()
         date = (
             data.get("commit", {}).get("committer", {}).get("date", "")
             if isinstance(data.get("commit"), dict)
             else ""
         )
-        return (sha, date) if sha else None
+        return (full[:7], full, date) if full else None
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         # The caller reports this cleanly to the user; keep it at debug to avoid double noise.
         logger.debug("Could not reach GitHub to check for updates: %s", exc)
@@ -95,15 +112,44 @@ def pipx_available() -> bool:
     return shutil.which("pipx") is not None
 
 
+def commit_from_package_metadata() -> str | None:
+    """Return the exact commit pip resolved when it installed this package, or ``None``.
+
+    pip records the resolved VCS commit for any ``git+…`` install in a PEP 610
+    ``direct_url.json`` file inside the installed distribution's metadata
+    (``vcs_info.commit_id``). This is *authoritative* for a pipx install — it reflects the
+    bytes actually on disk, not what we hoped got installed — so it's how we verify an update
+    genuinely happened rather than trusting pipx's exit code. Absent for an editable/dev
+    install (there is no VCS pin), hence ``None`` there.
+    """
+    try:
+        import importlib.metadata as im
+
+        raw = im.distribution("kaalyx").read_text("direct_url.json")
+        if not raw:
+            return None
+        import json
+
+        info = json.loads(raw).get("vcs_info") or {}
+        commit = str(info.get("commit_id", "")).strip()
+        return commit or None
+    except Exception as exc:  # metadata missing, not a VCS install, malformed JSON, …
+        logger.debug("Could not read commit from package metadata: %s", exc)
+        return None
+
+
 def installed_commit(timeout: float = 5.0) -> str | None:
     """Return the short commit this Kaalyx install was built from, or ``None`` if unknown.
 
-    Order of truth:
-      1. a dev git checkout — read ``.git`` HEAD directly (always authoritative locally), else
-      2. the recorded state file from the last successful update (the pipx-install case).
+    Order of truth (most authoritative first):
+      1. a dev git checkout — read ``.git`` HEAD directly, else
+      2. the exact commit pip pinned in the installed package's PEP 610 metadata
+         (reflects the bytes truly on disk for a ``git+…`` pipx install), else
+      3. the recorded state file from the last successful update.
 
-    ``None`` only when neither is available (a fresh pipx install that has never self-updated
-    through this tool) — the caller then can't prove up-to-date and treats it as "update".
+    Prefer (2) over (3) so a stale/incorrectly-written state file can never override what is
+    genuinely installed. ``None`` only when none are available — the caller then can't prove
+    up-to-date and treats it as "update".
     """
     repo_dir = Path(__file__).resolve().parent.parent.parent
     if (repo_dir / ".git").exists():
@@ -114,28 +160,44 @@ def installed_commit(timeout: float = 5.0) -> str | None:
             )
             sha = out.stdout.strip()
             if sha:
-                return sha
+                return short_sha(sha)
         except (OSError, subprocess.SubprocessError):
             pass
-    return read_installed_commit()
+    return short_sha(commit_from_package_metadata() or read_installed_commit())
 
 
-def reinstall_from_repo(capture: bool = True) -> tuple[int, str]:
+def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[int, str]:
     """Reinstall Kaalyx from the GitHub repo via ``pipx install --force``.
 
-    Uses pipx's git spec so a pipx user gets an in-place upgrade to the latest ``main``.
+    *ref* is the git ref to install; pass the full commit SHA (from
+    :func:`latest_remote_commit`) so the install is pinned to exactly that commit. This is
+    what makes an update genuine: ``git+…@main`` is the *same URL* every run, so pip happily
+    serves a cached clone/wheel and pipx exits 0 without new code landing; ``git+…@<sha>`` is
+    a distinct URL per commit, sidestepping that cache. We *also* pass ``--no-cache-dir`` and
+    ``--force-reinstall`` to pip as a belt-and-braces guarantee of a fresh build. Falls back
+    to ``main`` only if no ref is given.
+
     When *capture* is True, pipx's output is captured (hidden) and returned so the caller can
     show it only under --verbose; when False it streams to the terminal. Returns
     ``(exit_code, captured_output)``.
     """
+    target = ref or BRANCH
     if not pipx_available():
         return 3, (
             "pipx is not on PATH. Kaalyx self-update uses pipx; install pipx, or update "
-            f"manually with: pip install --force-reinstall 'git+{REPO_URL}.git@{BRANCH}'."
+            f"manually with: pip install --force-reinstall --no-cache-dir "
+            f"'git+{REPO_URL}.git@{target}'."
         )
 
-    spec = f"git+{REPO_URL}.git@{BRANCH}"
-    cmd = ["pipx", "install", "--force", spec]
+    spec = f"git+{REPO_URL}.git@{target}"
+    # --pip-args forwards flags to the pip that pipx runs inside the venv: --no-cache-dir
+    # forbids reusing a cached wheel, --force-reinstall rebuilds even if the version string
+    # is unchanged (it rarely bumps during active development).
+    cmd = [
+        "pipx", "install", "--force",
+        "--pip-args=--no-cache-dir --force-reinstall",
+        spec,
+    ]
     try:
         if capture:
             # Decode as UTF-8 with replacement: pipx prints emoji (✨🌟) that crash the

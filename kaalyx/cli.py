@@ -795,23 +795,26 @@ def _do_update(verbose: bool = False) -> None:
             raise typer.Exit(code=1)
 
         progress.update(task, completed=20)  # check succeeded
-        remote_sha, remote_date = latest
+        remote_sha, remote_full, remote_date = latest
 
         # Already up to date (provable only when we know the installed commit) => skip the
-        # reinstall entirely.
+        # reinstall entirely. local_sha comes from what is *genuinely* installed (package
+        # metadata / git HEAD), not merely from a prior recorded intention.
         if local_sha and local_sha == remote_sha:
             progress.stop()
             if verbose:
                 console.print(f"[dim]installed commit: {local_sha} == latest {remote_sha}[/]")
-            console.print(f"[green]✔ Already up to date[/] (v{current})")
+            console.print(f"[green]✔ Already up to date[/] (v{current}, {remote_sha})")
             return
 
         # --- Step 2/3: prepare + reinstall via pipx (bar fills during the real reinstall). ---
+        # Pin the install to the exact remote commit so pip cannot serve a cached build.
         progress.update(task, description="Update found, preparing", completed=40)
         progress.update(task, description="Pulling latest changes", completed=45)
         progress.update(task, description="Reinstalling via pipx")
         code, output = _run_while_advancing(
-            progress, task, lambda: updater.reinstall_from_repo(capture=True), 45, 100
+            progress, task,
+            lambda: updater.reinstall_from_repo(ref=remote_full, capture=True), 45, 100
         )
         # Fill to 100% only on genuine success; on failure leave it partial so the dots
         # never imply a completed update.
@@ -838,8 +841,13 @@ def _do_update(verbose: bool = False) -> None:
             )
         raise typer.Exit(code=code)
 
-    # --- Success is reported ONLY when pipx exited 0 AND the package is verifiably present. ---
+    # --- Success is claimed ONLY when the commit now on disk is verifiably the remote one. ---
+    # We do NOT trust pipx's exit code as proof: pip can exit 0 having served a cached build,
+    # leaving old code in place. Read the commit pip actually pinned into the package's PEP
+    # 610 metadata and require it to match the remote before recording state or reporting success.
     new_version = updater.installed_version_via_pipx()
+    installed_now = updater.short_sha(updater.commit_from_package_metadata())
+
     if new_version is None:
         # pipx returned 0 but we can't confirm the install — do not claim success.
         console.print(
@@ -848,20 +856,34 @@ def _do_update(verbose: bool = False) -> None:
         )
         raise typer.Exit(code=1)
 
+    if verbose:
+        console.print(f"[dim]commit on disk after install: {installed_now or 'unknown'}[/]")
+
+    if installed_now is not None and installed_now != remote_sha:
+        # The bytes on disk are NOT the remote commit — a genuine failure to update (stale
+        # cache, or pipx installed something else). Never record a commit we didn't install.
+        console.print(
+            f"[yellow]⚠ Update did not take effect[/] — still on {installed_now}, "
+            f"expected {remote_sha}."
+            + ("" if verbose else " Run [bold]kaalyx update --verbose[/] for details.")
+        )
+        raise typer.Exit(code=1)
+
     # Record the commit we just installed so the next run can tell "already up to date" from
-    # a genuine update (a pipx install has no .git to read a HEAD from).
-    updater.write_installed_commit(remote_sha)
+    # a genuine update (a pipx install has no .git to read a HEAD from). Prefer the verified
+    # on-disk commit; fall back to the remote full SHA if metadata was unreadable.
+    updater.write_installed_commit(installed_now or remote_full)
 
     if new_version != current:
         # Version string actually changed — the clearest signal of a real update.
-        console.print(f"[green]✔ Updated:[/] v{current} → v{new_version}")
+        console.print(f"[green]✔ Updated:[/] v{current} → v{new_version} ({remote_sha})")
     elif local_sha and local_sha != remote_sha:
         # Same version string but the code moved to a newer commit.
-        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version}, {remote_sha})")
+        console.print(f"[green]✔ Updated:[/] {local_sha} → {remote_sha} (v{new_version})")
     else:
         # We could not prove the prior commit (first self-update on a pipx install); we did
         # reinstall the latest. State is now recorded, so subsequent runs report accurately.
-        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version})")
+        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version}, {remote_sha})")
 
 
 @app.command(context_settings=_HELP_CTX, short_help="Update Kaalyx to the latest version.")

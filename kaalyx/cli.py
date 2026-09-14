@@ -113,30 +113,37 @@ _COMMAND_REFERENCE: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("", "", "-i, --install       Install missing tools"),
         ("", "", "--check-only        Report only (no install)"),
         ("update", "Update Kaalyx to the latest version from GitHub.", ""),
-        ("", "", "--verbose           Show technical detail"),
+        ("", "", "-vv, --verbose      Show technical detail"),
     ]),
 ]
 
 
 def _print_command_reference() -> None:
-    """Print the custom, flag-aware command reference panels for the main help screen."""
+    """Print the custom, flag-aware command reference panels for the main help screen.
+
+    Each command's flags are shown under a ``kaalyx <cmd> [FLAGS]`` usage line and indented,
+    so it is unmistakable the flags belong to that command — you type them AFTER the command
+    name, they are not standalone options on bare ``kaalyx``.
+    """
     from rich.panel import Panel
     from rich.text import Text
 
     for title, entries in _COMMAND_REFERENCE:
         lines: list[Text] = []
         for name, summary, flag_line in entries:
-            if name:  # a command header row
+            if name:  # a command header row: "kaalyx <cmd>   <summary>"
                 if lines:
                     lines.append(Text(""))  # blank line between commands
-                row = Text(f"{name:<8}", style="bold cyan")
-                row.append(summary, style="white")
+                row = Text("kaalyx ", style="dim")
+                row.append(f"{name}", style="bold cyan")
+                row.append("   " + summary, style="white")
                 lines.append(row)
-            else:      # an indented flag row
-                lines.append(Text(f"        {flag_line}", style="dim"))
+            else:      # a flag row, indented under its command
+                lines.append(Text(f"    {flag_line}", style="dim"))
         body = Text("\n").join(lines)
         console.print(
             Panel(body, title=f"[bold]{title}[/]", title_align="left",
+                  subtitle="[dim]flags go after the command name[/]", subtitle_align="right",
                   border_style="cyan", padding=(0, 1))
         )
 
@@ -460,7 +467,7 @@ def scan(
         rich_help_panel="General",
     ),
     verbose: bool = typer.Option(
-        False, "--verbose", "-v",
+        False, "--verbose", "-vv",
         help="Debug-level logging to console + file.",
         rich_help_panel="General",
     ),
@@ -574,7 +581,7 @@ def scan(
 def resume(
     target: str = typer.Argument(..., help="Target of the scan to resume."),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    verbose: bool = typer.Option(False, "--verbose", "-vv"),
 ) -> None:
     """Resume the last interrupted scan for TARGET from its last completed stage."""
     _run_scan(target, config_path=config, verbose=verbose, resume=True)
@@ -868,7 +875,7 @@ def _do_update(verbose: bool = False) -> None:
 @app.command(rich_help_panel="Info", context_settings=_HELP_CTX, hidden=True)
 def update(
     verbose: bool = typer.Option(
-        False, "--verbose", "-v",
+        False, "--verbose", "-vv",
         help="Show technical detail (commit hashes, pipx output).",
     ),
 ) -> None:

@@ -106,8 +106,12 @@ async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[
     spf = next((t for t in txts if t.lower().startswith("v=spf1")), None)
     if spf:
         records.append(OsintRecord(kind="spf", value=spf, source=source))
-        low = spf.lower()
-        if low.rstrip().endswith("+all") or "?all" in low:
+        # Match the `all` mechanism's qualifier anywhere in the record. A bare `all` with no
+        # qualifier defaults to `+all` (pass), so it is permissive too.
+        all_match = re.search(r"(?:^|\s)([+?~-]?)all(?:\s|$)", spf.lower())
+        qualifier = all_match.group(1) if all_match else ""
+        if all_match and qualifier in ("+", "?", ""):
+            shown = f"{qualifier}all" if qualifier else "all (defaults to +all)"
             findings.append(
                 Finding(
                     title="Weak SPF policy (permissive 'all')",
@@ -116,7 +120,7 @@ async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[
                     confidence=Confidence.CONFIRMED,
                     target=domain,
                     tool=source,
-                    description="SPF record allows unlisted senders (+all/?all), weakening anti-spoofing.",
+                    description=f"SPF allows unlisted senders ({shown}), weakening anti-spoofing.",
                     evidence=spf,
                 )
             )
@@ -471,11 +475,18 @@ async def harvest_emails(domain: str) -> list[Email]:
     found: dict[str, str] = {}  # address -> source(s)
 
     def _add(addr: str, src: str) -> None:
-        addr = addr.strip().lower()
+        addr = addr.strip().lower().strip(".")
         if not addr or "@" not in addr:
             return
+        local, _, host = addr.partition("@")
+        # Reject malformed local parts (empty, leading/trailing dot, consecutive dots) and
+        # placeholder patterns where the local part is the domain itself — these are template
+        # artifacts from the source pages, not real addresses.
+        if not local or local.startswith(".") or local.endswith(".") or ".." in local:
+            return
+        if local == domain or local == host:
+            return
         # Keep only addresses actually at the target domain (or a subdomain of it).
-        _, _, host = addr.partition("@")
         if not (host == domain or host.endswith("." + domain)):
             return
         if addr in found:
@@ -536,8 +547,9 @@ def _xml_value(xml_text: str, tag: str) -> str | None:
     return xml_text[start:end].strip()
 
 
-# Google dork templates grouped by intent (taxonomy inspired by reNgine's dork categories).
-# ``{d}`` is replaced with the domain. Each category is a purpose the user scans for.
+# Google dork templates grouped by intent. ``{d}`` is replaced with the domain; each
+# category is a purpose an experienced hunter searches for. These generate ready-to-click
+# search URLs only — Kaalyx never scrapes results.
 _DORK_CATEGORIES: dict[str, list[str]] = {
     "overview": [
         'site:{d}',
@@ -547,16 +559,58 @@ _DORK_CATEGORIES: dict[str, list[str]] = {
         'site:{d} inurl:admin OR inurl:login OR inurl:signin OR inurl:dashboard OR inurl:portal',
         'site:{d} intitle:"login" OR intitle:"admin"',
     ],
+    "auth_recovery": [
+        'site:{d} inurl:reset OR inurl:forgot OR inurl:recover OR inurl:password-reset',
+        'site:{d} intitle:"reset password" OR intitle:"forgot password" OR intitle:"account recovery"',
+    ],
+    "nonprod_env": [
+        'site:{d} inurl:dev OR inurl:staging OR inurl:stage OR inurl:test OR inurl:uat OR inurl:qa OR inurl:preprod',
+        'site:{d} intitle:"staging" OR intitle:"dev" OR intitle:"test environment"',
+    ],
     "api": [
-        'site:{d} inurl:api OR inurl:swagger OR inurl:graphql OR inurl:rest',
+        'site:{d} inurl:api OR inurl:graphql OR inurl:rest OR inurl:v1 OR inurl:v2',
         'site:{d} ext:json inurl:api',
+    ],
+    "swagger_apidocs": [
+        'site:{d} inurl:swagger OR inurl:swagger-ui OR inurl:openapi OR inurl:api-docs',
+        'site:{d} ext:json "swagger" OR ext:yaml "openapi"',
+    ],
+    "file_upload": [
+        'site:{d} inurl:upload OR inurl:fileupload OR inurl:import OR inurl:attachment',
+        'site:{d} intitle:"upload" intext:"choose file" OR intext:"drag and drop"',
     ],
     "config_files": [
         'site:{d} ext:env OR ext:conf OR ext:cfg OR ext:ini OR ext:yaml OR ext:yml',
         'site:{d} ext:xml OR ext:json filetype:config',
     ],
+    "server_config": [
+        'site:{d} ext:htaccess OR ext:htpasswd OR filetype:htaccess',
+        'site:{d} inurl:web.config OR ext:config "connectionString"',
+    ],
+    "ci_cd": [
+        'site:{d} inurl:jenkins OR inurl:.gitlab-ci.yml OR inurl:.travis.yml OR inurl:circleci',
+        'site:{d} ext:yml "pipeline" OR ext:yaml "workflow" OR inurl:.github/workflows',
+    ],
     "db_files": [
         'site:{d} ext:sql OR ext:db OR ext:dbf OR ext:bak OR ext:backup',
+    ],
+    "backups": [
+        'site:{d} ext:zip OR ext:tar OR ext:gz OR ext:rar OR ext:7z OR ext:tgz',
+        'site:{d} ext:bak OR ext:old OR ext:swp OR ext:save OR "backup" filetype:sql',
+    ],
+    "error_debug": [
+        'site:{d} intext:"Warning: " OR intext:"Fatal error" OR intext:"Notice: " OR intext:"stack trace"',
+        'site:{d} intext:"SQL syntax" OR intext:"ORA-" OR intext:"Traceback (most recent call last)"',
+        'site:{d} inurl:phpinfo OR intitle:"phpinfo()" OR inurl:debug OR intext:"DEBUG = True"',
+    ],
+    "source_maps": [
+        'site:{d} ext:map "sourceMappingURL" OR inurl:.js.map',
+    ],
+    "git_exposure": [
+        'site:{d} inurl:.git OR inurl:.svn OR inurl:.gitignore OR inurl:.gitconfig',
+    ],
+    "open_redirect": [
+        'site:{d} inurl:redirect OR inurl:redir OR inurl:url= OR inurl:next= OR inurl:return=',
     ],
     "exposed_documents": [
         'site:{d} ext:pdf OR ext:doc OR ext:docx OR ext:xls OR ext:xlsx OR ext:ppt OR ext:pptx',
@@ -570,23 +624,43 @@ _DORK_CATEGORIES: dict[str, list[str]] = {
         'site:{d} intext:password OR intext:apikey OR intext:"api key" OR intext:secret OR intext:token',
         'site:{d} ext:log OR ext:old OR ext:txt intext:password',
     ],
-    "cms": [
+    "well_known": [
+        'site:{d} inurl:.well-known/security.txt',
+        'site:{d} inurl:.well-known',
+    ],
+    "cms_wordpress": [
         'site:{d} inurl:wp-content OR inurl:wp-admin OR inurl:wp-includes',
+        'site:{d} inurl:wp-config OR inurl:xmlrpc.php OR inurl:wp-json OR inurl:debug.log',
+    ],
+    "google_cache": [
+        # `cache:` surfaces Google's cached copy — useful for content removed from the live
+        # site but still in the index.
+        'cache:{d}',
     ],
     "code_sharing": [
         'site:github.com "{d}"',
         'site:gitlab.com "{d}"',
         'site:pastebin.com "{d}"',
         'site:stackoverflow.com "{d}"',
+        'site:gist.github.com "{d}"',
+        'site:jsfiddle.net OR site:codepen.io OR site:ideone.com "{d}"',
+        'site:npmjs.com OR site:hub.docker.com "{d}"',
     ],
     "project_management": [
         'site:trello.com "{d}"',
         'site:atlassian.net "{d}"',
+        'site:notion.so OR site:coda.io "{d}"',
+    ],
+    "social_profiles": [
+        'site:linkedin.com/company "{d}" OR site:linkedin.com/in "{d}"',
+        'site:twitter.com OR site:x.com "{d}"',
+        'site:facebook.com OR site:instagram.com "{d}"',
     ],
     "cloud_storage": [
         'site:s3.amazonaws.com "{d}"',
         'site:blob.core.windows.net "{d}"',
         'site:storage.googleapis.com "{d}"',
+        'site:digitaloceanspaces.com OR site:s3.wasabisys.com "{d}"',
     ],
 }
 

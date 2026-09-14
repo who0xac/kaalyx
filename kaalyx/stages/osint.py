@@ -196,11 +196,12 @@ class OsintStage(Stage):
             sev: counts.get(f"sev_{sev}", 0)
             for sev in ("critical", "high", "medium", "low", "info")
         }
-        source_states = [
-            (r.name, "failed" if not r.ok else ("skipped" if (r.skipped or (r.total == 0 and r.note.lower().startswith("skipped"))) else "done"),
-             r.total, r.note)
-            for r in results
-        ]
+        def _state(r: SourceResult) -> str:
+            if not r.ok:
+                return "failed"
+            return "skipped" if r.skipped else "done"
+
+        source_states = [(r.name, _state(r), r.total, r.note) for r in results]
         duration = sum(r.duration_s for r in results)
         console.print()
         console.print(osint_ui.summary_panel(

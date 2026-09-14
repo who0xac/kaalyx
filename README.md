@@ -91,13 +91,13 @@ kaalyx scan example.com --only-osint whois,dns,mail_dns,m365
 
 ## Configuration
 
-Kaalyx reads two files: **`config.yaml`** (settings) and **`.env`** (API keys/secrets).
+Kaalyx reads two files: **`config.yaml`** (settings) and **`config.env`** (API keys/secrets).
 
 When installed with pipx, both live in the standard config directory:
 
 ```
 ~/.config/kaalyx/config.yaml
-~/.config/kaalyx/.env
+~/.config/kaalyx/config.env
 ```
 
 (`$XDG_CONFIG_HOME/kaalyx/` is honoured if set.) The first time you run a scan — or any
@@ -109,10 +109,10 @@ kaalyx config --path
 ```
 
 **Lookup order** (highest wins): a `--config PATH` flag → `./config.yaml` in the current
-directory (handy inside a source checkout) → `~/.config/kaalyx/config.yaml`. A local `./.env`
-likewise takes precedence over `~/.config/kaalyx/.env`.
+directory (handy inside a source checkout) → `~/.config/kaalyx/config.yaml`. A local `./config.env`
+likewise takes precedence over `~/.config/kaalyx/config.env`.
 
-Edit `~/.config/kaalyx/.env` to add keys. Any missing key simply disables that source —
+Edit `~/.config/kaalyx/config.env` to add keys. Any missing key simply disables that source —
 Kaalyx never crashes for a missing key. CLI flags override `config.yaml`, which overrides
 the built-in defaults.
 
@@ -128,7 +128,7 @@ GITHUB_TOKEN_2=token2
 GITHUB_TOKEN_3=token3
 ```
 
-The generated `~/.config/kaalyx/.env` documents every key — which tool uses it and where to
+The generated `~/.config/kaalyx/config.env` documents every key — which tool uses it and where to
 get it — so it's clear what to fill in on first open.
 
 ---
@@ -140,6 +140,6 @@ kaalyx/            # the Python package (orchestrator, stages, data, UI, …)
 scripts/
   install.sh       # external-tool installer (apt/pacman)
 config.yaml        # default settings (overridable)
-.env.example       # secrets template
+config.env.example # secrets template
 pyproject.toml     # packaging + `kaalyx` entry point (pipx-installable)
 ```

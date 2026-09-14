@@ -16,9 +16,13 @@ kaalyx.log
 **/kaalyx.log
 
 # --- Secrets ---
+# config.env is the secrets file (was .env; renamed to a visible name). Both are ignored —
+# .env stays ignored as a legacy fallback so an old one is never committed by accident.
+config.env
+config.env.*
+!config.env.example
 .env
 .env.*
-!.env.example
 
 # --- Python ---
 __pycache__/

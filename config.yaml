@@ -1,4 +1,4 @@
-# Kaalyx configuration (settings only — secrets live in .env).
+# Kaalyx configuration (settings only — secrets live in config.env).
 # Every value here has a code-side default; this file overrides those.
 # CLI flags override this file. Precedence: CLI > config.yaml > built-in defaults.
 
@@ -50,7 +50,7 @@ scan:
 
 # --- Notifications ---
 telegram:
-  enabled: true         # if token/chat id missing in .env, auto-disabled at runtime
+  enabled: true         # if token/chat id missing in config.env, auto-disabled at runtime
   # Only critical/high findings trigger immediate alerts; info/low are saved silently.
   alert_min_severity: high
 

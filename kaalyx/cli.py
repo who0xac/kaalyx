@@ -260,7 +260,7 @@ def _run_scan(
     import logging
 
     setup_logging(logging.DEBUG if verbose else logging.INFO)
-    # First-run bootstrap: create ~/.config/kaalyx/{config.yaml,.env} templates if missing,
+    # First-run bootstrap: create ~/.config/kaalyx/{config.yaml,config.env} templates if missing,
     # so a fresh pipx install has a config location without the user creating folders.
     from .config import ensure_config_dir
 
@@ -269,18 +269,18 @@ def _run_scan(
         from .config import config_dir
         console.print(
             f"[dim]First run: created config templates in {config_dir()} "
-            "— edit .env there to add API keys. See 'kaalyx config --path'.[/]"
+            "— edit config.env there to add API keys. See 'kaalyx config --path'.[/]"
         )
     config = load_config(config_path)
     secrets = load_secrets()
     _apply_osint_selection(config, only_osint, skip_osint)
 
-    # Opt-in Telegram: --notify turns it on; it still needs .env credentials to actually
+    # Opt-in Telegram: --notify turns it on; it still needs config.env credentials to actually
     # send (the notifier no-ops without them). Absent the flag, force it off.
     config.telegram.enabled = bool(notify)
     if notify and not secrets.has_telegram:
         console.print(
-            "[yellow]--notify set but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing in .env "
+            "[yellow]--notify set but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing in config.env "
             "— notifications will be skipped.[/]"
         )
 
@@ -374,7 +374,7 @@ def scan(
     # --- Opt-in features ---
     notify: bool = typer.Option(
         False, "--notify", "-N",
-        help="Send Telegram notifications (needs .env credentials).",
+        help="Send Telegram notifications (needs config.env credentials).",
         rich_help_panel="Opt-in features",
     ),
     dashboard: bool = typer.Option(
@@ -687,15 +687,15 @@ def web(
     raise typer.Exit(code=1)
 
 
-@app.command(context_settings=_HELP_CTX, short_help="Show where config.yaml and .env live.")
+@app.command(context_settings=_HELP_CTX, short_help="Show where config.yaml and config.env live.")
 def config(
     path: bool = typer.Option(
-        False, "--path", help="Print the exact config.yaml and .env paths and exit.",
+        False, "--path", help="Print the exact config.yaml and config.env paths and exit.",
     ),
 ) -> None:
-    """Show (and create) Kaalyx's config directory, config.yaml and .env locations.
+    """Show (and create) Kaalyx's config directory, config.yaml and config.env locations.
 
-    Running this creates ~/.config/kaalyx/ with template config.yaml and .env if they
+    Running this creates ~/.config/kaalyx/ with template config.yaml and config.env if they
     don't exist yet, so a fresh pipx install can be configured without guessing paths.
     """
     from .config import config_file, env_file, ensure_config_dir
@@ -709,15 +709,12 @@ def config(
         + ("[green](exists)[/]" if cfg.exists() else "[yellow](missing)[/]")
     )
     console.print(
-        f"  .env        : {env}  "
+        f"  config.env  : {env}  "
         + ("[green](exists)[/]" if env.exists() else "[yellow](missing)[/]")
     )
-    # `.env` is a dotfile, hidden by a plain `ls` — list the real contents so the user can
-    # confirm it's genuinely there without needing `ls -a`.
     try:
         contents = sorted(p.name for p in directory.iterdir())
-        console.print(f"\n[dim]Directory contents (incl. dotfiles): {', '.join(contents)}[/]")
-        console.print("[dim]Note: .env is a hidden dotfile — use `ls -a` to see it, not plain `ls`.[/]")
+        console.print(f"\n[dim]Directory contents: {', '.join(contents)}[/]")
     except OSError:
         pass
     if created:
@@ -727,7 +724,7 @@ def config(
         )
     console.print(
         "\n[dim]Lookup order: a --config path > ./config.yaml (in the current dir) > "
-        "the config directory above. A local ./.env also takes precedence over the one here.[/]"
+        "the config directory above. A local ./config.env also takes precedence over the one here.[/]"
     )
 
 

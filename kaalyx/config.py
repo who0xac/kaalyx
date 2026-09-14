@@ -1,7 +1,7 @@
 """Configuration loading for Kaalyx.
 
 Precedence (highest wins): CLI flags > ``config.yaml`` > built-in defaults.
-Secrets are read separately from a ``.env`` file / the environment and are never mixed
+Secrets are read separately from a ``config.env`` file / the environment and are never mixed
 into the YAML settings object.
 
 The settings themselves are plain dataclasses so the rest of the codebase gets attribute
@@ -42,8 +42,12 @@ def config_file() -> Path:
 
 
 def env_file() -> Path:
-    """Path of the secrets file in the standard config directory."""
-    return config_dir() / ".env"
+    """Path of the secrets file in the standard config directory.
+
+    Named ``config.env`` (a normal visible file), not ``.env``, since a hidden dotfile is
+    easy to miss with a plain ``ls``.
+    """
+    return config_dir() / "config.env"
 
 
 def resolve_config_path(explicit: str | Path | None) -> Path | None:
@@ -67,19 +71,23 @@ def resolve_config_path(explicit: str | Path | None) -> Path | None:
 
 
 def resolve_env_path() -> Path | None:
-    """Resolve which .env to load: ``./.env`` in the CWD if present, else the standard
-    ``~/.config/kaalyx/.env``. Returns ``None`` if neither exists (env-only secrets then)."""
-    cwd = Path(".env")
-    if cwd.is_file():
-        return cwd
-    standard = env_file()
-    if standard.is_file():
-        return standard
+    """Resolve which secrets file to load: ``./config.env`` in the CWD if present, else the
+    standard ``~/.config/kaalyx/config.env``. A legacy ``./.env`` / ``~/.config/kaalyx/.env``
+    is still honoured as a fallback so an existing install keeps working after the rename.
+    Returns ``None`` if none exists (env-only secrets then)."""
+    for candidate in (
+        Path("config.env"),          # CWD, new name
+        Path(".env"),                # CWD, legacy fallback
+        env_file(),                  # standard dir, new name
+        config_dir() / ".env",       # standard dir, legacy fallback
+    ):
+        if candidate.is_file():
+            return candidate
     return None
 
 
 def ensure_config_dir() -> tuple[Path, list[Path]]:
-    """Create the config dir with template config.yaml and .env if they're missing.
+    """Create the config dir with template config.yaml and config.env if they're missing.
 
     Idempotent and non-destructive: only writes a file that does not already exist, so a
     user's edited config/secrets are never overwritten. Returns ``(dir, created_files)``.
@@ -307,13 +315,13 @@ def load_config(config_path: str | Path | None = None) -> Config:
 
 
 # --------------------------------------------------------------------------------------
-# Secrets (from .env / environment) — kept strictly separate from settings.
+# Secrets (from config.env / environment) — kept strictly separate from settings.
 # --------------------------------------------------------------------------------------
 
 
 @dataclass
 class Secrets:
-    """API keys and tokens sourced from the environment / ``.env``.
+    """API keys and tokens sourced from the environment / ``config.env``.
 
     A missing value simply disables the corresponding source or feature; Kaalyx never
     crashes because a key is absent. Booleans below let callers check availability
@@ -376,9 +384,9 @@ class Secrets:
 
 
 def load_secrets(env_path: str | Path | None = None) -> Secrets:
-    """Load secrets from a ``.env`` file (if present) plus the process environment.
+    """Load secrets from a ``config.env`` file (if present) plus the process environment.
 
-    If *env_path* is ``None``, resolution follows :func:`resolve_env_path` (``./.env`` >
+    If *env_path* is ``None``, resolution follows :func:`resolve_env_path` (``./config.env`` >
     standard config dir). Values already in the environment take precedence over the file
     (conventional ``python-dotenv`` behaviour; lets shell exports / CI override).
     """
@@ -433,7 +441,7 @@ def _collect_github_tokens() -> list[str]:
 # --------------------------------------------------------------------------------------
 
 _CONFIG_TEMPLATE = """\
-# Kaalyx configuration (settings only — secrets live in .env alongside this file).
+# Kaalyx configuration (settings only — secrets live in config.env alongside this file).
 # Precedence: CLI flags > this file > built-in defaults. Delete any key to use its default.
 
 general:
@@ -453,7 +461,7 @@ rate_limit:
   max_retries: 3
 
 telegram:
-  enabled: true          # auto-disabled if the bot token / chat id are missing in .env
+  enabled: true          # auto-disabled if the bot token / chat id are missing in config.env
   alert_min_severity: high
 
 # OSINT sub-checks — set any to false to skip it (a --skip-osint CLI flag also works).

@@ -183,6 +183,7 @@ class OsintConfig:
     m365: bool = True                # Microsoft 365 / Entra tenant mapping
     email_harvest: bool = True       # keyless email harvesting (email-format, skymem)
     breach_lookup: bool = True       # h8mail breach enrichment (needs key; else skips)
+    leak_search: bool = True         # LeakSearch — actual leaked creds from ProxyNova/COMB dump
     github_subdomains: bool = True
     trufflehog: bool = True          # GitHub org secret scan (needs GITHUB_TOKEN)
     cloud_enum: bool = True
@@ -337,6 +338,14 @@ class Secrets:
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
+    # Breach/credential-lookup extras — all optional. When set, they let h8mail surface actual
+    # leaked passwords/hashes (not just breach counts): an h8mail INI with credential-returning
+    # API keys (Snusbase/Dehashed/Leak-Lookup), a local "Breach Compilation" folder, and/or a
+    # local cleartext breach dump file. Absent => h8mail still runs and returns counts only.
+    h8mail_config: str | None = None
+    breach_comp_path: str | None = None
+    local_breach_path: str | None = None
+
     # Round-robin cursor for GitHub token rotation (not persisted; per-process).
     _gh_cursor: int = 0
 
@@ -408,6 +417,9 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
         ipinfo_token=_get("IPINFO_TOKEN"),
         telegram_bot_token=_get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_get("TELEGRAM_CHAT_ID"),
+        h8mail_config=_get("H8MAIL_CONFIG"),
+        breach_comp_path=_get("BREACH_COMP_PATH"),
+        local_breach_path=_get("LOCAL_BREACH_PATH"),
     )
 
 
@@ -472,6 +484,7 @@ osint:
   m365: true
   email_harvest: true
   breach_lookup: true
+  leak_search: true
   github_subdomains: true
   trufflehog: true
   cloud_enum: true
@@ -518,4 +531,16 @@ IPINFO_TOKEN=
 # Create a bot via @BotFather, then get your numeric chat id (e.g. via @userinfobot).
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+
+# Breach / leaked-credential lookup (used by: breach_lookup source, h8mail).
+# All optional. Without them, h8mail still runs and reports which breaches an email appears
+# in; WITH them, h8mail can return the ACTUAL leaked passwords/hashes:
+#   H8MAIL_CONFIG    = path to an h8mail INI with credential-returning API keys
+#                      (Snusbase / Dehashed / Leak-Lookup). See `h8mail -g` for a template.
+#   BREACH_COMP_PATH = path to a local "Breach Compilation" folder (h8mail -bc)
+#   LOCAL_BREACH_PATH= path to a local cleartext breach dump file (h8mail -lb)
+# (The keyless LeakSearch source needs no config — it queries the ProxyNova/COMB dump.)
+H8MAIL_CONFIG=
+BREACH_COMP_PATH=
+LOCAL_BREACH_PATH=
 """

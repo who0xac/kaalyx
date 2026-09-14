@@ -86,6 +86,8 @@ _SPECS: list[ToolSpec] = [
              executable="theHarvester"),
     ToolSpec("misconfig-mapper", Part.OSINT, "Third-party SaaS misconfig checks"),
     ToolSpec("h8mail", Part.OSINT, "Email breach/credential lookup (needs keys)"),
+    ToolSpec("leaksearch", Part.OSINT, "Leaked-credential search (ProxyNova/COMB dump)",
+             executable="LeakSearch"),
     ToolSpec("porch-pirate", Part.OSINT, "Public Postman workspace/API-leak search"),
     ToolSpec("swaggerspy", Part.OSINT, "Exposed Swagger/OpenAPI discovery",
              executable="swaggerspy"),

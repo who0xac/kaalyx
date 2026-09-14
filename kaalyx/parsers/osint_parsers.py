@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 
 from . import iter_json_lines, try_load_json
 from ..data.models import (
@@ -431,16 +432,62 @@ def parse_theharvester(stdout_or_json: str, domain: str,
     return emails, employees, subs
 
 
-def parse_h8mail(stdout_or_json: str, source: str = "h8mail") -> dict[str, tuple[int, str]]:
-    """Parse h8mail JSON output into a map of email -> (breach_count, breach_detail).
+# One recovered credential row from a breach source: the source's name and the value it
+# returned (a cleartext password, a hash, or another datum such as an IP). ``kind`` classifies
+# the value so the stage can label a finding correctly.
+@dataclass
+class BreachCredential:
+    email: str
+    source: str          # breach/source name, e.g. "BreachCompilation", "Snusbase"
+    value: str           # the leaked value: cleartext password, hash, etc.
+    kind: str            # "password" | "hash" | "other"
+
+
+@dataclass
+class H8mailResult:
+    """Per-email breach outcome: a count/detail summary plus any recovered credentials."""
+    count: int
+    detail: str
+    credentials: list[BreachCredential] = field(default_factory=list)
+
+
+# h8mail source labels whose returned value is a password vs. a hash vs. neither. h8mail tags
+# local-breach hits generically, so we also sniff the value's shape.
+_HASH_RE = re.compile(r"^[0-9a-f]{32}$|^[0-9a-f]{40}$|^[0-9a-f]{64}$|^\$[0-9a-z]{1,4}\$", re.I)
+
+
+def _classify_breach_value(source: str, value: str) -> str:
+    """Classify a breach value as ``"password"``, ``"hash"``, or ``"other"``.
+
+    A hash is detected by shape (hex of a common digest length, or a ``$id$`` crypt prefix);
+    anything else that looks like a credential value is treated as a cleartext password. An
+    empty value is ``"other"`` (nothing recovered — just a breach source name).
+    """
+    v = value.strip()
+    if not v:
+        return "other"
+    if _HASH_RE.match(v):
+        return "hash"
+    low = source.lower()
+    if "hash" in low:
+        return "hash"
+    return "password"
+
+
+def parse_h8mail(stdout_or_json: str, source: str = "h8mail") -> dict[str, H8mailResult]:
+    """Parse h8mail JSON output into a map of email -> :class:`H8mailResult`.
 
     h8mail (run with ``-j out.json``) writes ``{"targets": [{"target": email, "pwned": N,
     "data": [[source, value], ...]}]}``. NOTE: the count field is ``pwned`` (h8mail's
     attribute name), NOT ``pwn_num`` — and ``data`` entries are 2-item ``[source, value]``
-    lists/tuples, so the breach source is the FIRST element (not a ``str.split(":")``). The
-    stage uses this map to enrich already-harvested emails (reNgine's h8mail chaining).
+    lists/tuples: element 0 is the breach source, **element 1 is the recovered value** (a
+    cleartext password or hash when h8mail is run against a local breach compilation
+    (``-bc``/``-lb``) or a credential-returning API via ``-c``; empty when the source only
+    confirms membership). We keep BOTH — the earlier parser discarded element 1, so actual
+    leaked passwords never surfaced. The stage uses the summary to enrich harvested emails and
+    the credentials to raise per-credential findings.
     """
-    result: dict[str, tuple[int, str]] = {}
+    result: dict[str, H8mailResult] = {}
     doc = try_load_json(stdout_or_json)
     if not isinstance(doc, dict):
         return result
@@ -453,21 +500,105 @@ def parse_h8mail(stdout_or_json: str, source: str = "h8mail") -> dict[str, tuple
         # h8mail's count attribute is `pwned`; accept `pwn_num` too for other versions.
         count = int(target.get("pwned", target.get("pwn_num", 0)) or 0)
 
-        # `data` is a list of [source, value] pairs; the breach source is element 0. Fall
-        # back to string handling for older/variant shapes.
         names: list[str] = []
+        creds: list[BreachCredential] = []
         for entry in target.get("data") or []:
-            if isinstance(entry, (list, tuple)) and entry:
-                names.append(str(entry[0])[:40])
+            src_name, value = "", ""
+            if isinstance(entry, (list, tuple)):
+                if entry:
+                    src_name = str(entry[0])
+                if len(entry) > 1:
+                    value = str(entry[1])
             elif isinstance(entry, str):
-                names.append(entry.split(":")[0][:40])
+                # Older/variant shape "source:value" — split once, value is the remainder.
+                src_name, _, value = entry.partition(":")
+            src_name = src_name.strip()
+            value = value.strip()
+            if src_name:
+                names.append(src_name[:40])
+            if value:
+                creds.append(BreachCredential(
+                    email=email, source=src_name[:60] or source,
+                    value=value, kind=_classify_breach_value(src_name, value),
+                ))
         detail = ", ".join(dict.fromkeys(n for n in names if n))[:300]
 
         # A target counts as breached if the count is positive OR it carries breach data.
         if count == 0 and names:
             count = len(names)
-        result[email] = (count, detail)
+        result[email] = H8mailResult(count=count, detail=detail, credentials=creds)
     return result
+
+
+def parse_leaksearch(stdout_or_json: str, source: str = "LeakSearch",
+                     target: str = "") -> list[Finding]:
+    """Parse LeakSearch output into per-credential leak findings.
+
+    LeakSearch (``-o out.json``) returns entries from the ProxyNova/COMB credential dump. The
+    shape varies by version, so we read defensively: a list (or a dict wrapping a list under
+    ``results``/``data``/``leaks``) of records, each either a dict with ``user``/``username``/
+    ``email`` + ``password`` (and optional ``database``/``source``) or a raw ``"user:password"``
+    string. Every recovered credential becomes ONE finding carrying the actual leaked value —
+    that is the actionable OSINT (a real password, reusable/pattern-worthy) that a breach
+    *count* does not give. Nothing is masked; the full value is stored and shown.
+    """
+    findings: list[Finding] = []
+    doc = try_load_json(stdout_or_json)
+
+    records: list = []
+    if isinstance(doc, list):
+        records = doc
+    elif isinstance(doc, dict):
+        for key in ("results", "data", "leaks", "credentials"):
+            if isinstance(doc.get(key), list):
+                records = doc[key]
+                break
+        if not records and doc:  # a single record object
+            records = [doc]
+    elif doc is None:
+        # Not JSON — fall back to line-oriented "user:password" text (the -o txt form).
+        for line in (stdout_or_json or "").splitlines():
+            line = line.strip()
+            if line and ":" in line and " " not in line.split(":", 1)[0]:
+                records.append(line)
+
+    seen: set[str] = set()
+    for rec in records:
+        user = password = db = ""
+        if isinstance(rec, dict):
+            user = str(rec.get("user") or rec.get("username") or rec.get("email") or "").strip()
+            password = str(rec.get("password") or rec.get("pass") or rec.get("value") or "").strip()
+            db = str(rec.get("database") or rec.get("source") or rec.get("db") or "").strip()
+        elif isinstance(rec, str):
+            user, _, password = rec.partition(":")
+            user, password = user.strip(), password.strip()
+        if not user and not password:
+            continue
+        dedup = f"{user}:{password}:{db}"
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+        # Relevance: a credential whose username/email ties to the target is a direct hit;
+        # a bare keyword match (LeakSearch was seeded with the domain) is downgraded + flagged.
+        relevance = assess_target_relevance(user, target) if target else "direct"
+        has_pw = bool(password)
+        findings.append(Finding(
+            title=("Leaked credential (plaintext password)" if has_pw
+                   else "Leaked credential (account in dump)"),
+            category="credential-leak",
+            severity=Severity.HIGH if has_pw else Severity.MEDIUM,
+            confidence=_cap_for_relevance(
+                Confidence.FIRM if has_pw else Confidence.TENTATIVE, relevance),
+            target=user or password,
+            tool=source,
+            description=(f"Credential dump exposure for '{user}'"
+                         + (f" in {db}" if db else "")
+                         + (": password recovered." if has_pw else " (no plaintext password in this record).")
+                         + _relevance_note(relevance, target)),
+            evidence=(f"{user}:{password}" if has_pw else user)[:300],
+            raw=str(rec)[:500],
+        ))
+    return findings
 
 
 def parse_misconfig_mapper(stdout: str, source: str = "misconfig-mapper") -> list[Finding]:

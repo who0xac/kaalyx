@@ -24,6 +24,14 @@ Sources:
         Google-dork generation.
     key-dependent (skip cleanly if no key):  breach lookup (h8mail), and the key-gated
         tools above (github-subdomains, trufflehog).
+
+Credential/leak coverage (post-harvest chaining):
+    * breach lookup (h8mail) — reports which breaches an email appears in, and, when the
+      operator configures a local breach compilation / credential-returning API, the ACTUAL
+      leaked passwords/hashes (one finding per recovered credential), not just counts.
+    * leak search (LeakSearch) — keyless query of the ProxyNova/COMB credential dump for real
+      user:password pairs, keyed on the domain and each harvested email (ReconFTW's approach).
+    * CAA iodef contact emails (BBOT dnscaa) are harvested from mail_dns and feed both.
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ SOURCE_LABELS: dict[str, str] = {
     "m365": "M365 tenant map",
     "email_harvest": "Email harvest",
     "breach_lookup": "Breach lookup",
+    "leak_search": "Leak search (creds)",
     "github_subdomains": "GitHub subdomains",
     "trufflehog": "TruffleHog (org)",
     "cloud_enum": "Cloud enum",
@@ -120,6 +129,13 @@ class OsintStage(Stage):
         # (reNgine's h8mail chaining). It's a post-step, not a concurrent source.
         if ctx.config.osint.breach_lookup:
             await self._enrich_breaches(results)
+
+        # LeakSearch (ReconFTW) also runs post-harvest so it can query both the domain and each
+        # harvested email against the ProxyNova/COMB credential dump for ACTUAL leaked
+        # passwords — value distinct from h8mail's breach membership. Post-step for the same
+        # reason: it consumes the harvested emails.
+        if ctx.config.osint.leak_search:
+            await self._run_leak_search(results)
 
         return self._persist(results)
 
@@ -259,10 +275,22 @@ class OsintStage(Stage):
         except OSError:
             return
 
-        out = await self.ctx.runner.run(
-            ["h8mail", "-t", str(infile), "--json", str(outfile), "-q", "quiet"],
-            timeout=600, label="h8mail",
-        )
+        # Build the h8mail command. Beyond breach *counts*, h8mail can return actual cleartext
+        # passwords/hashes when pointed at a local breach compilation or credential-returning
+        # APIs — so we enable those whenever the operator has configured them (thoroughness
+        # over speed). All are optional: absent config => h8mail still runs and returns counts.
+        cmd = ["h8mail", "-t", str(infile), "--json", str(outfile), "-q", "quiet"]
+        breach_cfg = self.ctx.secrets.h8mail_config      # -c INI with API keys (Snusbase/Dehashed/…)
+        breach_comp = self.ctx.secrets.breach_comp_path  # -bc "Breach Compilation" torrent folder
+        local_breach = self.ctx.secrets.local_breach_path  # -lb local cleartext dump file(s)
+        if breach_cfg:
+            cmd += ["-c", breach_cfg]
+        if breach_comp:
+            cmd += ["-bc", breach_comp]
+        if local_breach:
+            cmd += ["-lb", local_breach]
+
+        out = await self.ctx.runner.run(cmd, timeout=1800, label="h8mail")
         if not out.started:
             self.log.info("breach lookup skipped — h8mail not runnable (emails kept)")
             return
@@ -273,36 +301,118 @@ class OsintStage(Stage):
             data = out.stdout
         breach_map = P.parse_h8mail(data)
         if not breach_map:
-            self.log.info("breach lookup: no breach data (likely no API keys configured)")
+            self.log.info("breach lookup: no breach data (likely no API keys / local breach configured)")
             return
 
         enriched: list[Email] = []
         findings: list[Finding] = []
+        cred_total = 0
         for e in emails:
-            count, detail = breach_map.get(e.address.lower(), (0, ""))
-            if count > 0:
-                enriched.append(Email(address=e.address, source="h8mail",
-                                      breached=True, breach_count=count, breach_detail=detail))
+            res = breach_map.get(e.address.lower())
+            if not res or res.count <= 0:
+                continue
+            # Note in the breach_detail how many actual credentials were recovered, so the
+            # emails table reflects "not just a yes/no".
+            detail = res.detail
+            if res.credentials:
+                detail = (detail + f" | {len(res.credentials)} credential(s) recovered").strip(" |")
+            enriched.append(Email(address=e.address, source="h8mail",
+                                  breached=True, breach_count=res.count, breach_detail=detail))
+            # Summary finding: appears in N breaches.
+            findings.append(Finding(
+                title=f"Breached credential: {e.address}",
+                category="credential-leak",
+                severity=self._breach_severity(res.count),
+                tool="h8mail",
+                target=e.address,
+                description=f"Appears in {res.count} known breach(es): {res.detail}",
+                evidence=res.detail,
+            ))
+            # One finding PER recovered credential, carrying the actual leaked value.
+            for cred in res.credentials:
+                cred_total += 1
+                is_pw = cred.kind == "password"
                 findings.append(Finding(
-                    title=f"Breached credential: {e.address}",
+                    title=(f"Leaked password for {cred.email}" if is_pw
+                           else f"Leaked {cred.kind} for {cred.email}"),
                     category="credential-leak",
-                    severity=self._breach_severity(count),
+                    severity=Severity.HIGH if is_pw else Severity.MEDIUM,
+                    confidence=Confidence.FIRM,
                     tool="h8mail",
-                    target=e.address,
-                    description=f"Appears in {count} known breach(es): {detail}",
-                    evidence=detail,
+                    target=cred.email,
+                    description=(f"{cred.kind.capitalize()} recovered from {cred.source}."),
+                    evidence=f"{cred.email}:{cred.value}",
                 ))
         if enriched:
             # Attach to a synthetic result so _persist stores them.
             results.append(SourceResult(
                 name="breach_lookup", ok=True, emails=enriched, findings=findings,
-                note=f"{len(enriched)} breached",
+                note=f"{len(enriched)} breached, {cred_total} credential(s) recovered",
             ))
-            self.log.warning("breach lookup: %d breached email(s) found", len(enriched))
+            self.log.warning("breach lookup: %d breached email(s), %d credential(s) recovered",
+                             len(enriched), cred_total)
 
     @staticmethod
     def _breach_severity(count: int) -> Severity:
         return Severity.HIGH if count >= 3 else Severity.MEDIUM
+
+    async def _run_leak_search(self, results: list[SourceResult]) -> None:
+        """Query LeakSearch (ReconFTW's credential-dump source) for ACTUAL leaked passwords.
+
+        LeakSearch searches the ProxyNova/COMB dump (keyless) and returns real user:password
+        pairs — value h8mail can't give without a local breach compilation. We key it on the
+        target DOMAIN (catches any ``user@domain`` in the dump) AND on each harvested email
+        (catches employees whose leaked account uses a different address). Skips cleanly if
+        the tool isn't installed. Each recovered credential becomes one finding.
+        """
+        if not self.ctx.runner.tool_available("LeakSearch") and \
+                not self.ctx.runner.tool_available("leaksearch"):
+            self.log.info("leak search skipped — LeakSearch not on PATH")
+            return
+        binary = "LeakSearch" if self.ctx.runner.tool_available("LeakSearch") else "leaksearch"
+
+        # Query keys: the registrable domain first, then each unique harvested email.
+        keys: list[str] = [self.ctx.target.registrable]
+        seen_emails = {e.address.lower() for r in results for e in r.emails}
+        keys += sorted(seen_emails)
+
+        stage_dir = self.ctx.writer.stage_dir(self.name)
+        findings: list[Finding] = []
+        combined_raw: list[str] = []
+        for i, key in enumerate(keys):
+            outfile = stage_dir / f"_leaksearch_{i}.json"
+            # -d ProxyNova = keyless online dump; -n 100 raises the default 20-result cap
+            # (thoroughness over speed); -o writes JSON we parse.
+            out = await self.ctx.runner.run(
+                [binary, "-k", key, "-d", "ProxyNova", "-n", "100", "-o", str(outfile)],
+                timeout=600, label="LeakSearch",
+            )
+            if not out.started:
+                self.log.info("leak search skipped — LeakSearch not runnable")
+                return
+            try:
+                data = outfile.read_text(encoding="utf-8")
+            except OSError:
+                data = out.stdout
+            combined_raw.append(f"# key={key}\n{data}")
+            findings.extend(P.parse_leaksearch(data, target=self.ctx.target.registrable))
+
+        self.ctx.writer.raw_tool_output(self.name, "leaksearch", "\n\n".join(combined_raw))
+        # Dedup findings by (target, evidence) since domain + email queries can overlap.
+        unique: dict[str, Finding] = {}
+        for f in findings:
+            unique.setdefault(f"{f.target}|{f.evidence}", f)
+        deduped = list(unique.values())
+        if deduped:
+            results.append(SourceResult(
+                name="leak_search", ok=True, findings=deduped,
+                note=f"{len(deduped)} leaked credential(s)",
+            ))
+            self.log.warning("leak search: %d leaked credential(s) found", len(deduped))
+        else:
+            results.append(SourceResult(
+                name="leak_search", ok=True, note="no leaked credentials found",
+            ))
 
     # -- external-tool sources ---------------------------------------------------------
 
@@ -647,8 +757,10 @@ class OsintStage(Stage):
     async def _src_mail_dns(self) -> SourceResult:
         res = SourceResult(name="mail_dns")
         domain = self.ctx.target.registrable
-        records, findings = await osint_inproc.check_mail_dns_security(domain)
+        records, findings, caa_emails = await osint_inproc.check_mail_dns_security(domain)
         res.osint, res.findings = records, findings
+        # CAA iodef contact emails feed the harvest → breach/leak chain (BBOT dnscaa).
+        res.emails = caa_emails
 
         # Spoofability verdict (Spoofy logic) layered on the SPF/DMARC records just fetched —
         # no extra DNS lookup. Only raise a finding when the domain IS spoofable.

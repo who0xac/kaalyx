@@ -792,6 +792,7 @@ install_phase_osint() {
     try install_retirejs
     try install_theharvester
     try install_h8mail
+    try install_leaksearch
     try install_porch_pirate
     try install_swaggerspy
     try install_gato
@@ -885,6 +886,12 @@ EOF
 
 install_h8mail()      { pipx_install h8mail h8mail; }
 install_porch_pirate() { pipx_install porch-pirate porch-pirate; }
+
+# LeakSearch (JoelGMSec): git clone + venv + wrapper. Kaalyx invokes it as `LeakSearch`
+# (capital L — matches the entry script name), querying the keyless ProxyNova/COMB dump.
+install_leaksearch() {
+    git_venv_tool LeakSearch https://github.com/JoelGMSec/LeakSearch.git LeakSearch.py req
+}
 install_git_dumper()  { pipx_install git-dumper git-dumper; }
 
 # SwaggerSpy: git clone + venv + wrapper (swaggerspy.py). Kaalyx invokes it as `swaggerspy`.

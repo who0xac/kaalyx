@@ -83,7 +83,9 @@ async def resolve_txt(domain: str) -> list[str]:
     return out
 
 
-async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[Finding]]:
+async def check_mail_dns_security(
+    domain: str,
+) -> tuple[list[OsintRecord], list[Finding], list[Email]]:
     """Assess *domain*'s email/DNS security posture (keyless DNS lookups).
 
     Covers SPF and DMARC (the classic anti-spoofing pair) plus the wider keyless DNS
@@ -97,6 +99,9 @@ async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[
       * missing DMARC (low),
       * DMARC ``p=none`` (info: monitoring-only, no enforcement),
       * missing CAA (info: any CA may issue certs for the domain).
+
+    Returns ``(records, findings, emails)`` — ``emails`` are any ``iodef:mailto:`` contact
+    addresses extracted from CAA records (BBOT dnscaa), for the harvest/breach chain.
     """
     records: list[OsintRecord] = []
     findings: list[Finding] = []
@@ -174,9 +179,17 @@ async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[
     caa_answers = await _doh_query(domain, "CAA")
     caa_values = [str(a.get("data", "")).strip() for a in caa_answers if a.get("type") == _CAA]
     caa_values = [v for v in caa_values if v]
+    caa_emails: list[Email] = []
     if caa_values:
         for v in caa_values:
             records.append(OsintRecord(kind="caa", value=v, source=source))
+            # BBOT dnscaa: a CAA `iodef` violation-reporting destination often exposes an
+            # internal contact email (or URL). Extract mailto: addresses as harvested emails
+            # so they feed the breach/leak lookups — an on-domain address here is real OSINT.
+            for m in re.findall(r"mailto:([^\s\"';]+@[^\s\"';]+)", v, re.IGNORECASE):
+                addr = m.strip().lower().strip(".")
+                if "@" in addr:
+                    caa_emails.append(Email(address=addr, source="caa-iodef"))
     else:
         findings.append(
             Finding(
@@ -202,7 +215,7 @@ async def check_mail_dns_security(domain: str) -> tuple[list[OsintRecord], list[
         if hit:
             records.append(OsintRecord(kind=kind, value=hit, source=source))
 
-    return records, findings
+    return records, findings, caa_emails
 
 
 # Backwards-compatible alias (older name used before the DNS-security expansion).

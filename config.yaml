@@ -69,6 +69,7 @@ osint:
   m365: true                   # Microsoft 365 / Entra tenant mapping
   email_harvest: true          # keyless (email-format.com, skymem.info)
   breach_lookup: true          # h8mail enrichment (needs key; else skips)
+  leak_search: true            # LeakSearch — actual leaked creds from ProxyNova/COMB dump
   github_subdomains: true
   trufflehog: true             # GitHub org secret scan (needs GITHUB_TOKEN)
   cloud_enum: true

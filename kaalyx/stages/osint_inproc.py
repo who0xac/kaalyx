@@ -214,6 +214,12 @@ async def check_mail_dns_security(
         hit = next((t for t in txt if t.lower().startswith(prefix)), None)
         if hit:
             records.append(OsintRecord(kind=kind, value=hit, source=source))
+            # TLS-RPT (and MTA-STS) records carry rua/mailto reporting addresses (BBOT
+            # dnstlsrpt) — harvest any so they feed the email → breach/leak chain.
+            for m in re.findall(r"mailto:([^\s\"';,!]+@[^\s\"';,!]+)", hit, re.IGNORECASE):
+                addr = m.strip().lower().strip(".")
+                if "@" in addr:
+                    caa_emails.append(Email(address=addr, source=f"{kind}-rua"))
 
     return records, findings, caa_emails
 
@@ -886,3 +892,131 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
         reverse=True,
     )
     return ranked[:max_candidates]
+
+
+# --- Additional keyless OSINT harvests (BBOT parity: pgp, securitytxt, social) ------------
+
+# Public PGP keyservers expose a HKP search endpoint that returns UIDs (name <email>) for a
+# domain — BBOT's `pgp` module. Keyless.
+_PGP_KEYSERVERS = [
+    "https://keys.openpgp.org/pks/lookup",
+    "https://pgp.mit.edu/pks/lookup",
+    "https://keyserver.ubuntu.com/pks/lookup",
+]
+
+
+async def harvest_pgp_emails(domain: str) -> list[Email]:
+    """Harvest emails for *domain* from public PGP keyservers (BBOT ``pgp``). Keyless.
+
+    Queries each keyserver's HKP ``index`` endpoint for the domain and extracts on-domain
+    addresses from the returned key UIDs. Any network failure just yields fewer results.
+    """
+    found: dict[str, str] = {}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for base in _PGP_KEYSERVERS:
+            try:
+                resp = await client.get(base, params={"search": domain, "op": "index",
+                                                       "fingerprint": "on"})
+                if resp.status_code != 200:
+                    continue
+                for addr in _EMAIL_RE.findall(resp.text):
+                    a = addr.strip().lower().strip(".")
+                    host = a.partition("@")[2]
+                    if host == domain or host.endswith("." + domain):
+                        found.setdefault(a, "pgp")
+            except httpx.HTTPError as exc:
+                logger.debug("pgp keyserver %s failed for %s: %s", base, domain, exc)
+                continue
+    return [Email(address=a, source=s) for a, s in sorted(found.items())]
+
+
+async def fetch_securitytxt(domain: str) -> tuple[list[Email], list[OsintRecord]]:
+    """Fetch and parse ``security.txt`` (BBOT ``securitytxt``). Keyless, two HTTP GETs.
+
+    RFC 9116 puts the file at ``/.well-known/security.txt`` (legacy: ``/security.txt``). We
+    extract ``Contact:`` emails (on-domain) and record any Contact/Policy URLs. Returns
+    ``(emails, records)``.
+    """
+    emails: dict[str, str] = {}
+    records: list[OsintRecord] = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for path in ("/.well-known/security.txt", "/security.txt"):
+            try:
+                resp = await client.get(f"https://{domain}{path}")
+            except httpx.HTTPError as exc:
+                logger.debug("security.txt %s failed for %s: %s", path, domain, exc)
+                continue
+            if resp.status_code != 200 or "contact" not in resp.text.lower():
+                continue
+            records.append(OsintRecord(kind="security_txt", value=f"https://{domain}{path}",
+                                       detail="present", source="securitytxt"))
+            for line in resp.text.splitlines():
+                low = line.strip().lower()
+                if low.startswith(("contact:", "policy:", "encryption:")):
+                    val = line.split(":", 1)[1].strip()
+                    records.append(OsintRecord(kind="security_txt", value=val,
+                                               detail=low.split(":", 1)[0], source="securitytxt"))
+                    for addr in _EMAIL_RE.findall(val):
+                        a = addr.strip().lower().strip(".")
+                        host = a.partition("@")[2]
+                        if host == domain or host.endswith("." + domain):
+                            emails.setdefault(a, "securitytxt")
+            break  # first file that exists wins; don't double-count the legacy path
+    return ([Email(address=a, source=s) for a, s in sorted(emails.items())], records)
+
+
+# Social-profile patterns BBOT's `social` module recognises in page links.
+_SOCIAL_PATTERNS = {
+    "github": re.compile(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?", re.I),
+    "gitlab": re.compile(r"https?://(?:www\.)?gitlab\.com/([A-Za-z0-9._-]+)/?", re.I),
+    "linkedin": re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/(company|in)/([A-Za-z0-9._-]+)", re.I),
+    "twitter": re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/([A-Za-z0-9_]+)/?", re.I),
+    "facebook": re.compile(r"https?://(?:www\.)?facebook\.com/([A-Za-z0-9.]+)/?", re.I),
+    "instagram": re.compile(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?", re.I),
+    "youtube": re.compile(r"https?://(?:www\.)?youtube\.com/(@[A-Za-z0-9._-]+|c/[A-Za-z0-9._-]+|channel/[A-Za-z0-9_-]+)", re.I),
+}
+# Handles that are the platform's own chrome, not the target's profile.
+_SOCIAL_IGNORE = {"share", "sharer", "intent", "home", "login", "signup", "about", "help",
+                  "privacy", "policies", "tos", "legal", "features"}
+
+
+async def discover_social_profiles(domain: str) -> tuple[list[OsintRecord], list[str]]:
+    """Find the org's social profiles from its homepage (BBOT ``social``). Keyless.
+
+    Fetches the apex over https (then http) and extracts social-media profile links from the
+    HTML — one lightweight page fetch, NOT a crawl. Returns ``(records, github_handles)``;
+    the GitHub/GitLab handles are candidate org names that strengthen org discovery.
+    """
+    records: list[OsintRecord] = []
+    handles: list[str] = []
+    seen: set[str] = set()
+    html = ""
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for scheme in ("https", "http"):
+            try:
+                resp = await client.get(f"{scheme}://{domain}/")
+                if resp.status_code < 400 and resp.text:
+                    html = resp.text
+                    break
+            except httpx.HTTPError as exc:
+                logger.debug("social homepage %s://%s failed: %s", scheme, domain, exc)
+                continue
+    if not html:
+        return records, handles
+    for platform, pat in _SOCIAL_PATTERNS.items():
+        for m in pat.finditer(html):
+            handle = (m.group(m.lastindex) if m.lastindex else m.group(1)).strip("/").lower()
+            if not handle or handle in _SOCIAL_IGNORE:
+                continue
+            key = f"{platform}:{handle}"
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(OsintRecord(kind="social", value=f"{platform}: {handle}",
+                                       detail=platform, source="social"))
+            if platform in ("github", "gitlab"):
+                handles.append(handle)
+    return records, handles

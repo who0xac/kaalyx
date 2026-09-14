@@ -51,6 +51,7 @@ SOURCE_LABELS: dict[str, str] = {
     "mail_dns": "Mail/DNS security",
     "m365": "M365 tenant map",
     "email_harvest": "Email harvest",
+    "social": "Social profiles",
     "breach_lookup": "Breach lookup",
     "leak_search": "Leak search (creds)",
     "github_subdomains": "GitHub subdomains",
@@ -84,6 +85,7 @@ class OsintStage(Stage):
             "mail_dns": (osint_cfg.mail_dns, self._src_mail_dns),
             "m365": (osint_cfg.m365, self._src_m365),
             "email_harvest": (osint_cfg.email_harvest, self._src_email_harvest),
+            "social": (osint_cfg.social, self._src_social),
             "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
             "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
             "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
@@ -794,9 +796,36 @@ class OsintStage(Stage):
 
     async def _src_email_harvest(self) -> SourceResult:
         res = SourceResult(name="email_harvest")
-        res.emails = await osint_inproc.harvest_emails(self.ctx.target.registrable)
+        domain = self.ctx.target.registrable
+        # Merge three keyless email sources (BBOT parity): email-format.com + skymem
+        # (harvest_emails), PGP keyservers (pgp), and security.txt Contact: addresses. All
+        # filter to on-domain addresses; deduped by address, sources concatenated.
+        merged: dict[str, str] = {}
+
+        def _merge(items) -> None:
+            for e in items:
+                if e.address in merged:
+                    if e.source not in merged[e.address]:
+                        merged[e.address] = f"{merged[e.address]},{e.source}"
+                else:
+                    merged[e.address] = e.source
+
+        _merge(await osint_inproc.harvest_emails(domain))
+        _merge(await osint_inproc.harvest_pgp_emails(domain))
+        sec_emails, sec_records = await osint_inproc.fetch_securitytxt(domain)
+        _merge(sec_emails)
+        res.emails = [Email(address=a, source=s) for a, s in sorted(merged.items())]
+        res.osint = sec_records  # security.txt presence + Contact/Policy URLs
         if not res.emails:
             res.note = "no public emails found"
+        return res
+
+    async def _src_social(self) -> SourceResult:
+        res = SourceResult(name="social")
+        records, _handles = await osint_inproc.discover_social_profiles(self.ctx.target.registrable)
+        res.osint = records
+        if not records:
+            res.note = "no social profiles found"
         return res
 
     async def _src_google_dorks(self) -> SourceResult:

@@ -67,7 +67,8 @@ osint:
   dns: true                    # dnsx DNS records
   mail_dns: true               # SPF/DMARC/CAA/BIMI/MTA-STS/TLS-RPT
   m365: true                   # Microsoft 365 / Entra tenant mapping
-  email_harvest: true          # keyless (email-format.com, skymem.info)
+  email_harvest: true          # keyless (email-format.com, skymem.info, PGP keyservers, security.txt)
+  social: true                 # keyless social-profile discovery from the homepage
   breach_lookup: true          # h8mail enrichment (needs key; else skips)
   leak_search: true            # LeakSearch — actual leaked creds from ProxyNova/COMB dump
   github_subdomains: true

@@ -181,7 +181,8 @@ class OsintConfig:
     dns: bool = True                 # dnsx DNS records
     mail_dns: bool = True            # SPF/DMARC/CAA/BIMI/MTA-STS/TLS-RPT
     m365: bool = True                # Microsoft 365 / Entra tenant mapping
-    email_harvest: bool = True       # keyless email harvesting (email-format, skymem)
+    email_harvest: bool = True       # keyless email harvesting (email-format, skymem, pgp, security.txt)
+    social: bool = True              # social-profile discovery from the homepage (keyless)
     breach_lookup: bool = True       # h8mail breach enrichment (needs key; else skips)
     leak_search: bool = True         # LeakSearch — actual leaked creds from ProxyNova/COMB dump
     github_subdomains: bool = True
@@ -483,6 +484,7 @@ osint:
   mail_dns: true
   m365: true
   email_harvest: true
+  social: true
   breach_lookup: true
   leak_search: true
   github_subdomains: true

@@ -95,6 +95,13 @@ class OsintStage(Stage):
         if disabled:
             self.log.info("OSINT sources disabled by config/flags: %s", ", ".join(disabled))
 
+        # Identify the TARGET's GitHub org BEFORE the fan-out so the GitHub-scanning sources
+        # (trufflehog, gato) scan the target — never the token owner's account. Runs as a
+        # pre-step because those sources need its result and the fan-out is concurrent. If no
+        # org is confidently identified, both sources skip cleanly (see their methods).
+        if (osint_cfg.trufflehog or osint_cfg.github_actions) and ctx.secrets.has_github:
+            await self._discover_github_org()
+
         # Live progress board that updates in place as sources start/finish. Silence the
         # console log handler while the board owns the screen so the two don't interleave
         # (the file log keeps capturing everything).
@@ -349,12 +356,55 @@ class OsintStage(Stage):
         res.subdomains = P.parse_subdomain_lines(out.stdout, "github-subdomains")
         return res
 
+    async def _discover_github_org(self) -> None:
+        """Identify the target's GitHub org(s) and stash the best one in ctx.shared.
+
+        Stores ``ctx.shared["github_org"]`` = the chosen org login (or ``None``), plus
+        ``["github_org_reason"]`` and ``["github_org_candidates"]`` for logging/notes. Uses a
+        token for the discovery API calls but never selects the token owner's own account.
+        """
+        target = self.ctx.target
+        token = self.ctx.secrets.next_github_token()
+        try:
+            candidates = await osint_inproc.discover_github_org(target, token)
+        except Exception as exc:  # never let discovery break the stage
+            self.log.warning("GitHub org discovery failed: %s", exc)
+            candidates = []
+
+        self.ctx.set_shared("github_org_candidates", candidates)
+        if candidates:
+            best = candidates[0]
+            self.ctx.set_shared("github_org", best.login)
+            self.ctx.set_shared("github_org_reason", f"{best.confidence}: {best.reason}")
+            self.log.info(
+                "GitHub org for %s: %s (%s — %s)%s",
+                target.registrable, best.login, best.kind, best.confidence,
+                f"; other candidates: {', '.join(c.login for c in candidates[1:])}"
+                if len(candidates) > 1 else "",
+            )
+        else:
+            self.ctx.set_shared("github_org", None)
+            self.ctx.set_shared(
+                "github_org_reason",
+                f"no GitHub org confidently identified for {target.registrable}",
+            )
+            self.log.info(
+                "No GitHub org identified for %s — trufflehog/gato will skip "
+                "(will NOT scan the token owner's account).", target.registrable,
+            )
+
     async def _src_trufflehog(self) -> SourceResult:
         res = SourceResult(name="trufflehog")
         if not self.ctx.secrets.has_github:
             res.skipped, res.note = True, "skipped: GITHUB_TOKEN not set (org scan)"
             return res
-        org = self.ctx.target.registrable.split(".")[0]
+        # Scan the TARGET's org (identified in the pre-step), never the token owner. No
+        # confidently-identified org => skip cleanly rather than scan the wrong account.
+        org = self.ctx.get_shared("github_org")
+        if not org:
+            res.skipped = True
+            res.note = f"skipped: no GitHub org identified for {self.ctx.target.registrable}"
+            return res
         cmd = ["trufflehog", "github", "--org", org, "--json"]
         out = await self.ctx.runner.run(
             cmd, env={"GITHUB_TOKEN": self.ctx.secrets.next_github_token() or ""},
@@ -364,32 +414,68 @@ class OsintStage(Stage):
             res.skipped, res.note = True, "skipped: trufflehog not on PATH"
             return res
         self.ctx.writer.raw_tool_output(self.name, "trufflehog", out.stdout)
-        res.findings = P.parse_trufflehog(out.stdout)
+        # Defense-in-depth: keep only secrets whose repo actually belongs to the target org,
+        # so a trufflehog fallback-to-authenticated-user can never leak the operator's repos.
+        res.findings = P.parse_trufflehog(out.stdout, restrict_owner=org)
         res.note = f"org={org}"
         return res
 
+    def _cloud_keywords(self) -> list[str]:
+        """Keyword variants for cloud-bucket enumeration.
+
+        A single ``registrable.split('.')[0]`` (e.g. ``kycaid``) misses buckets that follow
+        common org naming conventions. We feed several variants so enumeration is thorough:
+        the bare base, the full registrable domain, and hyphen-collapsed forms. Thoroughness
+        over speed — testing a few extra keywords is cheap next to missing an exposed bucket.
+        """
+        reg = self.ctx.target.registrable
+        base = reg.split(".")[0]
+        variants = [base, reg, reg.replace(".", "-")]
+        if "-" in base:
+            variants.append(base.replace("-", ""))
+        # Preserve order, drop dupes/empties.
+        seen: set[str] = set()
+        return [k for k in variants if k and not (k in seen or seen.add(k))]
+
     async def _src_cloud_enum(self) -> SourceResult:
         res = SourceResult(name="cloud_enum")
-        keyword = self.ctx.target.registrable.split(".")[0]
-        out = await self.ctx.runner.run(["cloud_enum", "-k", keyword, "--quickscan"],
-                                        timeout=900, label="cloud_enum")
+        keywords = self._cloud_keywords()
+        # Full enumeration (NOT --quickscan): --quickscan skips the brute-force name
+        # mutations, testing far fewer candidate bucket/blob names. Kaalyx favours finding
+        # more over finishing sooner, so we run the complete scan across every keyword.
+        cmd = ["cloud_enum"]
+        for kw in keywords:
+            cmd += ["-k", kw]
+        out = await self.ctx.runner.run(cmd, timeout=1800, label="cloud_enum")
         if not out.started:
             res.skipped, res.note = True, "skipped: cloud_enum not on PATH"
             return res
         self.ctx.writer.raw_tool_output(self.name, "cloud_enum", out.stdout)
         res.findings = P.parse_cloud_enum(out.stdout)
+        res.note = f"keywords={','.join(keywords)}"
         return res
 
     async def _src_s3scanner(self) -> SourceResult:
         res = SourceResult(name="s3scanner")
-        keyword = self.ctx.target.registrable.split(".")[0]
-        out = await self.ctx.runner.run(["s3scanner", "-bucket", keyword],
-                                        timeout=300, label="s3scanner")
-        if not out.started:
+        keywords = self._cloud_keywords()
+        # s3scanner takes one -bucket per invocation; run it across every keyword variant so
+        # a bucket named after any of the org's conventions is caught (completeness first).
+        all_out: list[str] = []
+        started = False
+        for kw in keywords:
+            out = await self.ctx.runner.run(["s3scanner", "-bucket", kw],
+                                            timeout=300, label="s3scanner")
+            if not out.started:
+                break
+            started = True
+            all_out.append(out.stdout)
+        if not started:
             res.skipped, res.note = True, "skipped: s3scanner not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "s3scanner", out.stdout)
-        res.findings = P.parse_s3scanner(out.stdout)
+        combined = "\n".join(all_out)
+        self.ctx.writer.raw_tool_output(self.name, "s3scanner", combined)
+        res.findings = P.parse_s3scanner(combined)
+        res.note = f"keywords={','.join(keywords)}"
         return res
 
     async def _src_badsecrets(self) -> SourceResult:
@@ -525,7 +611,13 @@ class OsintStage(Stage):
                 "skipped: GITHUB_TOKEN not set (needs repo + admin:org scope for full results)",
             )
             return res
-        org = self.ctx.target.registrable.split(".")[0]
+        # Audit the TARGET's org (from the pre-step), never the token owner. No identified
+        # org => skip cleanly.
+        org = self.ctx.get_shared("github_org")
+        if not org:
+            res.skipped = True
+            res.note = f"skipped: no GitHub org identified for {self.ctx.target.registrable}"
+            return res
         json_out = self.ctx.writer.stage_dir(self.name) / "_gato.json"
         gh = self.ctx.secrets.next_github_token() or ""
         out = await self.ctx.runner.run(

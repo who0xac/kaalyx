@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -686,3 +687,189 @@ def generate_google_dorks(domain: str) -> tuple[list[OsintRecord], dict[str, lis
             )
         urls_by_category[category] = cat_urls
     return records, urls_by_category
+
+
+# --- GitHub org discovery (feeds trufflehog + gato with the TARGET's org, not the token's) --
+#
+# The token-owning account is NEVER a valid answer for a target scan: trufflehog/gato must
+# scan the *target company's* GitHub org, and if we can't confidently identify one they must
+# skip — not silently scan whoever owns GITHUB_TOKEN. That earlier shortcut (guessing the org
+# is simply ``registrable.split(".")[0]`` and letting trufflehog fall back to the authenticated
+# user when that guess isn't a real org) produced findings from the operator's personal repos
+# labelled as the target's — zero recon value, and a privacy problem. We instead discover the
+# org from real signals and verify it exists before handing it downstream.
+
+_GH_API = "https://api.github.com"
+
+
+def _github_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "kaalyx-osint",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _company_slugs(target) -> list[str]:
+    """Candidate company identifiers derived from the target domain.
+
+    e.g. ``kycaid.com`` -> ``["kycaid"]``; ``my-corp.co.uk`` -> ``["my-corp", "mycorp"]``.
+    These are only *hints* — every candidate is verified against the API before use, and a
+    name match alone is low confidence (many unrelated orgs share common words).
+    """
+    base = target.registrable.split(".")[0].strip().lower()
+    slugs = {base}
+    if "-" in base:
+        slugs.add(base.replace("-", ""))
+    return [s for s in slugs if s]
+
+
+@dataclass
+class GithubOrgCandidate:
+    login: str
+    kind: str           # "org" | "user"
+    confidence: str     # "high" | "medium" | "low"
+    reason: str
+    evidence: list[str] = field(default_factory=list)  # e.g. repos mentioning the domain
+
+
+async def _gh_get(client: "httpx.AsyncClient", path: str, params: dict | None = None) -> dict | None:
+    try:
+        resp = await client.get(f"{_GH_API}{path}", params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        # 403 with rate-limit headers is the common non-fatal case; log and move on.
+        logger.debug("GitHub API %s -> HTTP %s", path, resp.status_code)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.debug("GitHub API %s failed: %s", path, exc)
+    return None
+
+
+async def _verify_account(client, login: str) -> str | None:
+    """Return ``"org"``/``"user"`` if *login* is a real GitHub account, else ``None``."""
+    data = await _gh_get(client, f"/users/{urllib.parse.quote(login)}")
+    if not data:
+        return None
+    t = str(data.get("type", "")).lower()
+    return "org" if t == "organization" else ("user" if t == "user" else None)
+
+
+async def _owners_mentioning_domain(client, domain: str, token_owner: str | None) -> dict[str, list[str]]:
+    """Owners of repos whose CODE mentions *domain* (GitHub code search).
+
+    This is the strongest signal: it's the same mechanism github-subdomains uses, and a repo
+    that references the target's domain is very likely the target's own (or a close vendor's).
+    Returns ``{owner_login: [repo_full_name, ...]}``. The token owner is excluded — their
+    repos mentioning the domain don't make *them* the target org.
+    """
+    owners: dict[str, list[str]] = {}
+    data = await _gh_get(
+        client, "/search/code",
+        params={"q": f'"{domain}"', "per_page": 100},  # GitHub's max page — take as many signals as possible
+    )
+    for item in (data or {}).get("items", []) or []:
+        repo = item.get("repository") or {}
+        owner = (repo.get("owner") or {}).get("login")
+        full = repo.get("full_name")
+        if not owner or not full:
+            continue
+        if token_owner and owner.lower() == token_owner.lower():
+            continue  # never let the operator's own repos identify the target
+        owners.setdefault(owner, [])
+        if full not in owners[owner]:
+            owners[owner].append(full)
+    return owners
+
+
+async def _authenticated_login(client) -> str | None:
+    data = await _gh_get(client, "/user")
+    return data.get("login") if data else None
+
+
+async def discover_github_org(target, token: str | None, max_candidates: int = 5) -> list[GithubOrgCandidate]:
+    """Identify the TARGET's GitHub org(s), ranked by confidence. Never the token owner.
+
+    Strategy (thorough by design — we would rather spend a few extra API calls than settle
+    for scanning the wrong account):
+
+    1. **Code search for the domain.** Owners of repos whose code mentions the target domain
+       are strong candidates ("high" when the owner is an organization). This is the correct,
+       evidence-backed signal the bug report pointed at.
+    2. **Org search by company slug.** ``GET /search/users?q=<slug>+type:org`` finds orgs
+       whose name/login matches the company; a slug that *also* appears in (1) is "high",
+       otherwise "medium" (a plain name match — real but weaker).
+    3. **Exact-login probe.** If an org literally named after the slug exists, include it.
+
+    Every candidate is verified to be a real account via the API. The account that owns the
+    token is filtered out at every step so a company scan can never resolve to the operator's
+    personal account. Returns ``[]`` when nothing can be confidently identified — the caller
+    then skips trufflehog/gato with a clear reason rather than scanning anyone by default.
+    """
+    if not token:
+        return []
+
+    candidates: dict[str, GithubOrgCandidate] = {}
+    slugs = _company_slugs(target)
+
+    async with httpx.AsyncClient(timeout=20, headers=_github_headers(token), follow_redirects=True) as client:
+        token_owner = await _authenticated_login(client)
+
+        # (1) code-search owners mentioning the domain
+        domain_owners = await _owners_mentioning_domain(client, target.registrable, token_owner)
+        for login, repos in domain_owners.items():
+            kind = await _verify_account(client, login)
+            if kind is None:
+                continue
+            name_match = any(s in login.lower() for s in slugs)
+            conf = "high" if (kind == "org" or name_match) else "medium"
+            candidates[login.lower()] = GithubOrgCandidate(
+                login=login, kind=kind, confidence=conf,
+                reason=("owns repo(s) whose code mentions "
+                        f"{target.registrable}" + (" and name matches target" if name_match else "")),
+                evidence=repos[:5],
+            )
+
+        # (2) org search by company slug
+        for slug in slugs:
+            data = await _gh_get(client, "/search/users", params={"q": f"{slug} type:org", "per_page": 10})
+            for item in (data or {}).get("items", []) or []:
+                login = item.get("login")
+                if not login:
+                    continue
+                if token_owner and login.lower() == token_owner.lower():
+                    continue
+                low = login.lower()
+                # An exact slug==login is a strong match; a fuzzy search hit is weaker.
+                exact = low == slug
+                if low in candidates:
+                    # Already found via domain code search — upgrade to high (two signals).
+                    candidates[low].confidence = "high"
+                    candidates[low].reason += "; also matches org name search"
+                    continue
+                candidates[low] = GithubOrgCandidate(
+                    login=login, kind="org",
+                    confidence="high" if exact else "low",
+                    reason=(f"org name {'exactly matches' if exact else 'matches'} "
+                            f"target company slug '{slug}'"),
+                )
+
+        # (3) exact-login probe (an org literally named after the slug)
+        for slug in slugs:
+            if slug in candidates:
+                continue
+            kind = await _verify_account(client, slug)
+            if kind == "org":
+                candidates[slug] = GithubOrgCandidate(
+                    login=slug, kind="org", confidence="high",
+                    reason=f"an organization named '{slug}' exists on GitHub",
+                )
+
+    # Rank: high > medium > low, orgs before users, more evidence first.
+    order = {"high": 3, "medium": 2, "low": 1}
+    ranked = sorted(
+        candidates.values(),
+        key=lambda c: (order.get(c.confidence, 0), c.kind == "org", len(c.evidence)),
+        reverse=True,
+    )
+    return ranked[:max_candidates]

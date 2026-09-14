@@ -78,14 +78,42 @@ def parse_subdomain_lines(stdout: str, source: str) -> list[Subdomain]:
     return subs
 
 
-def parse_trufflehog(stdout: str, source: str = "trufflehog") -> list[Finding]:
+def _owner_of_repo_url(url: str) -> str | None:
+    """Extract the owner login from a GitHub repo URL/full-name in trufflehog metadata.
+
+    Handles ``https://github.com/<owner>/<repo>(.git)`` and bare ``<owner>/<repo>`` forms.
+    Returns the lower-cased owner, or ``None`` if it can't be determined.
+    """
+    if not url:
+        return None
+    s = url.strip()
+    m = re.search(r"github\.com[:/]+([^/]+)/", s)
+    if m:
+        return m.group(1).lower()
+    # Bare "owner/repo" form (no scheme, no leading slash): first segment is the owner.
+    if "://" not in s and not s.startswith("/") and "/" in s:
+        first = s.split("/", 1)[0].strip().lower()
+        return first or None
+    return None
+
+
+def parse_trufflehog(
+    stdout: str, source: str = "trufflehog", restrict_owner: str | None = None
+) -> list[Finding]:
     """Parse ``trufflehog --json`` output into secret findings.
 
     trufflehog v3 emits one JSON object per detected secret with ``DetectorName``,
     ``Verified``, ``Raw``, and a ``SourceMetadata`` block. Verified secrets are treated as
     higher severity/confidence than unverified ones.
+
+    When *restrict_owner* is given, only secrets whose source repository is owned by that
+    GitHub org/user are kept. This is a safety net: ``trufflehog github --org X`` can fall
+    back to scanning the *authenticated* account if ``X`` resolves oddly, and we must never
+    surface the token owner's own repo secrets as if they belonged to the target. Findings
+    whose owner can't be determined are dropped under this restriction (fail closed).
     """
     findings: list[Finding] = []
+    want_owner = restrict_owner.lower() if restrict_owner else None
     for obj in iter_json_lines(stdout):
         detector = obj.get("DetectorName") or obj.get("detector_name") or "secret"
         verified = bool(obj.get("Verified") or obj.get("verified"))
@@ -103,6 +131,11 @@ def parse_trufflehog(stdout: str, source: str = "trufflehog") -> list[Finding]:
                         or block.get("link")
                         or location
                     )
+        if want_owner is not None and _owner_of_repo_url(location) != want_owner:
+            # Not the target org's repo (or unattributable) — drop it, so a trufflehog
+            # fallback to the authenticated account can never surface the token owner's
+            # secrets under the target's report.
+            continue
         findings.append(
             Finding(
                 title=f"Exposed secret: {detector}",

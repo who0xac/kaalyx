@@ -118,15 +118,26 @@ class OsintProgress:
                 st.state = "done"
         self._refresh()
 
+    def _elapsed_for(self, st: "_SourceState", now: float) -> str:
+        """Per-source elapsed time: live (now - started) while running, frozen at
+        (finished - started) once done/skipped/failed, blank while still queued."""
+        if st.started <= 0:
+            return ""
+        end = st.finished if st.finished > 0 else now
+        secs = max(0.0, end - st.started)
+        return f"{secs:0.1f}s"
+
     def _render(self):
         table = Table.grid(padding=(0, 1))
         table.add_column(width=2)          # icon
         table.add_column(width=22)         # label
         table.add_column(width=10)         # state
         table.add_column(justify="right", width=6)  # items
+        table.add_column(justify="right", width=8)   # per-source elapsed
         table.add_column(ratio=1, style=MUTED)       # note
 
-        frame = _SPINNER_FRAMES[int((time.monotonic() * 12)) % len(_SPINNER_FRAMES)]
+        now = time.monotonic()
+        frame = _SPINNER_FRAMES[int((now * 12)) % len(_SPINNER_FRAMES)]
         for st in self._states.values():
             if st.state == "running":
                 icon, state_txt = Text(frame, style=ACCENT), Text("running", style="cyan")
@@ -139,8 +150,14 @@ class OsintProgress:
             else:
                 icon, state_txt = Text("·", style=MUTED), Text("queued", style=MUTED)
             items = str(st.items) if st.state == "done" and st.items else ""
+            # Per-source elapsed: live while running (so the user sees which source is slow in
+            # real time), frozen once finished. Dim while running, brighter when settled.
+            elapsed_txt = Text(
+                self._elapsed_for(st, now),
+                style=MUTED if st.state == "running" else "white",
+            )
             note = st.note if st.state in ("skipped", "failed") else ""
-            table.add_row(icon, Text(st.label, style="white"), state_txt, items, note)
+            table.add_row(icon, Text(st.label, style="white"), state_txt, items, elapsed_txt, note)
 
         done = sum(1 for s in self._states.values() if s.state != "queued" and s.state != "running")
         elapsed = time.monotonic() - self._start

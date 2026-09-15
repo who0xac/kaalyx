@@ -1,0 +1,13 @@
+# Shell scripts must use LF line endings, always — a CRLF checkout makes bash fail with
+# errors like "set: pipefail: invalid option name" on Linux. Force LF regardless of the
+# committer's OS (e.g. editing on Windows) so the installer always runs on Kali/Debian.
+*.sh text eol=lf
+scripts/install.sh text eol=lf
+
+# Keep other text files normalized to LF in the repo too.
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.example text eol=lf

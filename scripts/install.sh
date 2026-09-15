@@ -49,13 +49,15 @@ begin_category() {  # begin_category <label> <total>
     _CAT_OK["$1"]=0; _CAT_SKIP["$1"]=0; _CAT_FAIL["$1"]=0; _CAT_TOTAL["$1"]="$2"
 }
 
-# tool_step <name> <ok|skipped|failed> — print "[i/total] name <status>" in the right color.
+# tool_step <name> <ok|skipped|failed> [ok_verb] — print "[i/total] name <status>" coloured,
+# and roll the result into the active category's tally. *ok_verb* customises the success word
+# per category (Go: "installed", Python: "ready", Repos: "ready"); defaults to "installed".
 tool_step() {
-    local name="$1" status="$2"
+    local name="$1" status="$2" ok_verb="${3:-installed}"
     _STEP_i=$((_STEP_i + 1))
     case "${status}" in
         ok)      _CAT_OK["${_CAT_LABEL}"]=$(( ${_CAT_OK["${_CAT_LABEL}"]} + 1 ))
-                 printf '  [%d/%d] %s %sinstalled%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_GREEN}" "${C_NC}" ;;
+                 printf '  [%d/%d] %s %s%s%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_GREEN}" "${ok_verb}" "${C_NC}" ;;
         skipped) _CAT_SKIP["${_CAT_LABEL}"]=$(( ${_CAT_SKIP["${_CAT_LABEL}"]} + 1 ))
                  printf '  [%d/%d] %s %sskipped%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_YELLOW}" "${C_NC}" ;;
         *)       _CAT_FAIL["${_CAT_LABEL}"]=$(( ${_CAT_FAIL["${_CAT_LABEL}"]} + 1 ))
@@ -63,19 +65,23 @@ tool_step() {
     esac
 }
 
-# run_tool <name> <command...> — run an install command, classify the outcome, count it.
-# "skipped" = the tool is already present (nothing to do); "ok" = command succeeded;
-# "failed" = command returned non-zero. Never aborts the run (mirrors `try`).
+# run_tool <name> <ok_verb> <command...> — run an install command, classify the outcome, count
+# it. "skipped" = already present (nothing to do); "ok" = command succeeded and the binary is
+# now present; "failed" = otherwise. Never aborts the run (mirrors `try`). For repositories we
+# print a "(clone)" progress line before running so the clone is visible even when slow.
 run_tool() {
-    local name="$1"; shift
+    local name="$1" ok_verb="$2"; shift 2
     if command -v "${name}" >/dev/null 2>&1; then
         tool_step "${name}" skipped
         return 0
     fi
+    if [[ "${ok_verb}" == "ready" && "${_CAT_LABEL}" == "Repositories" ]]; then
+        printf '  [%d/%d] %s %s(clone)%s\n' "$((_STEP_i + 1))" "${_STEP_total}" "${name}" "${C_DIM}" "${C_NC}"
+    fi
     if "$@" >/dev/null 2>&1 && command -v "${name}" >/dev/null 2>&1; then
-        tool_step "${name}" ok
+        tool_step "${name}" ok "${ok_verb}"
     else
-        tool_step "${name}" failed
+        tool_step "${name}" failed "${ok_verb}"
     fi
 }
 
@@ -696,27 +702,6 @@ install_chromium() {
 #  PHASE 2 — Subdomains
 # ============================================================================
 
-install_phase_subdomains() {
-    phase "Installing Part 2 — Subdomain tools (15)"
-    begin_category "Subdomain tools" 15
-
-    run_tool massdns          install_massdns
-    run_tool subfinder        go_install subfinder         github.com/projectdiscovery/subfinder/v2/cmd/subfinder
-    run_tool assetfinder      go_install assetfinder       github.com/tomnomnom/assetfinder
-    run_tool chaos            go_install chaos             github.com/projectdiscovery/chaos-client/cmd/chaos
-    run_tool dnsx             go_install dnsx              github.com/projectdiscovery/dnsx/cmd/dnsx
-    run_tool puredns          go_install puredns           github.com/d3mondev/puredns/v2
-    run_tool alterx           go_install alterx            github.com/projectdiscovery/alterx/cmd/alterx
-    run_tool github-subdomains go_install github-subdomains github.com/gwen001/github-subdomains
-    run_tool findomain        install_findomain
-    run_tool sublist3r        install_sublist3r
-    run_tool crtsh            install_crtsh
-    run_tool shodan           install_shodan
-    run_tool subdominator     install_subdominator
-    run_tool censys           install_censys
-    run_tool dnsreaper        install_dnsreaper
-}
-
 install_findomain() {
 
     if command -v findomain >/dev/null 2>&1; then
@@ -867,26 +852,6 @@ EOF
 #  PHASE 1 — OSINT   (includes the 5 gap-closing tools)
 # ============================================================================
 
-install_phase_osint() {
-    phase "Installing Part 1 — OSINT tools (14)"
-    begin_category "OSINT tools" 14
-
-    # whois + dnsutils come from system packages; dnsx/github-subdomains are Go tools.
-    run_tool dnsx              go_install dnsx              github.com/projectdiscovery/dnsx/cmd/dnsx
-    run_tool github-subdomains go_install github-subdomains github.com/gwen001/github-subdomains
-    run_tool misconfig-mapper  go_install misconfig-mapper  github.com/intigriti/misconfig-mapper/cmd/misconfig-mapper
-    run_tool trufflehog        install_trufflehog
-    run_tool cloud_enum        install_cloud_enum
-    run_tool s3scanner         go_install s3scanner         github.com/sa7mon/s3scanner
-    run_tool badsecrets        install_badsecrets
-    run_tool retire            install_retirejs
-    run_tool theHarvester      install_theharvester
-    run_tool h8mail            install_h8mail
-    run_tool LeakSearch        install_leaksearch
-    run_tool porch-pirate      install_porch_pirate
-    run_tool swaggerspy        install_swaggerspy
-    run_tool gato              install_gato
-}
 
 install_trufflehog() {
 
@@ -1027,38 +992,12 @@ install_spoofy() {
 #  PHASE 3 — Hosts
 # ============================================================================
 
-install_phase_hosts() {
-    phase "Installing Part 3 — Host tools (3)"
-    begin_category "Host tools" 3
-    # nmap comes from system packages.
-    run_tool naabu   go_install naabu github.com/projectdiscovery/naabu/v2/cmd/naabu
-    run_tool httpx   go_install httpx github.com/projectdiscovery/httpx/cmd/httpx
-    run_tool wafw00f install_wafw00f
-}
-
 install_wafw00f() { pipx_install wafw00f wafw00f; }
 
 # ============================================================================
 #  PHASE 4 — Web analysis
 # ============================================================================
 
-install_phase_web() {
-    phase "Installing Part 4 — Web analysis tools (9)"
-    begin_category "Web tools" 9
-
-    try install_chromium   # gowitness screenshots (not a counted tool)
-
-    run_tool gowitness    go_install gowitness   github.com/sensepost/gowitness
-    run_tool gau          go_install gau         github.com/lc/gau/v2/cmd/gau
-    run_tool waybackurls  go_install waybackurls github.com/tomnomnom/waybackurls
-    run_tool katana       go_install katana      github.com/projectdiscovery/katana/cmd/katana
-    run_tool gospider     go_install gospider    github.com/jaeles-project/gospider
-    run_tool gf           go_install gf          github.com/tomnomnom/gf
-    run_tool uro          install_uro
-    run_tool secretfinder install_secretfinder
-    run_tool trufflehog   install_trufflehog     # also used in web JS/secret analysis
-    try install_gf_patterns   # gf pattern set (a ~/.gf dir, not a PATH binary — not counted)
-}
 
 install_uro() { pipx_install uro uro; }
 
@@ -1092,20 +1031,6 @@ install_gf_patterns() {
 #  PHASE 5 — Vulnerability checks
 # ============================================================================
 
-install_phase_vuln() {
-    phase "Installing Part 5 — Vulnerability tools (8)"
-    begin_category "Vulnerability tools" 8
-
-    run_tool kxss              go_install kxss              github.com/Emoe/kxss
-    run_tool dalfox            go_install dalfox            github.com/hahwul/dalfox/v2
-    run_tool nuclei            go_install nuclei            github.com/projectdiscovery/nuclei/v3/cmd/nuclei
-    run_tool interactsh-client go_install interactsh-client github.com/projectdiscovery/interactsh/cmd/interactsh-client
-    run_tool sqlmap           install_sqlmap
-    run_tool sstimap          install_sstimap
-    run_tool corsy            install_corsy
-    run_tool oralyzer         install_oralyzer
-    try update_nuclei_templates   # refreshes nuclei's template DB (not a counted tool)
-}
 
 install_sqlmap() {
 
@@ -1186,16 +1111,117 @@ update_nuclei_templates() {
 #  Run the selected phases
 # ============================================================================
 
-# anew is a shared plumbing tool used across phases; install it up front.
+# anew is a shared plumbing tool used across phases; install it up front (not counted).
 go_install anew github.com/tomnomnom/anew
 
-# Explicit `if` blocks (not `&&`) so a non-selected phase's false `want_phase` does not
-# trip `set -e`.
-if want_phase subdomains; then install_phase_subdomains; fi
-if want_phase osint;      then install_phase_osint;      fi
-if want_phase hosts;      then install_phase_hosts;      fi
-if want_phase web;        then install_phase_web;        fi
-if want_phase vuln;       then install_phase_vuln;       fi
+# ============================================================================
+#  Method-grouped install manifest
+#
+#  Tools are installed in three categorised, separately-counted groups by INSTALL METHOD —
+#  Go tools, Python/pip tools, and cloned repositories — rather than one flat list. Each
+#  manifest row is:  <phases>|<method>|<name>|<install-cmd...>
+#    phases : comma list (osint,subdomains,hosts,web,vuln) — row runs if any is selected
+#    method : go | py | repo
+#    name   : the resulting binary/command on PATH
+#    rest   : the install invocation (a go_install/pipx-backed helper/git helper call)
+#  A tool needed by several phases appears once; dedup keeps it from installing twice.
+# ============================================================================
+MANIFEST=(
+  # --- Go tools ---
+  "subdomains|go|subfinder|go_install subfinder github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
+  "subdomains|go|assetfinder|go_install assetfinder github.com/tomnomnom/assetfinder"
+  "subdomains|go|chaos|go_install chaos github.com/projectdiscovery/chaos-client/cmd/chaos"
+  "subdomains,osint|go|dnsx|go_install dnsx github.com/projectdiscovery/dnsx/cmd/dnsx"
+  "subdomains|go|puredns|go_install puredns github.com/d3mondev/puredns/v2"
+  "subdomains|go|alterx|go_install alterx github.com/projectdiscovery/alterx/cmd/alterx"
+  "subdomains,osint|go|github-subdomains|go_install github-subdomains github.com/gwen001/github-subdomains"
+  "osint|go|misconfig-mapper|go_install misconfig-mapper github.com/intigriti/misconfig-mapper/cmd/misconfig-mapper"
+  "osint|go|s3scanner|go_install s3scanner github.com/sa7mon/s3scanner"
+  "hosts|go|naabu|go_install naabu github.com/projectdiscovery/naabu/v2/cmd/naabu"
+  "hosts|go|httpx|go_install httpx github.com/projectdiscovery/httpx/cmd/httpx"
+  "web|go|gowitness|go_install gowitness github.com/sensepost/gowitness"
+  "web|go|gau|go_install gau github.com/lc/gau/v2/cmd/gau"
+  "web|go|waybackurls|go_install waybackurls github.com/tomnomnom/waybackurls"
+  "web|go|katana|go_install katana github.com/projectdiscovery/katana/cmd/katana"
+  "web|go|gospider|go_install gospider github.com/jaeles-project/gospider"
+  "web|go|gf|go_install gf github.com/tomnomnom/gf"
+  "vuln|go|kxss|go_install kxss github.com/Emoe/kxss"
+  "vuln|go|dalfox|go_install dalfox github.com/hahwul/dalfox/v2"
+  "vuln|go|nuclei|go_install nuclei github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
+  "vuln|go|interactsh-client|go_install interactsh-client github.com/projectdiscovery/interactsh/cmd/interactsh-client"
+  # --- Python / pip tools ---
+  "osint|py|badsecrets|install_badsecrets"
+  "osint|py|h8mail|install_h8mail"
+  "osint|py|porch-pirate|install_porch_pirate"
+  "osint|py|theHarvester|install_theharvester"
+  "osint|py|retire|install_retirejs"
+  "subdomains|py|shodan|install_shodan"
+  "subdomains|py|subdominator|install_subdominator"
+  "subdomains|py|censys|install_censys"
+  "hosts|py|wafw00f|install_wafw00f"
+  "web|py|uro|install_uro"
+  "vuln|py|corsy|install_corsy"
+  "vuln|py|oralyzer|install_oralyzer"
+  # --- Repositories (git clone + venv/wrapper, or image pull) ---
+  "osint|repo|trufflehog|install_trufflehog"
+  "osint,web|repo|trufflehog|install_trufflehog"
+  "osint|repo|cloud_enum|install_cloud_enum"
+  "osint|repo|LeakSearch|install_leaksearch"
+  "osint|repo|swaggerspy|install_swaggerspy"
+  "osint|repo|gato|install_gato"
+  "subdomains|repo|massdns|install_massdns"
+  "subdomains|repo|findomain|install_findomain"
+  "subdomains|repo|sublist3r|install_sublist3r"
+  "subdomains|repo|crtsh|install_crtsh"
+  "subdomains|repo|dnsreaper|install_dnsreaper"
+  "web|repo|secretfinder|install_secretfinder"
+  "vuln|repo|sqlmap|install_sqlmap"
+  "vuln|repo|sstimap|install_sstimap"
+)
+
+# manifest_selected <method> -> emit "name<TAB>cmd..." rows for the given method whose phases
+# intersect the selected PHASES, de-duplicated by tool name (first occurrence wins).
+manifest_selected() {
+    local want_method="$1" seen="" row phases method name rest p hit
+    for row in "${MANIFEST[@]}"; do
+        IFS='|' read -r phases method name rest <<<"${row}"
+        [[ "${method}" == "${want_method}" ]] || continue
+        [[ ",${seen}," == *",${name},"* ]] && continue
+        hit=0
+        IFS=',' read -ra _ph <<<"${phases}"
+        for p in "${_ph[@]}"; do want_phase "${p}" && { hit=1; break; }; done
+        [[ "${hit}" -eq 1 ]] || continue
+        seen="${seen},${name}"
+        printf '%s\t%s\n' "${name}" "${rest}"
+    done
+}
+
+# install_group <method> <label> <ok_verb> — one categorised, counted install pass.
+install_group() {
+    local method="$1" label="$2" ok_verb="$3"
+    local -a rows=()
+    local line
+    while IFS= read -r line; do [[ -n "${line}" ]] && rows+=("${line}"); done < <(manifest_selected "${method}")
+    local total="${#rows[@]}"
+    [[ "${total}" -gt 0 ]] || return 0
+    phase "Installing ${label} (${total})"
+    begin_category "${label}" "${total}"
+    local name cmd
+    for line in "${rows[@]}"; do
+        name="${line%%$'\t'*}"; cmd="${line#*$'\t'}"
+        # shellcheck disable=SC2086
+        run_tool "${name}" "${ok_verb}" ${cmd}
+    done
+}
+
+install_group go   "Go tools"     "installed"
+install_group py   "Python tools" "ready"
+install_group repo "Repositories" "ready"
+
+# Supporting side-steps that aren't counted tools (a headless browser for screenshots, the gf
+# pattern set, and the nuclei template DB refresh). Run only for the phases that need them.
+if want_phase web;  then try install_chromium; try install_gf_patterns; fi
+if want_phase vuln; then try update_nuclei_templates; fi
 
 # ============================================================================
 #  httpx name-collision guard (Python httpx CLI vs ProjectDiscovery httpx)
@@ -1282,7 +1308,7 @@ export PATH="${HOME}/.local/bin:/usr/local/go/bin:${GOBIN_DIR}:${CARGO_BIN}:${BI
 print_summary() {
     printf '\n%s%s--- Tool Installation Summary ---%s\n' "${C_BOLD}" "${C_CYAN}" "${C_NC}"
     local cat
-    for cat in "OSINT tools" "Subdomain tools" "Host tools" "Web tools" "Vulnerability tools"; do
+    for cat in "Go tools" "Python tools" "Repositories"; do
         [[ -n "${_CAT_TOTAL[${cat}]:-}" ]] || continue   # only categories that actually ran
         printf '  %-20s %s%d OK%s, %s%d skipped%s, %s%d failed%s (of %d)\n' \
             "${cat}:" \

@@ -160,13 +160,13 @@ def _owner_of_repo_url(url: str) -> str | None:
 
 
 def mask_secret(value: str) -> str:
-    """Mask a secret for safe on-screen display: keep the first & last few chars, hide the
-    middle (``AKIA…len=40…3F9c``). Short values are fully masked so nothing usable leaks.
+    """Mask a secret: keep the first & last few chars, hide the middle (``AKIA…•…3F9c``).
 
-    The masking is deliberate: the findings table is shown in a terminal (and may be
-    screenshotted/shared), so we never print a usable secret there — enough to recognise
-    which key it is and eyeball whether it's a placeholder, but not to use it. The full raw
-    value stays only in the on-disk raw file / DB for deliberate manual verification.
+    NOT USED for terminal rendering by default — per an explicit, standing user decision,
+    findings show the FULL unmasked secret value in the terminal (evidence/description) so the
+    operator can act on it directly. This helper is retained only for any future opt-in
+    "masked view", and must not be reintroduced into the default finding output without the
+    user's say-so. See PROJECT_MEMORY (masking removed by user request).
     """
     v = (value or "").strip()
     if not v:
@@ -234,16 +234,17 @@ def parse_trufflehog(
             # fallback to the authenticated account can never surface the token owner's
             # secrets under the target's report.
             continue
-        # Where it was found (file:line) + a masked preview of the value — enough to triage
-        # without opening the raw file, but the value is never shown usable on screen.
+        # Where it was found (file:line) + the FULL detected value. Per explicit user request,
+        # secret values are shown UNMASKED in the terminal (evidence/description); the same
+        # value is also in raw for the DB/file.
         where = f"{file}:{line}" if file and line else (file or "")
-        masked = mask_secret(raw_secret)
-        evidence = " | ".join(p for p in (repo, where, masked) if p)
+        value = (raw_secret or "").strip()
+        evidence = " | ".join(p for p in (repo, where, value) if p)
         desc = (
             f"{detector} secret "
             + ("verified (authenticates)" if verified else "detected (unverified)")
             + (f" at {where}" if where else "")
-            + (f". Value: {masked}" if masked else "")
+            + (f". Value: {value}" if value else "")
             + "."
         )
         findings.append(
@@ -901,12 +902,13 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
             continue
         seen_creds.add(token)
         req_name, key, url = c.get("request", ""), c.get("key", ""), c.get("url", "")
-        masked = mask_secret(token)
+        # Full, UNMASKED value shown in the terminal (evidence/description) per explicit user
+        # request; the same value is in raw for the DB/file.
         detail_lines = []
         if req_name:
             detail_lines.append(f"Request: {req_name}")
         detail_lines.append(f"Header:  {key}")
-        detail_lines.append(f"Value:   {masked}")
+        detail_lines.append(f"Value:   {token}")
         if url:
             detail_lines.append(f"URL:     {url}")
         findings.append(Finding(
@@ -919,8 +921,8 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
             description=(f"A literal (non-templated) credential is hardcoded in the "
                          f"'{key}' header of "
                          + (f"request '{req_name}'" if req_name else "a Postman request")
-                         + f". Value: {masked}."),
-            evidence="\n".join(detail_lines)[:600],
+                         + f". Value: {token}."),
+            evidence="\n".join(detail_lines)[:800],
             raw=f"{req_name} | {key} | {url} | {token}"[:600],
         ))
 

@@ -179,6 +179,7 @@ class OsintConfig:
 
     whois: bool = True
     dns: bool = True                 # dnsx DNS records
+    ip_info: bool = True             # resolved-IP geolocation / ASN / ISP-org / reverse-IP (keyless)
     mail_dns: bool = True            # SPF/DMARC/CAA/BIMI/MTA-STS/TLS-RPT
     m365: bool = True                # Microsoft 365 / Entra tenant mapping
     email_harvest: bool = True       # keyless email harvesting (email-format, skymem, pgp, security.txt)
@@ -481,6 +482,7 @@ telegram:
 osint:
   whois: true
   dns: true
+  ip_info: true
   mail_dns: true
   m365: true
   email_harvest: true

@@ -48,6 +48,7 @@ from .sources import SourceResult, run_sources
 SOURCE_LABELS: dict[str, str] = {
     "whois": "WHOIS",
     "dns": "DNS records (dnsx)",
+    "ip_info": "IP intel (geo/ASN)",
     "mail_dns": "Mail/DNS security",
     "m365": "M365 tenant map",
     "email_harvest": "Email harvest",
@@ -82,6 +83,7 @@ class OsintStage(Stage):
         candidates = {
             "whois": (osint_cfg.whois, self._src_whois),
             "dns": (osint_cfg.dns, self._src_dnsx),
+            "ip_info": (osint_cfg.ip_info, self._src_ip_info),
             "mail_dns": (osint_cfg.mail_dns, self._src_mail_dns),
             "m365": (osint_cfg.m365, self._src_m365),
             "email_harvest": (osint_cfg.email_harvest, self._src_email_harvest),
@@ -207,6 +209,7 @@ class OsintStage(Stage):
 
         # One blank line before each result table so the blocks don't run together.
         for table in (
+            osint_ui.host_intel_table(osint_rows),
             osint_ui.mail_hygiene_table(osint_rows),
             osint_ui.emails_table(email_rows),
             osint_ui.employees_table(emp_rows),
@@ -803,6 +806,16 @@ class OsintStage(Stage):
                 description=f"SPF/DMARC posture allows spoofing: {reason}.",
                 evidence=reason,
             ))
+        return res
+
+    async def _src_ip_info(self) -> SourceResult:
+        res = SourceResult(name="ip_info")
+        # Resolve the target's IP(s) and fetch keyless geo/ASN/ISP-org/reverse-IP per IP.
+        res.osint = await osint_inproc.ip_info(self.ctx.target.registrable)
+        if not res.osint:
+            res.note = "no resolvable IP / geo lookup unavailable"
+        else:
+            res.note = f"{len(res.osint)} IP(s)"
         return res
 
     async def _src_m365(self) -> SourceResult:

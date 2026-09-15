@@ -377,6 +377,21 @@ def mail_hygiene_table(records: list) -> Table | None:
     return table
 
 
+def host_intel_table(records: list) -> Table | None:
+    """Show resolved-IP geolocation / ASN / ISP-org / reverse-IP (the ip_info source), so this
+    intelligence is visible by default rather than buried in the raw files."""
+    rows = [r for r in records if r["kind"] == "ip_info"]
+    if not rows:
+        return None
+    table = Table(title="Host / IP Intelligence", box=ROUNDED, border_style=ACCENT_DIM,
+                  title_style=f"bold {ACCENT}", header_style="bold white")
+    table.add_column("IP", style="cyan", no_wrap=True)
+    table.add_column("Country · ASN · Org · Reverse", style="white", overflow="fold")
+    for r in rows:
+        table.add_row(r["value"], r["detail"] or "—")
+    return table
+
+
 # Category → human section title, in the order we present them.
 _CATEGORY_TITLES = [
     ("secret", "Secrets & Credentials"),

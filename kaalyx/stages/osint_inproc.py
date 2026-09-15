@@ -82,6 +82,108 @@ async def resolve_txt(domain: str) -> list[str]:
     return out
 
 
+# DNS A/AAAA record type numbers (for resolving a domain to its IPs via DoH).
+_A, _AAAA = 1, 28
+
+
+async def resolve_ips(domain: str) -> list[str]:
+    """Resolve *domain*'s A (and AAAA) addresses via DNS-over-HTTPS. De-duped, order-stable."""
+    ips: list[str] = []
+    seen: set[str] = set()
+    for rtype, want in (("A", _A), ("AAAA", _AAAA)):
+        for ans in await _doh_query(domain, rtype):
+            if ans.get("type") != want:
+                continue
+            ip = str(ans.get("data", "")).strip()
+            if ip and ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+    return ips
+
+
+async def _geo_ip(client: "httpx.AsyncClient", ip: str) -> dict | None:
+    """Geolocation + ASN + ISP/org + reverse-DNS for one IP, keyless.
+
+    Primary: ip-api.com (free, no key, one call returns country/asn/isp/org/reverse). Fallback:
+    ipapi.co. Returns a normalised dict or ``None`` on total failure.
+    """
+    # ip-api.com — select exactly the fields we need. `reverse` is the PTR (reverse-IP) name.
+    try:
+        resp = await client.get(
+            f"http://ip-api.com/json/{ip}",
+            params={"fields": "status,country,countryCode,regionName,city,isp,org,as,asname,reverse,query"},
+        )
+        if resp.status_code == 200:
+            d = resp.json()
+            if d.get("status") == "success":
+                return {
+                    "ip": ip,
+                    "country": d.get("country") or "",
+                    "cc": d.get("countryCode") or "",
+                    "asn": d.get("as") or "",           # e.g. "AS15169 Google LLC"
+                    "asname": d.get("asname") or "",
+                    "isp": d.get("isp") or "",
+                    "org": d.get("org") or "",
+                    "reverse": d.get("reverse") or "",  # reverse-IP / PTR
+                }
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("ip-api.com failed for %s: %s", ip, exc)
+    # Fallback: ipapi.co (keyless).
+    try:
+        resp = await client.get(f"https://ipapi.co/{ip}/json/")
+        if resp.status_code == 200:
+            d = resp.json()
+            if not d.get("error"):
+                return {
+                    "ip": ip,
+                    "country": d.get("country_name") or "",
+                    "cc": d.get("country") or "",
+                    "asn": (f"AS{d.get('asn')}" if d.get("asn") else "").replace("ASAS", "AS"),
+                    "asname": d.get("org") or "",
+                    "isp": d.get("org") or "",
+                    "org": d.get("org") or "",
+                    "reverse": "",
+                }
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("ipapi.co failed for %s: %s", ip, exc)
+    return None
+
+
+async def ip_info(domain: str) -> list[OsintRecord]:
+    """Reverse-IP / geolocation / ASN / whois-org intelligence for the domain's resolved IP(s).
+
+    Resolves the domain to its A/AAAA addresses, then fetches keyless geo+ASN+ISP+reverse-DNS
+    for each and returns them as ``kind="ip_info"`` OsintRecords (rendered in the Host/IP
+    Intelligence table). ``value`` is the IP; ``detail`` a one-line country · ASN · org · rev
+    summary. Empty on total failure — never raises.
+    """
+    ips = await resolve_ips(domain)
+    if not ips:
+        return []
+    records: list[OsintRecord] = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for ip in ips:
+            info = await _geo_ip(client, ip)
+            if info is None:
+                records.append(OsintRecord(kind="ip_info", value=ip,
+                                           detail="(geo/ASN lookup failed)", source="ip_info"))
+                continue
+            parts = []
+            if info["country"]:
+                parts.append(f"{info['country']}" + (f" ({info['cc']})" if info["cc"] else ""))
+            if info["asn"]:
+                parts.append(info["asn"])
+            org = info["org"] or info["isp"]
+            if org and org not in (info["asn"], ""):
+                parts.append(org)
+            if info["reverse"]:
+                parts.append(f"rev={info['reverse']}")
+            records.append(OsintRecord(
+                kind="ip_info", value=ip, detail=" · ".join(parts), source="ip_info"))
+    return records
+
+
 async def check_mail_dns_security(
     domain: str,
 ) -> tuple[list[OsintRecord], list[Finding], list[Email]]:

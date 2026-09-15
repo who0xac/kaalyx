@@ -65,6 +65,7 @@ web:
 osint:
   whois: true
   dns: true                    # dnsx DNS records
+  ip_info: true                # resolved-IP geo / ASN / ISP-org / reverse-IP (keyless)
   mail_dns: true               # SPF/DMARC/CAA/BIMI/MTA-STS/TLS-RPT
   m365: true                   # Microsoft 365 / Entra tenant mapping
   email_harvest: true          # keyless (email-format.com, skymem.info, PGP keyservers, security.txt)

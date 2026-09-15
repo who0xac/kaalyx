@@ -44,20 +44,30 @@ def severity_style(severity: str | Severity) -> str:
     return SEVERITY_STYLE.get(key, SEVERITY_STYLE["unknown"])
 
 
+# --- Stage-header palette (FINAL, permanent; identical across all 6 stage headers) ---------
+# A warm orange/red/yellow family. The scheme never changes per stage — only the stage
+# name/subtitle text and the domain/count values differ.
+STAGE_BAR = "orange1"          # the ▌ vertical bar
+STAGE_TITLE = "bold orange1"   # the stage NAME (matches the bar)
+STAGE_SUBTITLE = MUTED         # the subtitle line — dim gray
+STAGE_LABEL = MUTED            # the "target" label — dim gray
+STAGE_DOMAIN = "red"           # the domain name
+STAGE_COUNT = "yellow"         # the source/host count
+
+
 def stage_header(title: str, subtitle: str = ""):
     """Build the shared per-stage header renderable (used by all 6 pipeline stages).
 
-    Style: a strong bright-cyan vertical bar (▌) on each line, the stage TITLE bold, and the
-    subtitle dim — no boxes/dividers. Replaces the old double-line box header.
+    Style (FINAL warm palette): an ORANGE vertical bar (▌) on each line, the stage TITLE bold
+    orange (matching the bar), the subtitle dim gray — no boxes/dividers.
     """
     from rich.console import Group
     from rich.text import Text
 
-    bar = Text("▌ ", style=f"bold {ACCENT}")
-    line1 = Text.assemble((bar.plain, f"bold {ACCENT}"), (title, "bold white"))
+    line1 = Text.assemble(("▌ ", STAGE_BAR), (title, STAGE_TITLE))
     parts = [line1]
     if subtitle:
-        parts.append(Text.assemble((bar.plain, f"bold {ACCENT}"), (subtitle, MUTED)))
+        parts.append(Text.assemble(("▌ ", STAGE_BAR), (subtitle, STAGE_SUBTITLE)))
     return Group(*parts)
 
 

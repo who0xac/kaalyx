@@ -145,7 +145,8 @@ def format_duration(seconds: float) -> str:
 def print_banner(domain: str, source_count: int) -> None:
     """Print the OSINT stage header (Style 3: accent bar + bold title + dim subtitle),
     preceded by the main banner, then a target/source-count line."""
-    from . import print_main_banner, stage_header
+    from . import (print_main_banner, stage_header,
+                   STAGE_LABEL, STAGE_DOMAIN, STAGE_COUNT)
 
     console = get_console()
 
@@ -154,13 +155,14 @@ def print_banner(domain: str, source_count: int) -> None:
     console.print()
 
     console.print(stage_header("OSINT", "Passive Footprinting & Intelligence Gathering"))
-    subtitle = Text.assemble(
-        ("target ", MUTED),
-        (domain, "bold white"),
+    # Target line uses the warm-palette values: "target" label dim, domain red, count yellow.
+    target_line = Text.assemble(
+        ("target ", STAGE_LABEL),
+        (domain, STAGE_DOMAIN),
         ("   ", ""),
-        (f"{source_count} sources", ACCENT_DIM),
+        (f"{source_count} sources", STAGE_COUNT),
     )
-    console.print(subtitle)
+    console.print(target_line)
     console.print()
 
 

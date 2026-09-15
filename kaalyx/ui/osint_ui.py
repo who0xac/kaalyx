@@ -377,6 +377,25 @@ def mail_hygiene_table(records: list) -> Table | None:
     return table
 
 
+def social_table(records: list) -> Table | None:
+    """Show discovered social-media profiles (the social source) as a table, so the data is
+    visible during the scan instead of only saved to social.txt."""
+    rows = [r for r in records if r["kind"] == "social"]
+    if not rows:
+        return None
+    table = Table(title="Social Profiles", box=ROUNDED, border_style=ACCENT_DIM,
+                  title_style=f"bold {ACCENT}", header_style="bold white")
+    table.add_column("Platform", style="cyan", no_wrap=True)
+    table.add_column("Handle / Profile", style="white", overflow="fold")
+    for r in rows:
+        # value is "<platform>: <handle>"; detail is the platform. Split for clean columns.
+        val = r["value"]
+        platform = (r["detail"] or (val.split(":", 1)[0] if ":" in val else "")).strip()
+        handle = val.split(":", 1)[1].strip() if ":" in val else val
+        table.add_row(platform, handle)
+    return table
+
+
 def host_intel_table(records: list) -> Table | None:
     """Show resolved-IP geolocation / ASN / ISP-org / reverse-IP (the ip_info source), so this
     intelligence is visible by default rather than buried in the raw files."""

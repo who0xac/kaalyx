@@ -59,6 +59,11 @@ class SourceResult:
     employees: list[Employee] = field(default_factory=list)
     skipped: bool = False  # True when the source chose not to run (missing tool/key)
     note: str = ""  # short human summary for logs, e.g. "skipped: no GITHUB_TOKEN"
+    # Verbatim raw payload for this source (tool stdout, or a text dump of in-process records),
+    # persisted UNCONDITIONALLY to raw/<source>.<ext> — even when empty/skipped — so every
+    # source leaves a dedicated on-disk artifact. ``raw_ext`` picks the file extension.
+    raw: str = ""
+    raw_ext: str = "txt"
 
     @property
     def total(self) -> int:

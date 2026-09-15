@@ -183,6 +183,7 @@ class OsintStage(Stage):
                 sort=False,
             )
         self._write_status_file(results)
+        self._write_raw_source_files(results)
 
         # Render result tables + summary panel (read back from DB so dedup/merge is reflected).
         self._render_results(results)
@@ -211,6 +212,7 @@ class OsintStage(Stage):
         for table in (
             osint_ui.host_intel_table(osint_rows),
             osint_ui.mail_hygiene_table(osint_rows),
+            osint_ui.social_table(osint_rows),
             osint_ui.emails_table(email_rows),
             osint_ui.employees_table(emp_rows),
         ):
@@ -265,6 +267,33 @@ class OsintStage(Stage):
             lines.append(f"{r.name:22} {state:7} items={r.total}{note}")
         self.ctx.writer.write_lines(self.name, "_sources_status.txt", lines, sort=False)
 
+    def _write_raw_source_files(self, results: list[SourceResult]) -> None:
+        """Write ONE dedicated raw file per source, ALWAYS — even when a source was skipped or
+        found nothing (an empty file records that it ran). Uses the source's ``raw`` payload
+        (tool stdout / raw JSON) when it set one; otherwise dumps that source's own records as
+        text so in-process sources (m365, mail_dns, social, exposed_git, ip_info, …) also leave
+        a dedicated artifact on disk under ``osint/raw/<source>.<ext>``.
+        """
+        def _dump(r: SourceResult) -> str:
+            parts: list[str] = []
+            for o in r.osint:
+                parts.append(f"{o.kind}\t{o.value}" + (f"\t{o.detail}" if o.detail else ""))
+            for s in r.subdomains:
+                parts.append(f"subdomain\t{s.hostname}")
+            for e in r.emails:
+                parts.append(f"email\t{e.address}" + (f"\t{e.source}" if e.source else ""))
+            for e in r.employees:
+                parts.append(f"employee\t{e.name}" + (f"\t{e.role}" if e.role else ""))
+            for f in r.findings:
+                parts.append(f"finding\t[{f.severity.value}] {f.category}: {f.title}\t{f.target}"
+                             + (f"\t{f.evidence}" if f.evidence else ""))
+            return "\n".join(parts)
+
+        for r in results:
+            content = r.raw if r.raw else _dump(r)
+            header = r.note if (not content and r.note) else ""
+            self.ctx.writer.raw_source_output(self.name, r.name, content, r.raw_ext, header)
+
     # -- breach enrichment (post-harvest chaining) -------------------------------------
 
     async def _enrich_breaches(self, results: list[SourceResult]) -> None:
@@ -274,11 +303,17 @@ class OsintStage(Stage):
         The harvested emails are the input, so this only runs if we actually found emails
         and h8mail is on PATH.
         """
+        def _skip(note: str) -> None:
+            results.append(SourceResult(name="breach_lookup", ok=True, skipped=True,
+                                        note=note, raw_ext="json"))
+
         emails = [e for r in results for e in r.emails]
         if not emails:
+            _skip("skipped: no harvested emails to check")
             return
         if not self.ctx.runner.tool_available("h8mail"):
             self.log.info("breach lookup skipped — h8mail not on PATH (emails kept)")
+            _skip("skipped: h8mail not on PATH")
             return
 
         # Feed emails via stdin file to avoid a huge argv.
@@ -289,6 +324,7 @@ class OsintStage(Stage):
         try:
             infile.write_text(email_list, encoding="utf-8")
         except OSError:
+            _skip("skipped: could not write h8mail input file")
             return
 
         # Build the h8mail command. Beyond breach *counts*, h8mail can return actual cleartext
@@ -309,6 +345,7 @@ class OsintStage(Stage):
         out = await self.ctx.runner.run(cmd, timeout=1800, label="h8mail")
         if not out.started:
             self.log.info("breach lookup skipped — h8mail not runnable (emails kept)")
+            _skip("skipped: h8mail not runnable")
             return
         # h8mail writes JSON to outfile; read it back.
         try:
@@ -318,6 +355,8 @@ class OsintStage(Stage):
         breach_map = P.parse_h8mail(data)
         if not breach_map:
             self.log.info("breach lookup: no breach data (likely no API keys / local breach configured)")
+            results.append(SourceResult(name="breach_lookup", ok=True,
+                                        note="no breach data", raw=data, raw_ext="json"))
             return
 
         enriched: list[Email] = []
@@ -359,12 +398,15 @@ class OsintStage(Stage):
                     description=(f"{cred.kind.capitalize()} recovered from {cred.source}."),
                     evidence=f"{cred.email}:{cred.value}",
                 ))
+        # Always append a breach_lookup result (with the raw h8mail JSON) so it gets a
+        # dedicated raw file even when nothing was breached.
+        results.append(SourceResult(
+            name="breach_lookup", ok=True, emails=enriched, findings=findings,
+            note=(f"{len(enriched)} breached, {cred_total} credential(s) recovered"
+                  if enriched else "no breached emails"),
+            raw=data, raw_ext="json",
+        ))
         if enriched:
-            # Attach to a synthetic result so _persist stores them.
-            results.append(SourceResult(
-                name="breach_lookup", ok=True, emails=enriched, findings=findings,
-                note=f"{len(enriched)} breached, {cred_total} credential(s) recovered",
-            ))
             self.log.warning("breach lookup: %d breached email(s), %d credential(s) recovered",
                              len(enriched), cred_total)
 
@@ -384,6 +426,8 @@ class OsintStage(Stage):
         if not self.ctx.runner.tool_available("LeakSearch") and \
                 not self.ctx.runner.tool_available("leaksearch"):
             self.log.info("leak search skipped — LeakSearch not on PATH")
+            results.append(SourceResult(name="leak_search", ok=True, skipped=True,
+                                        note="skipped: LeakSearch not on PATH", raw_ext="json"))
             return
         binary = "LeakSearch" if self.ctx.runner.tool_available("LeakSearch") else "leaksearch"
 
@@ -405,6 +449,9 @@ class OsintStage(Stage):
             )
             if not out.started:
                 self.log.info("leak search skipped — LeakSearch not runnable")
+                results.append(SourceResult(name="leak_search", ok=True, skipped=True,
+                                            note="skipped: LeakSearch not runnable",
+                                            raw_ext="json"))
                 return
             try:
                 data = outfile.read_text(encoding="utf-8")
@@ -413,7 +460,7 @@ class OsintStage(Stage):
             combined_raw.append(f"# key={key}\n{data}")
             findings.extend(P.parse_leaksearch(data, target=self.ctx.target.registrable))
 
-        self.ctx.writer.raw_tool_output(self.name, "leaksearch", "\n\n".join(combined_raw))
+        raw_blob = "\n\n".join(combined_raw)
         # Dedup findings by (target, evidence) since domain + email queries can overlap.
         unique: dict[str, Finding] = {}
         for f in findings:
@@ -422,12 +469,13 @@ class OsintStage(Stage):
         if deduped:
             results.append(SourceResult(
                 name="leak_search", ok=True, findings=deduped,
-                note=f"{len(deduped)} leaked credential(s)",
+                note=f"{len(deduped)} leaked credential(s)", raw=raw_blob, raw_ext="json",
             ))
             self.log.warning("leak search: %d leaked credential(s) found", len(deduped))
         else:
             results.append(SourceResult(
                 name="leak_search", ok=True, note="no leaked credentials found",
+                raw=raw_blob, raw_ext="json",
             ))
 
     # -- external-tool sources ---------------------------------------------------------
@@ -441,7 +489,7 @@ class OsintStage(Stage):
             return res
         text = out.stdout.strip()
         if text:
-            self.ctx.writer.raw_tool_output(self.name, "whois", text)
+            res.raw, res.raw_ext = text, "txt"
             for line in text.splitlines():
                 low = line.lower().strip()
                 for key in ("registrar:", "creation date:", "registrant", "name server:",
@@ -460,7 +508,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: dnsx not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "dnsx", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         res.osint = P.parse_dnsx(out.stdout)
         return res
 
@@ -539,7 +587,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: trufflehog not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "trufflehog", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         # Defense-in-depth: keep only secrets whose repo actually belongs to the target org,
         # so a trufflehog fallback-to-authenticated-user can never leak the operator's repos.
         res.findings = P.parse_trufflehog(out.stdout, restrict_owner=org)
@@ -576,7 +624,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: cloud_enum not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "cloud_enum", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "txt"
         res.findings = P.parse_cloud_enum(out.stdout, target=self.ctx.target.registrable)
         res.note = f"keywords={','.join(keywords)}"
         return res
@@ -599,7 +647,7 @@ class OsintStage(Stage):
             res.skipped, res.note = True, "skipped: s3scanner not on PATH"
             return res
         combined = "\n".join(all_out)
-        self.ctx.writer.raw_tool_output(self.name, "s3scanner", combined)
+        res.raw, res.raw_ext = combined, "txt"
         res.findings = P.parse_s3scanner(combined, target=self.ctx.target.registrable)
         res.note = f"keywords={','.join(keywords)}"
         return res
@@ -611,7 +659,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: badsecrets not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "badsecrets", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         res.findings = P.parse_badsecrets(out.stdout)
         return res
 
@@ -624,7 +672,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: retire not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "retirejs", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         res.findings = P.parse_retirejs(out.stdout)
         return res
 
@@ -649,6 +697,7 @@ class OsintStage(Stage):
                 continue
         if not data:
             data = out.stdout  # fallback
+        res.raw, res.raw_ext = data, "json"   # dedicated raw/theharvester.json
         emails, employees, subs = P.parse_theharvester(data, self.ctx.target.registrable)
         res.emails, res.employees, res.subdomains = emails, employees, subs
         return res
@@ -663,7 +712,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: misconfig-mapper not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "misconfig-mapper", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         res.findings = P.parse_misconfig_mapper(out.stdout)
         return res
 
@@ -677,6 +726,9 @@ class OsintStage(Stage):
         keyword = self.ctx.target.registrable
         ran_any = False
 
+        # api_leaks fans out to two tools; write a DEDICATED raw file for EACH, always — even
+        # when a tool is absent or empty (porch-pirate.json / swaggerspy.txt), matching the
+        # "one file per source, no exceptions" rule.
         # --raw emits JSON so we get structured workspace/collection objects (one finding
         # each) instead of free-text we'd otherwise have to guess at line by line.
         pp = await self.ctx.runner.run(
@@ -685,22 +737,28 @@ class OsintStage(Stage):
         )
         if pp.started:
             ran_any = True
-            self.ctx.writer.raw_tool_output(self.name, "porch-pirate", pp.stdout)
+            self.ctx.writer.raw_source_output(self.name, "porch-pirate", pp.stdout, "json")
             pp_findings, pp_subs = P.parse_porch_pirate(
                 pp.stdout, target=self.ctx.target.registrable)
             res.findings.extend(pp_findings)
             res.subdomains.extend(pp_subs)  # hostnames leaking in request URLs -> Part 2
+        else:
+            self.ctx.writer.raw_source_output(self.name, "porch-pirate", "", "json",
+                                              header="skipped: porch-pirate not on PATH")
 
         ss = await self.ctx.runner.run(
             ["swaggerspy", keyword], timeout=600, label="swaggerspy",
         )
         if ss.started:
             ran_any = True
-            self.ctx.writer.raw_tool_output(self.name, "swaggerspy", ss.stdout)
+            self.ctx.writer.raw_source_output(self.name, "swaggerspy", ss.stdout, "txt")
             ss_findings, ss_subs = P.parse_swaggerspy(
                 ss.stdout, target=self.ctx.target.registrable)
             res.findings.extend(ss_findings)
             res.subdomains.extend(ss_subs)
+        else:
+            self.ctx.writer.raw_source_output(self.name, "swaggerspy", "", "txt",
+                                              header="skipped: swaggerspy not on PATH")
 
         if not ran_any:
             res.skipped = True
@@ -760,7 +818,7 @@ class OsintStage(Stage):
         if not out.started:
             res.skipped, res.note = True, "skipped: gato not on PATH"
             return res
-        self.ctx.writer.raw_tool_output(self.name, "gato", out.stdout)
+        res.raw, res.raw_ext = out.stdout, "json"
         # Prefer the structured JSON file; fall back to parsing stdout text.
         try:
             json_text = json_out.read_text(encoding="utf-8")

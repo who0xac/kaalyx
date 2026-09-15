@@ -113,3 +113,23 @@ class ResultWriter:
         except OSError as exc:
             logger.warning("Could not write raw output for %s: %s", tool, exc)
             return None
+
+    def raw_source_output(self, stage: str, source: str, content: str,
+                          ext: str = "txt", header: str = "") -> Path | None:
+        """Persist ONE dedicated raw file per source under ``<stage>/raw/<source>.<ext>`` —
+        UNCONDITIONALLY, even when *content* is empty (an empty file records that the source
+        ran and found nothing, mirroring the reference tool). *header* is an optional first
+        line (e.g. a skip reason) so an empty file still says why.
+        """
+        raw_dir = self.stage_dir(stage) / "raw"
+        try:
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            path = raw_dir / f"{source}.{ext}"
+            body = content if content is not None else ""
+            if header:
+                body = f"# {header}\n" + (body if body else "")
+            path.write_text(body, encoding="utf-8")
+            return path
+        except OSError as exc:
+            logger.warning("Could not write raw output for source %s: %s", source, exc)
+            return None

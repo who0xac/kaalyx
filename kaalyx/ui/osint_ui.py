@@ -291,15 +291,28 @@ def findings_table(rows: list, limit: int = 25) -> Table | None:
     table.add_column("Verified", width=10, justify="center")
     table.add_column("Category", style="magenta")
     table.add_column("Title", style="white", overflow="fold")
-    table.add_column("Target", style=MUTED, overflow="fold")
+    # Detail carries the triage info: where it was found + a masked value preview (from the
+    # finding's evidence, e.g. "repo | file:line | AKIA…••••…3F9c"), falling back to target.
+    table.add_column("Detail (where / masked value)", style=MUTED, overflow="fold")
     for r in ordered:
         sev = r["severity"]
+        detail = _row_get(r, "evidence") or _row_get(r, "target") or ""
         table.add_row(
             Text(sev.upper(), style=severity_style(sev)),
             _verified_cell(r),
-            r["category"], r["title"], r["target"],
+            r["category"], r["title"],
+            Text(detail, style=MUTED),
         )
     return table
+
+
+def _row_get(row, key: str, default: str = "") -> str:
+    """Read a column from a sqlite3.Row or dict-like finding row, tolerating missing keys."""
+    try:
+        val = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return val if val is not None else default
 
 
 def _verified_cell(row) -> "Text":

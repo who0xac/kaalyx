@@ -159,6 +159,47 @@ def _owner_of_repo_url(url: str) -> str | None:
     return None
 
 
+def mask_secret(value: str) -> str:
+    """Mask a secret for safe on-screen display: keep the first & last few chars, hide the
+    middle (``AKIA…len=40…3F9c``). Short values are fully masked so nothing usable leaks.
+
+    The masking is deliberate: the findings table is shown in a terminal (and may be
+    screenshotted/shared), so we never print a usable secret there — enough to recognise
+    which key it is and eyeball whether it's a placeholder, but not to use it. The full raw
+    value stays only in the on-disk raw file / DB for deliberate manual verification.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    n = len(v)
+    if n <= 8:
+        return f"{'•' * n} (len={n})"
+    head, tail = v[:4], v[-4:]
+    return f"{head}…{'•' * min(6, n - 8)}…{tail} (len={n})"
+
+
+def _trufflehog_location(meta: dict) -> tuple[str, str, str]:
+    """Pull ``(repository, file, line)`` from a trufflehog SourceMetadata block.
+
+    trufflehog v3 nests these under ``SourceMetadata.Data.<SourceType>`` (e.g. ``Github``),
+    with keys ``repository``, ``file``, ``line``/``line_number`` and ``link``. Returns
+    best-effort strings ("" when absent). ``repository`` falls back to any ``link``.
+    """
+    repo = file = line = link = ""
+    data = meta.get("Data") if isinstance(meta, dict) else None
+    if isinstance(data, dict):
+        for block in data.values():
+            if not isinstance(block, dict):
+                continue
+            repo = block.get("repository") or repo
+            file = block.get("file") or file
+            link = block.get("link") or link
+            ln = block.get("line", block.get("line_number", ""))
+            if ln not in ("", None):
+                line = str(ln)
+    return (repo or link, file, line)
+
+
 def parse_trufflehog(
     stdout: str, source: str = "trufflehog", restrict_owner: str | None = None
 ) -> list[Finding]:
@@ -167,6 +208,11 @@ def parse_trufflehog(
     trufflehog v3 emits one JSON object per detected secret with ``DetectorName``,
     ``Verified``, ``Raw``, and a ``SourceMetadata`` block. Verified secrets are treated as
     higher severity/confidence than unverified ones.
+
+    Each finding surfaces enough to triage at a glance WITHOUT running jq: a masked preview of
+    the detected value (via :func:`mask_secret`) and the exact file + line inside the repo,
+    packed into ``evidence`` as ``repo | file:line | <masked value>``. The unmasked value and
+    full JSON live only in ``raw`` (persisted to disk/DB), never shown on screen.
 
     When *restrict_owner* is given, only secrets whose source repository is owned by that
     GitHub org/user are kept. This is a safety net: ``trufflehog github --org X`` can fall
@@ -181,36 +227,36 @@ def parse_trufflehog(
         verified = bool(obj.get("Verified") or obj.get("verified"))
         raw_secret = obj.get("Raw") or obj.get("raw") or ""
         meta = obj.get("SourceMetadata") or {}
-        # Best-effort extraction of a location string across trufflehog metadata shapes.
-        location = ""
-        data = meta.get("Data") if isinstance(meta, dict) else None
-        if isinstance(data, dict):
-            for block in data.values():
-                if isinstance(block, dict):
-                    location = (
-                        block.get("repository")
-                        or block.get("file")
-                        or block.get("link")
-                        or location
-                    )
-        if want_owner is not None and _owner_of_repo_url(location) != want_owner:
+        repo, file, line = _trufflehog_location(meta)
+        location = repo or file or "github-org"
+        if want_owner is not None and _owner_of_repo_url(repo) != want_owner:
             # Not the target org's repo (or unattributable) — drop it, so a trufflehog
             # fallback to the authenticated account can never surface the token owner's
             # secrets under the target's report.
             continue
+        # Where it was found (file:line) + a masked preview of the value — enough to triage
+        # without opening the raw file, but the value is never shown usable on screen.
+        where = f"{file}:{line}" if file and line else (file or "")
+        masked = mask_secret(raw_secret)
+        evidence = " | ".join(p for p in (repo, where, masked) if p)
+        desc = (
+            f"{detector} secret "
+            + ("verified (authenticates)" if verified else "detected (unverified)")
+            + (f" at {where}" if where else "")
+            + (f". Value: {masked}" if masked else "")
+            + "."
+        )
         findings.append(
             Finding(
                 title=f"Exposed secret: {detector}",
                 category="secret",
                 severity=Severity.HIGH if verified else Severity.MEDIUM,
                 confidence=Confidence.CONFIRMED if verified else Confidence.TENTATIVE,
-                target=location or "github-org",
+                target=(f"{location}:{line}" if line else location),
                 tool=source,
-                description=(
-                    f"{detector} secret {'verified' if verified else 'detected'} by trufflehog."
-                ),
-                evidence=(raw_secret[:120] + "…") if len(raw_secret) > 120 else raw_secret,
-                raw=str(obj)[:2000],
+                description=desc,
+                evidence=evidence,
+                raw=str(obj)[:2000],  # full JSON incl. unmasked Raw — on-disk/DB only
             )
         )
     return findings

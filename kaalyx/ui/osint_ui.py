@@ -171,10 +171,38 @@ def print_banner(domain: str, source_count: int) -> None:
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+def _classify_skip(note: str) -> str:
+    """Split a generic skip into an actionable sub-state from its note text:
+
+      * ``not_installed`` — the tool isn't on PATH ("skipped: <tool> not on PATH/runnable").
+        More urgent: the user can install it.
+      * ``no_key`` — a required key/token is missing ("skipped: <KEY> not set").
+      * ``skipped`` — a deliberate no-input skip (no emails to check, no org identified, etc.).
+    """
+    low = note.lower()
+    if "not on path" in low or "not runnable" in low or "not installed" in low:
+        return "not_installed"
+    if "not set" in low or "_token" in low or "_key" in low or "github_token" in low:
+        return "no_key"
+    return "skipped"
+
+
+def _skip_note(note: str) -> str:
+    """Clean the raw skip note for the board — drop a leading 'skipped:' prefix and, for a
+    no-key skip, phrase it as '<KEY> not set in config.env'."""
+    import re
+    n = re.sub(r"^\s*skipped[:\-]?\s*", "", note or "", flags=re.I).strip()
+    m = re.search(r"([A-Z][A-Z0-9_]{3,})\s+not set", n)
+    if m:
+        return f"{m.group(1)} not set in config.env"
+    return n
+
+
 @dataclass
 class _SourceState:
     label: str
-    state: str = "queued"   # queued | running | done | skipped | failed
+    # queued | running | done | skipped | no_key | not_installed | failed
+    state: str = "queued"
     items: int = 0
     note: str = ""
     started: float = 0.0
@@ -219,7 +247,8 @@ class OsintProgress:
             elif getattr(result, "skipped", False) or (
                 st.items == 0 and st.note.lower().startswith("skipped")
             ):
-                st.state = "skipped"
+                # Split the generic "skipped" into distinct, actionable sub-states.
+                st.state = _classify_skip(st.note)
             else:
                 st.state = "done"
         self._refresh()
@@ -244,14 +273,27 @@ class OsintProgress:
         now = time.monotonic()
         frame = _SPINNER_FRAMES[int((now * 12)) % len(_SPINNER_FRAMES)]
         for st in self._states.values():
+            note = ""
             if st.state == "running":
                 icon, state_txt = Text(frame, style=ACCENT), Text("running", style="cyan")
             elif st.state == "done":
                 icon, state_txt = Text("✔", style="green"), Text("done", style="green")
+            elif st.state == "not_installed":
+                # Most actionable: tool isn't installed. Urgent orange ✘ + how to fix.
+                icon = Text("✘", style="bold orange1")
+                state_txt = Text("not installed", style="bold orange1")
+                note = "run: kaalyx tools --install"
+            elif st.state == "no_key":
+                # Deliberate no-key skip — yellow, less urgent than a missing tool.
+                icon, state_txt = Text("○", style="yellow"), Text("no key", style="yellow")
+                note = _skip_note(st.note)
             elif st.state == "skipped":
-                icon, state_txt = Text("○", style="yellow"), Text("skipped", style="yellow")
+                # No-input / clean deliberate skip — dim.
+                icon, state_txt = Text("○", style=MUTED), Text("skipped", style=MUTED)
+                note = _skip_note(st.note)
             elif st.state == "failed":
                 icon, state_txt = Text("✘", style="red"), Text("failed", style="bold red")
+                note = st.note
             else:
                 icon, state_txt = Text("·", style=MUTED), Text("queued", style=MUTED)
             items = str(st.items) if st.state == "done" and st.items else ""
@@ -261,10 +303,11 @@ class OsintProgress:
                 self._elapsed_for(st, now),
                 style=MUTED if st.state == "running" else "white",
             )
-            note = st.note if st.state in ("skipped", "failed") else ""
-            table.add_row(icon, Text(st.label, style="white"), state_txt, items, elapsed_txt, note)
+            table.add_row(icon, Text(st.label, style="white"), state_txt, items, elapsed_txt,
+                          Text(note, style=MUTED))
 
-        done = sum(1 for s in self._states.values() if s.state != "queued" and s.state != "running")
+        done = sum(1 for s in self._states.values()
+                   if s.state not in ("queued", "running"))
         elapsed = time.monotonic() - self._start
         header = Text.assemble(
             ("running OSINT sources  ", "bold white"),

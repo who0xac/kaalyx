@@ -80,15 +80,32 @@ tool_step() {
 # repositories we print a "(clone)" progress line before running so the clone is visible.
 run_tool() {
     local name="$1" ok_verb="$2"; shift 2
-    if command -v "${name}" >/dev/null 2>&1; then
+    # "Present" means genuinely runnable. For a Repositories tool, a wrapper on PATH is NOT
+    # proof — its venv deps may have failed — so we verify it actually runs before skipping.
+    # A broken-but-present repo tool falls through to (re)install, which self-heals.
+    if [[ "${_CAT_LABEL}" == "Repositories" ]]; then
+        if wrapper_runnable "${name}"; then
+            tool_step "${name}" present
+            return 0
+        fi
+    elif command -v "${name}" >/dev/null 2>&1; then
         tool_step "${name}" present
         return 0
     fi
-    if [[ "${ok_verb}" == "ready" && "${_CAT_LABEL}" == "Repositories" ]]; then
+    if [[ "${_CAT_LABEL}" == "Repositories" ]]; then
         printf '  [%d/%d] %s %s(clone)%s\n' "$((_STEP_i + 1))" "${_STEP_total}" "${name}" "${C_DIM}" "${C_NC}"
     fi
-    if "$@" >/dev/null 2>&1 && command -v "${name}" >/dev/null 2>&1; then
-        tool_step "${name}" ok "${ok_verb}"
+    # The install function returns non-zero on a broken/failed install (deps failed / not
+    # runnable). Verify runnability after it runs, not just that a wrapper exists.
+    if "$@" >/dev/null 2>&1; then
+        if [[ "${_CAT_LABEL}" == "Repositories" ]]; then
+            wrapper_runnable "${name}" && tool_step "${name}" ok "${ok_verb}" \
+                                       || tool_step "${name}" failed
+        elif command -v "${name}" >/dev/null 2>&1; then
+            tool_step "${name}" ok "${ok_verb}"
+        else
+            tool_step "${name}" failed
+        fi
     else
         tool_step "${name}" failed
     fi
@@ -653,10 +670,41 @@ pipx_install() {
 # Clone a repo, build a venv, and write a wrapper script into ~/bin that runs `entry`
 # (the repo's main .py) through that venv. `req` selects dependency install: "req" =
 # requirements.txt, "self" = `pip install .`, or a space-separated package list.
+# Runnable check for a git+venv tool: it counts as installed ONLY if its wrapper exists AND
+# its entry script actually runs (a lightweight `--help` that neither errors nor complains
+# about missing deps). A wrapper alone means nothing — the venv's requirements may have failed
+# to install, which is exactly the "already installed but broken" bug this guards against.
+git_venv_runnable() {
+    local name="$1" dir="${SRC_DIR}/$1"
+    [[ -x "${BIN_DIR}/${name}" ]] || return 1
+    [[ -x "${dir}/.venv/bin/python" ]] || return 1
+    local out
+    out="$("${BIN_DIR}/${name}" --help 2>&1 | head -20 || true)"
+    # A working tool prints usage/help; a broken one prints an import/requirements error.
+    if printf '%s' "${out}" | grep -qiE 'no module named|modulenotfound|please pip install|pip install -r|importerror|traceback'; then
+        return 1
+    fi
+    return 0
+}
+
+# Runnable check for a custom wrapper (crtsh/gato/corsy etc.): the wrapper exists AND running
+# it with --help doesn't blow up with an import/requirements error. Same principle as
+# git_venv_runnable but for tools with bespoke install functions.
+wrapper_runnable() {
+    local name="$1"
+    [[ -x "${BIN_DIR}/${name}" ]] || return 1
+    local out
+    out="$("${BIN_DIR}/${name}" --help 2>&1 | head -20 || true)"
+    if printf '%s' "${out}" | grep -qiE 'no module named|modulenotfound|please pip install|pip install -r|importerror|traceback'; then
+        return 1
+    fi
+    return 0
+}
+
 git_venv_tool() {
     local name="$1" repo="$2" entry="$3" req="${4:-}"
 
-    if [[ -x "${BIN_DIR}/${name}" ]]; then
+    if git_venv_runnable "${name}"; then
         info "${name} already installed."
         return
     fi
@@ -667,19 +715,23 @@ git_venv_tool() {
     if [[ -d "${dir}/.git" ]]; then
         git -C "${dir}" pull --ff-only || true
     else
+        rm -rf "${dir}"          # a stale/partial clone would poison the venv; start clean
         git clone --depth 1 "${repo}" "${dir}"
     fi
 
-    python3 -m venv "${dir}/.venv"
-    "${dir}/.venv/bin/pip" install --upgrade pip setuptools wheel
+    # Recreate the venv if it's missing (a prior partial install may have left none).
+    [[ -x "${dir}/.venv/bin/python" ]] || python3 -m venv "${dir}/.venv"
+    "${dir}/.venv/bin/pip" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
 
+    # Install dependencies — do NOT swallow failure; capture it so we can report a broken tool.
+    local dep_rc=0
     if [[ "${req}" == "req" && -f "${dir}/requirements.txt" ]]; then
-        "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt" || true
+        "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt" || dep_rc=$?
     elif [[ "${req}" == "self" ]]; then
-        "${dir}/.venv/bin/pip" install "${dir}" || true
+        "${dir}/.venv/bin/pip" install "${dir}" || dep_rc=$?
     elif [[ -n "${req}" ]]; then
         # shellcheck disable=SC2086
-        "${dir}/.venv/bin/pip" install ${req} || true
+        "${dir}/.venv/bin/pip" install ${req} || dep_rc=$?
     fi
 
     cat > "${BIN_DIR}/${name}" <<EOF
@@ -687,6 +739,16 @@ git_venv_tool() {
 exec "${dir}/.venv/bin/python" "${dir}/${entry}" "\$@"
 EOF
     chmod +x "${BIN_DIR}/${name}"
+
+    # Verify the tool actually runs now; if not, it's a failed install, not a success.
+    if [[ ${dep_rc} -ne 0 ]]; then
+        warn "${name}: dependency install failed (pip exit ${dep_rc}); the tool may not run."
+        return 1
+    fi
+    if ! git_venv_runnable "${name}"; then
+        warn "${name}: installed but does not run cleanly (missing deps / import error)."
+        return 1
+    fi
 }
 
 install_uv() {
@@ -781,7 +843,7 @@ install_sublist3r() {
 
 install_crtsh() {
 
-    if [[ -x "${BIN_DIR}/crtsh" ]]; then
+    if wrapper_runnable crtsh; then
         log "crtsh already installed."
         return
     fi
@@ -800,19 +862,20 @@ install_crtsh() {
 
     if [[ ! -f "${source}" ]]; then
         warn "crtsh.py was not found at ${source}; inspect the repository layout."
-        return
+        return 1
     fi
 
-    python3 -m venv "${dir}/.venv"
-    "${dir}/.venv/bin/pip" install --upgrade pip
-    "${dir}/.venv/bin/pip" install requests
+    [[ -x "${dir}/.venv/bin/python" ]] || python3 -m venv "${dir}/.venv"
+    "${dir}/.venv/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
+    local dep_rc=0
+    "${dir}/.venv/bin/pip" install requests || dep_rc=$?
 
     cat > "${BIN_DIR}/crtsh" <<EOF
 #!/usr/bin/env bash
 exec "${dir}/.venv/bin/python" "${source}" "\$@"
 EOF
-
     chmod +x "${BIN_DIR}/crtsh"
+    [[ ${dep_rc} -eq 0 ]] || { warn "crtsh: dependency install failed (pip exit ${dep_rc})."; return 1; }
 }
 
 install_shodan() { pipx_install shodan shodan; }
@@ -999,7 +1062,7 @@ install_swaggerspy() {
 # (superseded by Trajan) but still functional; Kaalyx uses it for the Actions audit.
 install_gato() {
 
-    if command -v gato >/dev/null 2>&1 || [[ -x "${BIN_DIR}/gato" ]]; then
+    if wrapper_runnable gato; then
         info "gato already installed."
         return
     fi
@@ -1013,13 +1076,14 @@ install_gato() {
         git clone --depth 1 https://github.com/praetorian-inc/gato.git "${dir}"
     fi
 
-    python3 -m venv "${dir}/.venv"
-    "${dir}/.venv/bin/pip" install --upgrade pip setuptools wheel
-    "${dir}/.venv/bin/pip" install "${dir}" || { warn "gato pip install failed."; return; }
+    [[ -x "${dir}/.venv/bin/python" ]] || python3 -m venv "${dir}/.venv"
+    "${dir}/.venv/bin/pip" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    "${dir}/.venv/bin/pip" install "${dir}" || { warn "gato pip install failed."; return 1; }
 
     if [[ -x "${dir}/.venv/bin/gato" ]]; then
         ln -sf "${dir}/.venv/bin/gato" "${BIN_DIR}/gato"
     fi
+    wrapper_runnable gato || { warn "gato installed but does not run cleanly."; return 1; }
 }
 
 # msftrecon (Arcanum-Sec) — git clone + venv + wrapper (msftrecon.py).
@@ -1107,7 +1171,7 @@ install_sstimap() {
 
 install_corsy() {
 
-    if [[ -x "${BIN_DIR}/corsy" ]]; then
+    if wrapper_runnable corsy; then
         log "Corsy already installed."
         return
     fi
@@ -1122,21 +1186,22 @@ install_corsy() {
         git clone https://github.com/s0md3v/Corsy.git "${dir}"
     fi
 
-    python3 -m venv "${dir}/.venv"
-    "${dir}/.venv/bin/pip" install --upgrade pip
+    [[ -x "${dir}/.venv/bin/python" ]] || python3 -m venv "${dir}/.venv"
+    "${dir}/.venv/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
 
+    local dep_rc=0
     if [[ -f "${dir}/requirements.txt" ]]; then
-        "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt"
+        "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt" || dep_rc=$?
     else
-        "${dir}/.venv/bin/pip" install requests
+        "${dir}/.venv/bin/pip" install requests || dep_rc=$?
     fi
 
     cat > "${BIN_DIR}/corsy" <<EOF
 #!/usr/bin/env bash
 exec "${dir}/.venv/bin/python" "${dir}/corsy.py" "\$@"
 EOF
-
     chmod +x "${BIN_DIR}/corsy"
+    [[ ${dep_rc} -eq 0 ]] || { warn "corsy: dependency install failed (pip exit ${dep_rc})."; return 1; }
 }
 
 install_oralyzer() { pipx_install "git+https://github.com/r0075h3ll/Oralyzer.git" oralyzer; }

@@ -16,6 +16,7 @@ it interleaves cleanly with logging.
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 
@@ -26,6 +27,102 @@ from rich.table import Table
 from rich.text import Text
 
 from ..core.logging import get_console
+
+
+class _QuietTerminal:
+    """Context manager that disables tty ECHO + canonical input for its body, then drains any
+    buffered keystrokes on exit — so keys pressed while a rich.Live board is up are neither
+    echoed onto the screen (which would make the board reprint) nor left queued for the shell.
+
+    A no-op when stdin isn't a real tty (pipes, CI) or on platforms without ``termios``
+    (Windows) — the ``with`` block still runs, just without terminal tweaks.
+    """
+
+    def __init__(self) -> None:
+        self._fd = None
+        self._saved = None
+
+    def __enter__(self):
+        try:
+            import termios
+            if not sys.stdin.isatty():
+                return self
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+            new = termios.tcgetattr(self._fd)
+            # lflags: drop ECHO (don't print typed chars) and ICANON (don't line-buffer).
+            new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+            termios.tcsetattr(self._fd, termios.TCSANOW, new)
+        except Exception:
+            # Any failure (no termios, not a tty, restricted env) => just run without tweaks.
+            self._fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is None or self._saved is None:
+            return False
+        try:
+            import termios
+            # Discard anything typed during the board, then restore the original tty mode.
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+            termios.tcsetattr(self._fd, termios.TCSANOW, self._saved)
+        except Exception:
+            pass
+        return False
+
+
+class _LiveWithQuietTerminal:
+    """Wrap a ``rich.Live`` context manager so entering/exiting it also (a) enters/exits a
+    :class:`_QuietTerminal` for keypress-robustness and (b) installs a terminal-resize handler
+    that keeps the board a single in-place frame.
+
+    Resize is the second duplicate-frame trigger: rich overwrites the previous frame by moving
+    the cursor UP by the previously-rendered line count; a resize between refreshes changes how
+    many physical lines that frame occupies, so the cursor-up misses and the next frame draws
+    below the old one. On SIGWINCH we clear the LiveRender's cached shape and force a refresh,
+    so the next frame is drawn cleanly at the current size instead of over a miscounted one."""
+
+    def __init__(self, live) -> None:
+        self._live = live
+        self._quiet = _QuietTerminal()
+        self._prev_winch = None
+
+    def _on_resize(self, *_):
+        try:
+            # Drop the stale "previous frame height" so rich doesn't cursor-up over a frame
+            # whose real line count just changed, then repaint at the new size.
+            self._live._live_render._shape = None  # type: ignore[attr-defined]
+            self._live.refresh()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self._quiet.__enter__()
+        try:
+            result = self._live.__enter__()
+        except Exception:
+            self._quiet.__exit__(None, None, None)
+            raise
+        try:
+            import signal
+            if hasattr(signal, "SIGWINCH"):
+                self._prev_winch = signal.getsignal(signal.SIGWINCH)
+                signal.signal(signal.SIGWINCH, self._on_resize)
+        except Exception:
+            self._prev_winch = None
+        return result
+
+    def __exit__(self, *exc):
+        try:
+            if self._prev_winch is not None:
+                import signal
+                try:
+                    signal.signal(signal.SIGWINCH, self._prev_winch)
+                except Exception:
+                    pass
+            return self._live.__exit__(*exc)
+        finally:
+            self._quiet.__exit__(*exc)
 from . import ACCENT, ACCENT_DIM, MUTED, severity_style
 
 
@@ -45,19 +142,10 @@ def format_duration(seconds: float) -> str:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
-# The OSINT stage header: a fixed double-line box drawn by hand so it renders identically
-# on every terminal, regardless of font metrics.
-_HEADER_LINES = [
-    "╔══════════════════════════════════════════════════════════╗",
-    "║  OSINT · Passive Footprinting & Intelligence Gathering    ║",
-    "╚══════════════════════════════════════════════════════════╝",
-]
-
-
 def print_banner(domain: str, source_count: int) -> None:
-    """Print the OSINT stage header: main banner, a blank line, the double-line box, then a
-    target/source-count line."""
-    from . import print_main_banner
+    """Print the OSINT stage header (Style 3: accent bar + bold title + dim subtitle),
+    preceded by the main banner, then a target/source-count line."""
+    from . import print_main_banner, stage_header
 
     console = get_console()
 
@@ -65,14 +153,13 @@ def print_banner(domain: str, source_count: int) -> None:
     print_main_banner()
     console.print()
 
-    header = Text("\n".join(_HEADER_LINES), style=f"bold {ACCENT}")
+    console.print(stage_header("OSINT", "Passive Footprinting & Intelligence Gathering"))
     subtitle = Text.assemble(
         ("target ", MUTED),
         (domain, "bold white"),
         ("   ", ""),
         (f"{source_count} sources", ACCENT_DIM),
     )
-    console.print(header)
     console.print(subtitle)
     console.print()
 
@@ -190,29 +277,38 @@ class OsintProgress:
             self._live.refresh()
 
     def live(self):
-        """Context manager yielding an auto-refreshing ``rich.Live`` for this board.
+        """Context manager yielding an auto-refreshing ``rich.Live`` board that stays a SINGLE
+        in-place frame regardless of terminal interaction (keypresses, resize).
 
         ``get_renderable=self._render`` makes Live recompute the board on every one of its
         ``refresh_per_second`` ticks (not only on start/finish events), so the spinner frame
         — derived from the clock in ``_render`` — animates continuously even while a slow
-        source (e.g. theHarvester) blocks between events.
+        source blocks between events.
+
+        Robustness against duplicate frames (the board re-printing itself):
+          * ``redirect_stdout/stderr`` capture any stray program write during the fan-out.
+          * A terminal-mode guard (:class:`_QuietTerminal`) disables tty ECHO + canonical mode
+            for the duration, so stray KEYPRESSES aren't echoed onto the screen — an echoed
+            char is console output Live didn't emit, which makes a non-transient Live
+            checkpoint the current frame and start a fresh one below (the "board printed N
+            times" bug). Draining is best-effort and a no-op off a real tty / on Windows.
+          * RESIZE: rich 13.x re-reads the console size every refresh and redraws in place; the
+            terminal guard removes the only remaining trigger (echoed input), so a resize alone
+            just reflows the same single frame.
         """
         from rich.live import Live
 
-        self._live = Live(
+        live = Live(
             get_renderable=self._render,
             console=self._console,
             refresh_per_second=12,
             auto_refresh=True,
             transient=False,
-            # Capture any stray stdout/stderr write (a library print/warning during the
-            # fan-out) so it can't make the non-transient board checkpoint and reprint as a
-            # duplicate. The console log handler is fully detached separately; this covers
-            # anything that bypasses logging.
             redirect_stdout=True,
             redirect_stderr=True,
         )
-        return self._live
+        self._live = live
+        return _LiveWithQuietTerminal(live)
 
 
 # --- Result tables ----------------------------------------------------------------------

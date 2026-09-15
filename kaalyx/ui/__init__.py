@@ -44,6 +44,23 @@ def severity_style(severity: str | Severity) -> str:
     return SEVERITY_STYLE.get(key, SEVERITY_STYLE["unknown"])
 
 
+def stage_header(title: str, subtitle: str = ""):
+    """Build the shared per-stage header renderable (used by all 6 pipeline stages).
+
+    Style: a strong bright-cyan vertical bar (▌) on each line, the stage TITLE bold, and the
+    subtitle dim — no boxes/dividers. Replaces the old double-line box header.
+    """
+    from rich.console import Group
+    from rich.text import Text
+
+    bar = Text("▌ ", style=f"bold {ACCENT}")
+    line1 = Text.assemble((bar.plain, f"bold {ACCENT}"), (title, "bold white"))
+    parts = [line1]
+    if subtitle:
+        parts.append(Text.assemble((bar.plain, f"bold {ACCENT}"), (subtitle, MUTED)))
+    return Group(*parts)
+
+
 def severity_tag(severity: str | Severity) -> str:
     """Return a coloured, bracketed severity tag for inline use, e.g. ``[HIGH]``."""
     key = severity.value if isinstance(severity, Severity) else str(severity).lower()

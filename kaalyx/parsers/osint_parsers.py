@@ -770,36 +770,58 @@ def _postman_hostnames(node, out: set[str]) -> None:
             out.add(hm.group(1).lower())
 
 
-def _postman_literal_creds(node, out: list[tuple[str, str, str]]) -> None:
+def _first_url(node) -> str:
+    """Return the first request URL string found under *node* (raw > url > any '://' string)."""
+    if isinstance(node, dict):
+        raw = node.get("url")
+        if isinstance(raw, dict):
+            r = raw.get("raw")
+            if isinstance(r, str) and "://" in r:
+                return r
+        if isinstance(raw, str) and "://" in raw:
+            return raw
+        for v in node.values():
+            found = _first_url(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _first_url(item)
+            if found:
+                return found
+    return ""
+
+
+def _postman_literal_creds(node, out: list[dict]) -> None:
     """Find hardcoded credential values in headers/auth across the Postman JSON tree.
 
-    Appends ``(request_name, key, token)`` for each literal (non-templated) secret. Handles
-    both the header shape ``{"key": "Authorization", "value": "Token <literal>"}`` and the
-    auth shape ``{"type": "bearer", "bearer": [{"key":"token","value":"<literal>"}]}``.
-    ``request_name`` is best-effort from the nearest enclosing item's ``name``.
+    Appends a dict ``{request, key, token, url}`` for each literal (non-templated) secret.
+    Handles the header shape ``{"key": "Authorization", "value": "Token <literal>"}`` and
+    cred-ish string values. ``request``/``url`` are best-effort from the nearest enclosing
+    request item.
     """
-    def _scan(n, req_name: str) -> None:
+    def _scan(n, req_name: str, req_url: str) -> None:
         if isinstance(n, dict):
             name = str(n.get("name") or req_name or "").strip() or req_name
-            # header/auth entry: has a key + value pair
+            # If this dict is (or contains) a request, capture its URL for the children.
+            url = req_url or _first_url(n)
             key = n.get("key")
             val = n.get("value")
             if isinstance(key, str) and isinstance(val, str) and _CRED_KEY_RE.search(key):
                 token = _looks_literal_secret(val)
                 if token:
-                    out.append((name, key, token))
-            # a bare Authorization-style string value under a cred-ish key
+                    out.append({"request": name, "key": key, "token": token, "url": url})
             for k, v in n.items():
                 if isinstance(v, str) and _CRED_KEY_RE.search(k):
                     token = _looks_literal_secret(v)
                     if token:
-                        out.append((name, k, token))
+                        out.append({"request": name, "key": k, "token": token, "url": url})
                 else:
-                    _scan(v, name)
+                    _scan(v, name, url)
         elif isinstance(n, list):
             for item in n:
-                _scan(item, req_name)
-    _scan(node, "")
+                _scan(item, req_name, req_url)
+    _scan(node, "", "")
 
 
 def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
@@ -867,26 +889,39 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
         ))
 
     # (1) Hardcoded credentials embedded in request headers/auth — each its own HIGH finding.
-    creds: list[tuple[str, str, str]] = []
+    # The finding carries STRUCTURED detail in ``evidence`` as newline-separated ``Label: value``
+    # lines so the UI can render it as a spacious card (never truncated), while ``description``
+    # stays a one-line human summary. The full unmasked token lives only in ``raw``.
+    creds: list[dict] = []
     _postman_literal_creds(doc, creds)
     seen_creds: set[str] = set()
-    for req_name, key, token in creds:
+    for c in creds:
+        token = c["token"]
         if token in seen_creds:
             continue
         seen_creds.add(token)
+        req_name, key, url = c.get("request", ""), c.get("key", ""), c.get("url", "")
         masked = mask_secret(token)
-        where = f"request '{req_name}'" if req_name else "a Postman request"
+        detail_lines = []
+        if req_name:
+            detail_lines.append(f"Request: {req_name}")
+        detail_lines.append(f"Header:  {key}")
+        detail_lines.append(f"Value:   {masked}")
+        if url:
+            detail_lines.append(f"URL:     {url}")
         findings.append(Finding(
             title="Hardcoded API credential in public Postman request",
             category="secret",
             severity=Severity.HIGH,
             confidence=Confidence.FIRM,
-            target=f"postman:{req_name or key}"[:200],
+            target=(f"postman:{req_name or key}")[:200],
             tool=source,
             description=(f"A literal (non-templated) credential is hardcoded in the "
-                         f"'{key}' header/auth of {where}. Value: {masked}."),
-            evidence=f"{key}: {masked}",
-            raw=f"{req_name} | {key} | {token}"[:500],
+                         f"'{key}' header of "
+                         + (f"request '{req_name}'" if req_name else "a Postman request")
+                         + f". Value: {masked}."),
+            evidence="\n".join(detail_lines)[:600],
+            raw=f"{req_name} | {key} | {url} | {token}"[:600],
         ))
 
     # (2) Hostnames leaking in request URLs -> discovered subdomains (feed Part 2).

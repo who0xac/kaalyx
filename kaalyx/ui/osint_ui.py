@@ -375,36 +375,110 @@ def mail_hygiene_table(records: list) -> Table | None:
     return table
 
 
-def findings_table(rows: list, limit: int = 25) -> Table | None:
-    """Coloured table of findings, most-severe first."""
-    if not rows:
-        return None
-    order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
-    ordered = sorted(rows, key=lambda r: order.get(r["severity"], 0), reverse=True)[:limit]
-    # expand=True lets the table use the FULL terminal width, and the two content columns
-    # (Title, Detail) carry ratios so important detail wraps onto multiple lines rather than
-    # being truncated — completeness over tidiness (never cut a masked credential or a URL).
-    table = Table(title="Findings", box=ROUNDED, border_style=ACCENT_DIM,
+# Category → human section title, in the order we present them.
+_CATEGORY_TITLES = [
+    ("secret", "Secrets & Credentials"),
+    ("credential-leak", "Leaked Credentials"),
+    ("api-leak", "API Leaks"),
+    ("cloud", "Cloud Resources"),
+    ("ci-cd", "CI/CD (GitHub Actions)"),
+    ("third-party-misconfig", "Third-party Misconfigurations"),
+    ("email-security", "Email / DNS Security"),
+    ("tenant-mapping", "Tenant Mapping"),
+]
+_SEV_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
+
+
+def _is_complex(row) -> bool:
+    """A finding needs the spacious CARD format (not a table row) when its detail is large or
+    multi-line — e.g. a hardcoded Postman credential with request/header/value/URL. A short,
+    single-line detail (TruffleHog's ``repo | file:line | masked``) fits a compact table."""
+    ev = _row_get(row, "evidence")
+    return "\n" in ev or len(ev) > 100
+
+
+def _finding_card(row):
+    """Render one complex finding as a bordered card with every detail line visible."""
+    sev = _row_get(row, "severity", "unknown")
+    title = _row_get(row, "title")
+    body = Table.grid(padding=(0, 1))
+    body.add_column(style="cyan", no_wrap=True)     # label
+    body.add_column(style="white", overflow="fold")  # value (wraps, never truncates)
+    body.add_row(Text(sev.upper(), style=severity_style(sev)), _verified_cell(row))
+    tgt = _row_get(row, "target")
+    if tgt:
+        body.add_row("Target", tgt)
+    # evidence is newline-separated "Label: value" lines (from the parser) — show each on
+    # its own row; fall back to the description for findings without structured evidence.
+    ev = _row_get(row, "evidence")
+    if "\n" in ev:
+        for line in ev.split("\n"):
+            if ":" in line:
+                lbl, _, val = line.partition(":")
+                body.add_row(lbl.strip(), val.strip())
+            elif line.strip():
+                body.add_row("", line.strip())
+    else:
+        body.add_row("Detail", ev or _row_get(row, "description"))
+    return Panel(body, title=Text(title, style="bold white"), title_align="left",
+                 border_style=severity_style(sev), box=ROUNDED, padding=(0, 1))
+
+
+def _simple_findings_table(rows: list, section_title: str) -> Table:
+    """Compact table for simple findings (short single-line detail), full width, folding."""
+    table = Table(title=section_title, box=ROUNDED, border_style=ACCENT_DIM,
                   title_style=f"bold {ACCENT}", header_style="bold white", expand=True)
     table.add_column("Sev", width=9, no_wrap=True)
     table.add_column("Verified", width=10, justify="center", no_wrap=True)
-    table.add_column("Category", style="magenta", no_wrap=True)
-    table.add_column("Title", style="white", overflow="fold", ratio=2, min_width=20)
-    # Detail carries the triage info: where it was found + a masked value preview (from the
-    # finding's evidence, e.g. "repo | file:line | AKIA…••••…3F9c"), falling back to target.
-    # ratio=3 + fold => the full detail wraps cleanly instead of being cut.
-    table.add_column("Detail (where / masked value)", style=MUTED,
-                     overflow="fold", ratio=3, min_width=24)
-    for r in ordered:
-        sev = r["severity"]
+    table.add_column("Title", style="white", overflow="fold", ratio=2, min_width=18)
+    table.add_column("Detail", style=MUTED, overflow="fold", ratio=3, min_width=22)
+    for r in rows:
+        sev = _row_get(r, "severity", "unknown")
         detail = _row_get(r, "evidence") or _row_get(r, "target") or ""
         table.add_row(
             Text(sev.upper(), style=severity_style(sev)),
-            _verified_cell(r),
-            r["category"], r["title"],
-            Text(detail, style=MUTED),
+            _verified_cell(r), _row_get(r, "title"), Text(detail, style=MUTED),
         )
     return table
+
+
+def render_findings(rows: list, limit: int = 40) -> list:
+    """Findings rendered Option-3 style: GROUPED BY CATEGORY, each group using the format that
+    fits its detail — a compact table for simple findings, spacious cards for complex ones.
+
+    Returns a list of renderables (section header + table/cards per category) so no detail is
+    ever truncated to keep a uniform table tidy. Empty list when there are no findings.
+    """
+    if not rows:
+        return []
+    rows = sorted(rows, key=lambda r: _SEV_ORDER.get(_row_get(r, "severity", "unknown"), 0),
+                  reverse=True)[:limit]
+    # Bucket by category, preserving the presentation order; unknown categories go last.
+    buckets: dict[str, list] = {}
+    for r in rows:
+        buckets.setdefault(_row_get(r, "category", "other") or "other", []).append(r)
+
+    ordered_cats = [c for c, _ in _CATEGORY_TITLES if c in buckets]
+    ordered_cats += [c for c in buckets if c not in ordered_cats]
+    title_map = dict(_CATEGORY_TITLES)
+
+    out: list = [Text("Findings", style=f"bold {ACCENT}")]
+    for cat in ordered_cats:
+        group = buckets[cat]
+        section = title_map.get(cat, cat.replace("-", " ").title())
+        complex_rows = [r for r in group if _is_complex(r)]
+        simple_rows = [r for r in group if not _is_complex(r)]
+        if simple_rows:
+            out.append(_simple_findings_table(simple_rows, section))
+        for r in complex_rows:
+            out.append(_finding_card(r))
+    return out
+
+
+def findings_table(rows: list, limit: int = 25):
+    """Back-compat shim: return a Group of the grouped-findings renderables (or ``None``)."""
+    parts = render_findings(rows, limit=limit)
+    return Group(*parts) if parts else None
 
 
 def _row_get(row, key: str, default: str = "") -> str:

@@ -210,11 +210,17 @@ class OsintStage(Stage):
             osint_ui.mail_hygiene_table(osint_rows),
             osint_ui.emails_table(email_rows),
             osint_ui.employees_table(emp_rows),
-            osint_ui.findings_table(finding_rows),
         ):
             if table is not None:
                 console.print()
                 console.print(table)
+
+        # Findings are grouped by category (Option 3): a compact table for simple types,
+        # spacious cards for complex ones (e.g. hardcoded Postman credentials) so no detail
+        # is truncated. render_findings returns a list of renderables to print in order.
+        for renderable in osint_ui.render_findings(finding_rows):
+            console.print()
+            console.print(renderable)
 
         counts = ctx.repo.scan_counts(ctx.scan_id)
         sev_counts = {

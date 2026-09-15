@@ -121,7 +121,9 @@ build_version() {
 }
 
 print_banner() {
-    # Art in red, tagline in yellow, author dim — same palette as the main Kaalyx banner.
+    # Same palette as the main Kaalyx banner: art red; version bold yellow; the " | "
+    # separator dim; tagline bold green; author dim.
+    local C_BYELLOW=$'\033[1;33m' C_BGREEN=$'\033[1;32m'
     printf '%s\n' "${C_RED}"
     cat <<'ART'
  _  __           _
@@ -132,8 +134,10 @@ print_banner() {
                     |___/
 ART
     printf '%s' "${C_NC}"
-    printf '    %s%s%s\n' "${C_YELLOW}" "Automated Recon & Vulnerability Engine" "${C_NC}"
-    printf '    %s%s  ·  Author: who0xac%s\n' "${C_DIM}" "$(build_version)" "${C_NC}"
+    printf '    %s%s%s  |  %s%s%s\n' \
+        "${C_BYELLOW}" "$(build_version)" "${C_NC}" \
+        "${C_BGREEN}" "Automated Recon & Vulnerability Engine" "${C_NC}"
+    printf '    %sAuthor: who0xac%s\n' "${C_DIM}" "${C_NC}"
 }
 
 print_help() {

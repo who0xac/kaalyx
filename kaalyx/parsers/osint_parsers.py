@@ -722,24 +722,108 @@ def parse_misconfig_mapper(stdout: str, source: str = "misconfig-mapper") -> lis
     return findings
 
 
-def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
-                       target: str = "") -> list[Finding]:
-    """Parse porch-pirate ``--raw`` JSON into ONE finding per public Postman workspace.
+# A "literal credential" is a hardcoded, non-templated secret value found in a request's
+# headers/auth — NOT a Postman variable like ``{{auth_token}}``. We look for values that pair a
+# credential-ish key (authorization/token/apikey/secret/…) with a value that (a) isn't a
+# ``{{...}}`` placeholder and (b) looks like a real secret (long, high-entropy-ish token, or a
+# Bearer/Basic/Token scheme carrying such a value).
+_CRED_KEY_RE = re.compile(r"(authorization|api[-_]?key|x-api-key|token|secret|access[-_]?token|"
+                          r"client[-_]?secret|password|bearer)", re.I)
+_TEMPLATE_RE = re.compile(r"\{\{.*?\}\}")               # Postman variable, e.g. {{auth_token}}
+# A literal secret-looking value: an optional scheme word then a 20+ char token of secret-y
+# characters (letters/digits/_-.+/=), no spaces, not a pure URL.
+_LITERAL_SECRET_RE = re.compile(
+    r"(?:^|\b)(?:bearer|token|basic|apikey|api_key)?\s*([A-Za-z0-9_\-\.\+/=]{20,})\s*$", re.I)
+_HOST_RE = re.compile(r"https?://([a-zA-Z0-9][a-zA-Z0-9.\-]*[a-zA-Z0-9])(?::\d+)?", re.I)
 
-    Run with ``--raw``, porch-pirate emits JSON describing the public Postman workspaces /
-    collections that reference the target. We create exactly one finding per workspace with
-    structured fields (id, name, a truncated description) — NOT one finding per line of a
-    workspace's free-text description (the earlier bug). Non-JSON output yields nothing
-    rather than a line-by-line text dump.
+
+def _looks_literal_secret(value: str) -> str | None:
+    """Return the literal secret token in *value* if it's a hardcoded (non-templated) secret,
+    else ``None``. Rejects Postman ``{{variable}}`` placeholders and short/empty values."""
+    v = (value or "").strip()
+    if not v or _TEMPLATE_RE.search(v):
+        return None
+    m = _LITERAL_SECRET_RE.search(v)
+    if not m:
+        return None
+    token = m.group(1)
+    # Guard against obvious non-secrets that pass the length filter (URLs, content types).
+    if "://" in token or "/" in token and "." in token and len(token) < 40:
+        return None
+    return token
+
+
+def _postman_hostnames(node, out: set[str]) -> None:
+    """Collect hostnames from every ``url`` string anywhere in the Postman JSON tree."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and (k.lower() in ("raw", "url", "host") or "://" in v):
+                for hm in _HOST_RE.finditer(v):
+                    out.add(hm.group(1).lower())
+            else:
+                _postman_hostnames(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _postman_hostnames(item, out)
+    elif isinstance(node, str) and "://" in node:
+        for hm in _HOST_RE.finditer(node):
+            out.add(hm.group(1).lower())
+
+
+def _postman_literal_creds(node, out: list[tuple[str, str, str]]) -> None:
+    """Find hardcoded credential values in headers/auth across the Postman JSON tree.
+
+    Appends ``(request_name, key, token)`` for each literal (non-templated) secret. Handles
+    both the header shape ``{"key": "Authorization", "value": "Token <literal>"}`` and the
+    auth shape ``{"type": "bearer", "bearer": [{"key":"token","value":"<literal>"}]}``.
+    ``request_name`` is best-effort from the nearest enclosing item's ``name``.
+    """
+    def _scan(n, req_name: str) -> None:
+        if isinstance(n, dict):
+            name = str(n.get("name") or req_name or "").strip() or req_name
+            # header/auth entry: has a key + value pair
+            key = n.get("key")
+            val = n.get("value")
+            if isinstance(key, str) and isinstance(val, str) and _CRED_KEY_RE.search(key):
+                token = _looks_literal_secret(val)
+                if token:
+                    out.append((name, key, token))
+            # a bare Authorization-style string value under a cred-ish key
+            for k, v in n.items():
+                if isinstance(v, str) and _CRED_KEY_RE.search(k):
+                    token = _looks_literal_secret(v)
+                    if token:
+                        out.append((name, k, token))
+                else:
+                    _scan(v, name)
+        elif isinstance(n, list):
+            for item in n:
+                _scan(item, req_name)
+    _scan(node, "")
+
+
+def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
+                       target: str = "") -> tuple[list[Finding], list[Subdomain]]:
+    """Parse porch-pirate ``--raw`` JSON into per-workspace + per-credential findings, plus any
+    hostnames leaking in request URLs.
+
+    Returns ``(findings, subdomains)``:
+      * one workspace finding per public Postman workspace referencing the target;
+      * one HIGH-severity finding per HARDCODED credential found in a request's headers/auth
+        (literal values only — Postman ``{{variable}}`` placeholders are ignored), with the
+        value masked the same way as secret findings elsewhere;
+      * every hostname appearing in a request URL is returned as a discovered subdomain (real
+        infrastructure that often appears nowhere else in OSINT output).
+    Non-JSON output yields nothing rather than a line-by-line text dump.
     """
     findings: list[Finding] = []
+    subs: list[Subdomain] = []
     seen: set[str] = set()
 
     def _walk(node) -> list[dict]:
         """Collect workspace/collection-like dicts from arbitrary nested JSON."""
         out: list[dict] = []
         if isinstance(node, dict):
-            # A workspace/collection object has an id and (usually) a name/slug/type.
             if node.get("id") and any(k in node for k in ("name", "slug", "type", "publicHandle")):
                 out.append(node)
             for v in node.values():
@@ -749,11 +833,9 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
                 out.extend(_walk(item))
         return out
 
-    # Parse the whole document (porch-pirate --raw is a single JSON doc, not JSON-lines).
     doc = try_load_json(stdout)
     if doc is None:
-        # Not JSON (e.g. an older text build or an error) — don't fabricate findings.
-        return findings
+        return findings, subs
 
     for ws in _walk(doc):
         ws_id = str(ws.get("id", "")).strip()
@@ -761,16 +843,11 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
             continue
         seen.add(ws_id)
         name = str(ws.get("name") or ws.get("slug") or "workspace").strip()
-        desc = " ".join(str(ws.get("description", "")).split())  # collapse whitespace/newlines
+        desc = " ".join(str(ws.get("description", "")).split())
         if len(desc) > 160:
             desc = desc[:157] + "…"
-        # Heuristic: does the structured data hint at embedded credentials?
         blob = json.dumps(ws).lower() if isinstance(ws, dict) else str(ws).lower()
         leaky = any(k in blob for k in ("apikey", "api_key", "token", "secret", "bearer", "authorization", "password"))
-        # porch-pirate searches Postman for the target *name*, so a workspace may be an
-        # unrelated match. Grade the whole workspace blob's tie to the target: one that
-        # references the target domain keeps its confidence; a bare name match is capped at
-        # TENTATIVE and flagged, so it isn't presented like a verified target-owned leak.
         relevance = assess_target_relevance(blob, target) if target else "direct"
         confidence = _cap_for_relevance(
             Confidence.FIRM if leaky else Confidence.TENTATIVE, relevance)
@@ -788,37 +865,77 @@ def parse_porch_pirate(stdout: str, source: str = "porch-pirate",
             evidence=desc[:300],
             raw=json.dumps(ws)[:800],
         ))
-    return findings
+
+    # (1) Hardcoded credentials embedded in request headers/auth — each its own HIGH finding.
+    creds: list[tuple[str, str, str]] = []
+    _postman_literal_creds(doc, creds)
+    seen_creds: set[str] = set()
+    for req_name, key, token in creds:
+        if token in seen_creds:
+            continue
+        seen_creds.add(token)
+        masked = mask_secret(token)
+        where = f"request '{req_name}'" if req_name else "a Postman request"
+        findings.append(Finding(
+            title="Hardcoded API credential in public Postman request",
+            category="secret",
+            severity=Severity.HIGH,
+            confidence=Confidence.FIRM,
+            target=f"postman:{req_name or key}"[:200],
+            tool=source,
+            description=(f"A literal (non-templated) credential is hardcoded in the "
+                         f"'{key}' header/auth of {where}. Value: {masked}."),
+            evidence=f"{key}: {masked}",
+            raw=f"{req_name} | {key} | {token}"[:500],
+        ))
+
+    # (2) Hostnames leaking in request URLs -> discovered subdomains (feed Part 2).
+    hosts: set[str] = set()
+    _postman_hostnames(doc, hosts)
+    for host in sorted(hosts):
+        if "." not in host or host in ("localhost",):
+            continue
+        # Keep only real hostnames; if a target is known, keep on-domain hosts (the valuable
+        # ones), but also keep any FQDN so nothing is silently dropped.
+        subs.append(Subdomain(hostname=host, source="postman"))
+    return findings, subs
 
 
 def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy",
-                     target: str = "") -> list[Finding]:
-    """Parse SwaggerSpy output (exposed Swagger/OpenAPI specs) into findings.
+                     target: str = "") -> tuple[list[Finding], list[Subdomain]]:
+    """Parse SwaggerSpy output (exposed Swagger/OpenAPI specs) into findings + subdomains.
 
     Exposed API documentation reveals endpoints, parameters and sometimes embedded creds.
-    We treat each discovered spec URL as an informational finding (endpoint-surface), and
-    bump severity when the line hints at secrets.
+    We treat each discovered spec URL as an informational finding (endpoint-surface), bump
+    severity when the line hints at secrets, and extract the spec's hostname as a discovered
+    subdomain (real infrastructure).
 
     SwaggerSpy searches by the target name, so a spec URL may belong to an unrelated host.
     When *target* is given we grade the spec URL's tie to it: a spec hosted on the target
     domain keeps its confidence; one that only matches the base keyword is capped at
-    TENTATIVE and flagged, so an unverified spec is never presented with exact-match
-    confidence.
+    TENTATIVE and flagged.
     """
     findings: list[Finding] = []
+    subs_seen: set[str] = set()
+    subs: list[Subdomain] = []
     seen: set[str] = set()
     url_re = re.compile(r"https?://[^\s\"'<>]+")
     for line in stdout.splitlines():
         text = line.strip()
         low = text.lower()
-        # A discovered spec is a URL; that's the reliable signal. Lines without a URL are
-        # banners/progress and must not become findings (one finding per discovered spec).
         m = url_re.search(text)
         if not m:
             continue
         if "swagger" not in low and "openapi" not in low and "api-docs" not in low and "api/docs" not in low:
             continue
         url = m.group(0).rstrip(".,)")
+        # Extract the spec's hostname as a discovered subdomain.
+        hm = _HOST_RE.match(url)
+        if hm:
+            host = hm.group(1).lower()
+            if "." in host and host not in subs_seen:
+                subs_seen.add(host)
+                subs.append(Subdomain(hostname=host, source="swaggerspy"))
         if url in seen:
             continue
         seen.add(url)
@@ -838,7 +955,7 @@ def parse_swaggerspy(stdout: str, source: str = "SwaggerSpy",
             evidence=text[:300],
             raw=text[:500],
         ))
-    return findings
+    return findings, subs
 
 
 def parse_gato(output: str, source: str = "gato") -> list[Finding]:
@@ -917,3 +1034,52 @@ def parse_gato(output: str, source: str = "gato") -> list[Finding]:
             raw=text[:500],
         ))
     return findings
+
+
+# Scopes gato needs to actually enumerate a target org's repos/secrets.
+_GATO_REQUIRED_SCOPES = ("repo", "admin:org")
+
+
+def diagnose_gato_no_findings(output: str, org: str = "") -> str:
+    """Explain WHY a gato run surfaced nothing, from its own JSON — not a canned guess.
+
+    gato's JSON reports the token's ``scopes`` and the user's relationship to the org
+    (``org_admin_user`` / ``org_member``). The common false diagnosis is "token lacks scope"
+    when the real reason is that the authenticated user simply isn't a MEMBER of the target
+    org (so GitHub returns nothing regardless of scope). We check scope first, then membership:
+
+      * missing a required scope        -> "token is missing scope(s): …"
+      * has scope but not an org member -> "authenticated as a non-member of org X …"
+      * otherwise                       -> a neutral "no accessible … (org is clean or private)".
+    """
+    doc = try_load_json(output)
+    scopes: list[str] = []
+    org_member = org_admin = None
+    if isinstance(doc, dict):
+        raw_scopes = doc.get("scopes") or doc.get("token_scopes") or []
+        if isinstance(raw_scopes, str):
+            raw_scopes = [s.strip() for s in raw_scopes.split(",")]
+        scopes = [str(s).strip().lower() for s in raw_scopes if s]
+        # membership flags may live at the top level or under an org block
+        for src in (doc, doc.get("organization") or {}, doc.get("org") or {}):
+            if isinstance(src, dict):
+                if org_member is None and "org_member" in src:
+                    org_member = bool(src.get("org_member"))
+                if org_admin is None and "org_admin_user" in src:
+                    org_admin = bool(src.get("org_admin_user"))
+
+    org_txt = f" {org}" if org else ""
+    if scopes:
+        missing = [s for s in _GATO_REQUIRED_SCOPES if s not in scopes]
+        if missing:
+            return (f"no findings — token is missing scope(s): {', '.join(missing)} "
+                    f"(has: {', '.join(scopes)})")
+    # Scope is fine (or unknown). If we know the user isn't a member/admin of the org, that's
+    # the real cause — not scope.
+    if org_member is False and not org_admin:
+        return (f"no findings — authenticated as a non-member of org{org_txt}; "
+                f"no accessible repo/org secrets (token scope is sufficient)")
+    if scopes:
+        return (f"no findings — org{org_txt} appears clean or private to this token "
+                f"(scopes ok: {', '.join(scopes)})")
+    return f"no findings — could not determine cause from gato output (org{org_txt})"

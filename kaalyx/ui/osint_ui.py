@@ -381,15 +381,20 @@ def findings_table(rows: list, limit: int = 25) -> Table | None:
         return None
     order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
     ordered = sorted(rows, key=lambda r: order.get(r["severity"], 0), reverse=True)[:limit]
+    # expand=True lets the table use the FULL terminal width, and the two content columns
+    # (Title, Detail) carry ratios so important detail wraps onto multiple lines rather than
+    # being truncated — completeness over tidiness (never cut a masked credential or a URL).
     table = Table(title="Findings", box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white")
-    table.add_column("Sev", width=9)
-    table.add_column("Verified", width=10, justify="center")
-    table.add_column("Category", style="magenta")
-    table.add_column("Title", style="white", overflow="fold")
+                  title_style=f"bold {ACCENT}", header_style="bold white", expand=True)
+    table.add_column("Sev", width=9, no_wrap=True)
+    table.add_column("Verified", width=10, justify="center", no_wrap=True)
+    table.add_column("Category", style="magenta", no_wrap=True)
+    table.add_column("Title", style="white", overflow="fold", ratio=2, min_width=20)
     # Detail carries the triage info: where it was found + a masked value preview (from the
     # finding's evidence, e.g. "repo | file:line | AKIA…••••…3F9c"), falling back to target.
-    table.add_column("Detail (where / masked value)", style=MUTED, overflow="fold")
+    # ratio=3 + fold => the full detail wraps cleanly instead of being cut.
+    table.add_column("Detail (where / masked value)", style=MUTED,
+                     overflow="fold", ratio=3, min_width=24)
     for r in ordered:
         sev = r["severity"]
         detail = _row_get(r, "evidence") or _row_get(r, "target") or ""

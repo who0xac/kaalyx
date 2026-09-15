@@ -677,7 +677,10 @@ class OsintStage(Stage):
         if pp.started:
             ran_any = True
             self.ctx.writer.raw_tool_output(self.name, "porch-pirate", pp.stdout)
-            res.findings.extend(P.parse_porch_pirate(pp.stdout, target=self.ctx.target.registrable))
+            pp_findings, pp_subs = P.parse_porch_pirate(
+                pp.stdout, target=self.ctx.target.registrable)
+            res.findings.extend(pp_findings)
+            res.subdomains.extend(pp_subs)  # hostnames leaking in request URLs -> Part 2
 
         ss = await self.ctx.runner.run(
             ["swaggerspy", keyword], timeout=600, label="swaggerspy",
@@ -685,7 +688,10 @@ class OsintStage(Stage):
         if ss.started:
             ran_any = True
             self.ctx.writer.raw_tool_output(self.name, "swaggerspy", ss.stdout)
-            res.findings.extend(P.parse_swaggerspy(ss.stdout, target=self.ctx.target.registrable))
+            ss_findings, ss_subs = P.parse_swaggerspy(
+                ss.stdout, target=self.ctx.target.registrable)
+            res.findings.extend(ss_findings)
+            res.subdomains.extend(ss_subs)
 
         if not ran_any:
             res.skipped = True
@@ -751,12 +757,14 @@ class OsintStage(Stage):
             json_text = json_out.read_text(encoding="utf-8")
         except OSError:
             json_text = ""
-        res.findings = P.parse_gato(json_text or out.stdout)
+        gato_json = json_text or out.stdout
+        res.findings = P.parse_gato(gato_json)
         if res.findings:
             res.note = f"org={org}"
         else:
-            # Ran cleanly but found nothing — most often a token-scope limitation.
-            res.note = f"org={org}: no findings (token may lack repo/admin:org scope)"
+            # Ran cleanly but found nothing — diagnose the REAL cause from gato's own JSON
+            # (token scope vs. the user not being a member of the target org), not a guess.
+            res.note = f"org={org}: {P.diagnose_gato_no_findings(gato_json, org)}"
         return res
 
     # -- in-process sources ------------------------------------------------------------

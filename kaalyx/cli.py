@@ -871,18 +871,27 @@ def _tag_for_commit(subject: str) -> tuple[str, str, str]:
 
 
 def _render_update_changelog(old_ref: str, new_ref: str, commits: list[tuple[str, str]]) -> None:
-    """Print the nuclei-style bracketed-tag update summary (no borders, left-aligned tags)."""
+    """Print the update summary.
+
+    A single-commit update (or when the commit list couldn't be fetched) gets the SIMPLE
+    one-line form — no per-commit breakdown, no footer — since a changelog of one line is
+    just noise. Only a MULTI-commit update (2+) prints the nuclei-style tagged bullet list
+    with the header count and the "run kaalyx changelog" footer.
+    """
     n = len(commits)
-    plural = "commit" if n == 1 else "commits"
-    count = f" ({n} {plural})" if n else ""
+    if n <= 1:
+        console.print(
+            f"[green]✔ Kaalyx updated:[/] [bold]{old_ref}[/] → [bold]{new_ref}[/]"
+        )
+        return
+
     console.print(
-        f"[cyan]\\[INF][/] kaalyx updated [bold]{old_ref}[/] → [bold]{new_ref}[/]{count}"
+        f"[cyan]\\[INF][/] kaalyx updated [bold]{old_ref}[/] → [bold]{new_ref}[/] ({n} commits)"
     )
-    if commits:
-        console.print()
-        for _sha, subject in commits:
-            tag, style, msg = _tag_for_commit(subject)
-            console.print(f"[{style}]\\[{tag}][/] {msg}")
+    console.print()
+    for _sha, subject in commits:
+        tag, style, msg = _tag_for_commit(subject)
+        console.print(f"[{style}]\\[{tag}][/] {msg}")
     console.print()
     console.print(
         "[cyan]\\[INF][/] run [bold]kaalyx changelog[/] anytime · "

@@ -135,7 +135,7 @@ class Finding:
 class Email:
     """A discovered email address (from harvesting) with optional breach data.
 
-    Modelled after BBOT's typed ``EMAIL_ADDRESS`` event plus reNgine's h8mail breach
+    A typed email-address record plus h8mail breach
     chaining: an email harvested by one source can later be enriched with breach counts by
     a breach-lookup source keyed on the same address.
     """

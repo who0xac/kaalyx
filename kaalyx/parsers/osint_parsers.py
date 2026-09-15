@@ -448,8 +448,8 @@ def parse_theharvester(stdout_or_json: str, domain: str,
     """Parse theHarvester JSON output into emails, employees, and subdomains.
 
     theHarvester (run with ``-f out.json``) writes a JSON document with keys such as
-    ``emails``, ``hosts``, ``linkedin_people`` and ``twitter_people`` (reNgine reads the
-    same fields). We read defensively and only keep on-domain emails.
+    ``emails``, ``hosts``, ``linkedin_people`` and ``twitter_people``. We read
+    defensively and only keep on-domain emails.
     """
     emails: list[Email] = []
     employees: list[Employee] = []

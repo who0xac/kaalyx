@@ -5,17 +5,17 @@ persisting everything to both SQLite and raw files, and rendering a live rich UI
 source is isolated: a missing tool, a missing API key, a disabled toggle, or a source that
 errors is logged and skipped — it never affects the other sources or the scan.
 
-Design synthesised from BBOT, reNgine and ReconFTW:
+Design principles:
 
-* **BBOT** — fine-grained one-source-per-check structure, typed findings/emails, keyless
-  email harvesting (email-format/skymem), extended DNS security records, the current
-  keyless Azure tenant method (ODC federationprovider), and the "``if not r: return``"
-  graceful-skip discipline.
-* **reNgine** — theHarvester emails/employees/hosts extraction, the email→breach chaining
-  (harvested emails feed the breach lookup), and the categorised Google-dork taxonomy.
-* **ReconFTW** — a per-source enable/disable toggle for every sub-check, passing secrets
-  via environment (not argv) so tokens don't leak into the process list, and tool-present
-  checks with clear skip messages.
+* fine-grained one-source-per-check structure, with typed findings/emails, keyless
+  email harvesting (email-format/skymem), extended DNS security records, a keyless Azure
+  tenant mapping method (ODC federationprovider), and an "``if not r: return``"
+  graceful-skip discipline;
+* theHarvester emails/employees/hosts extraction, email→breach chaining (harvested emails
+  feed the breach lookup), and a categorised Google-dork taxonomy;
+* a per-source enable/disable toggle for every sub-check, passing secrets via environment
+  (not argv) so tokens don't leak into the process list, and tool-present checks with clear
+  skip messages.
 
 Sources:
     external tools (skip if not on PATH):  whois, dnsx, github-subdomains, trufflehog,
@@ -30,8 +30,8 @@ Credential/leak coverage (post-harvest chaining):
       operator configures a local breach compilation / credential-returning API, the ACTUAL
       leaked passwords/hashes (one finding per recovered credential), not just counts.
     * leak search (LeakSearch) — keyless query of the ProxyNova/COMB credential dump for real
-      user:password pairs, keyed on the domain and each harvested email (ReconFTW's approach).
-    * CAA iodef contact emails (BBOT dnscaa) are harvested from mail_dns and feed both.
+      user:password pairs, keyed on the domain and each harvested email.
+    * CAA iodef contact emails are harvested from mail_dns and feed both.
 """
 
 from __future__ import annotations
@@ -128,11 +128,11 @@ class OsintStage(Stage):
             set_console_logging(True)
 
         # Breach lookup runs AFTER harvesting so it can enrich the emails we found
-        # (reNgine's h8mail chaining). It's a post-step, not a concurrent source.
+        # (h8mail chaining). It's a post-step, not a concurrent source.
         if ctx.config.osint.breach_lookup:
             await self._enrich_breaches(results)
 
-        # LeakSearch (ReconFTW) also runs post-harvest so it can query both the domain and each
+        # LeakSearch also runs post-harvest so it can query both the domain and each
         # harvested email against the ProxyNova/COMB credential dump for ACTUAL leaked
         # passwords — value distinct from h8mail's breach membership. Post-step for the same
         # reason: it consumes the harvested emails.
@@ -259,7 +259,7 @@ class OsintStage(Stage):
     # -- breach enrichment (post-harvest chaining) -------------------------------------
 
     async def _enrich_breaches(self, results: list[SourceResult]) -> None:
-        """Enrich harvested emails with breach data via h8mail (reNgine chaining pattern).
+        """Enrich harvested emails with breach data via h8mail (email→breach chaining).
 
         h8mail needs API keys/config to return meaningful data; without it we skip cleanly.
         The harvested emails are the input, so this only runs if we actually found emails
@@ -364,7 +364,7 @@ class OsintStage(Stage):
         return Severity.HIGH if count >= 3 else Severity.MEDIUM
 
     async def _run_leak_search(self, results: list[SourceResult]) -> None:
-        """Query LeakSearch (ReconFTW's credential-dump source) for ACTUAL leaked passwords.
+        """Query LeakSearch (a credential-dump source) for ACTUAL leaked passwords.
 
         LeakSearch searches the ProxyNova/COMB dump (keyless) and returns real user:password
         pairs — value h8mail can't give without a local breach compilation. We key it on the
@@ -695,7 +695,7 @@ class OsintStage(Stage):
     async def _src_exposed_git(self) -> SourceResult:
         """Detect a publicly exposed ``/.git/`` directory (in-process, detect-only).
 
-        Uses BBOT git.py's reliable check (GET /.git/config → 200 + '[core]' + not HTML) via
+        Uses a reliable check (GET /.git/config → 200 + '[core]' + not HTML) via
         `osint_inproc.check_exposed_git`. No download/reconstruction. Probes the apex host and
         its ``www.`` (broader per-host probing across all discovered subdomains belongs to the
         Hosts/Web stages). Keyless — never skips for a missing tool.
@@ -766,7 +766,7 @@ class OsintStage(Stage):
         domain = self.ctx.target.registrable
         records, findings, caa_emails = await osint_inproc.check_mail_dns_security(domain)
         res.osint, res.findings = records, findings
-        # CAA iodef contact emails feed the harvest → breach/leak chain (BBOT dnscaa).
+        # CAA iodef contact emails feed the harvest → breach/leak chain.
         res.emails = caa_emails
 
         # Spoofability verdict (Spoofy logic) layered on the SPF/DMARC records just fetched —
@@ -802,7 +802,7 @@ class OsintStage(Stage):
     async def _src_email_harvest(self) -> SourceResult:
         res = SourceResult(name="email_harvest")
         domain = self.ctx.target.registrable
-        # Merge three keyless email sources (BBOT parity): email-format.com + skymem
+        # Merge three keyless email sources: email-format.com + skymem
         # (harvest_emails), PGP keyservers (pgp), and security.txt Contact: addresses. All
         # filter to on-domain addresses; deduped by address, sources concatenated.
         merged: dict[str, str] = {}

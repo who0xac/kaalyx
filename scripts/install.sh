@@ -34,7 +34,7 @@ info() { printf '\033[1;36m[*]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31m[-]\033[0m %s\n' "$1"; exit 1; }
 
-# ReconFTW-style phase header: "Running: <phase>" in bold cyan.
+# Phase header: "Running: <phase>" in bold cyan.
 phase() { printf '\n%s%sRunning: %s%s\n' "${C_BOLD}" "${C_CYAN}" "$1" "${C_NC}"; }
 
 # --- Per-tool progress counters + category tallies -----------------------------------------
@@ -108,7 +108,7 @@ try() {
 #  Banner + help
 # ============================================================================
 
-# Build/version line, ReconFTW-style: "main-v1.0.0-<short-sha>". The sha is best-effort from
+# Build/version line: "main-v1.0.0-<short-sha>". The sha is best-effort from
 # the repo the script lives in (blank when run outside a checkout).
 build_version() {
     local sha=""

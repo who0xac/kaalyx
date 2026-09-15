@@ -173,8 +173,8 @@ class OsintConfig:
 
     Every OSINT sub-check can be turned off here (or via a matching ``--no-<source>`` CLI
     flag, which takes precedence). Default is all-on; sources with no tool/key installed
-    skip themselves gracefully regardless of these toggles. Mirrors ReconFTW's per-check
-    booleans but centralised in one object.
+    skip themselves gracefully regardless of these toggles. Centralises the per-check
+    booleans in one object.
     """
 
     whois: bool = True

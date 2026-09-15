@@ -1,22 +1,21 @@
 """In-process (keyless) OSINT sources implemented in Python rather than as external tools.
 
 These cover OSINT items from Part 1 that have no single obvious CLI binary and are cleanly
-doable over plain HTTP/DNS without an API key. The set was expanded after studying BBOT,
-reNgine and ReconFTW:
+doable over plain HTTP/DNS without an API key:
 
 * **Email / DNS security posture** — SPF and DMARC (missing/weak policies) plus the wider
-  keyless DNS security records BBOT checks: CAA, BIMI, MTA-STS and TLS-RPT. Resolved via
+  keyless DNS security records: CAA, BIMI, MTA-STS and TLS-RPT. Resolved via
   DNS-over-HTTPS (Cloudflare, then Google) so no local resolver tool is required.
 * **M365 / Azure tenant mapping** — Microsoft's public, unauthenticated endpoints:
   ``getuserrealm`` (managed/federated + brand), the ODC ``federationprovider`` endpoint
-  (tenant id + brand — BBOT's current keyless method), and OpenID metadata (tenant GUID).
+  (tenant id + brand — a keyless method), and OpenID metadata (tenant GUID).
   The old SOAP ``GetFederationInformation`` tenant-domain trick is deliberately NOT used:
   Microsoft patched it on 2025-05-23 (MC1081538) and it no longer returns tenant domains.
-* **Keyless email harvesting** — query email-format.com (BBOT's ``emailformat`` approach)
-  and skymem.info for addresses at the domain. No API key needed.
+* **Keyless email harvesting** — query email-format.com and skymem.info for addresses at
+  the domain. No API key needed.
 * **Categorised Google dork generation** — ready-to-click Google search URLs grouped by
-  purpose (login/admin/config/git/db/docs/cloud), inspired by reNgine's dork taxonomy.
-  No scraping (ToS/CAPTCHA/ban risk); the user reviews these manually.
+  purpose (login/admin/config/git/db/docs/cloud). No scraping (ToS/CAPTCHA/ban risk); the
+  user reviews these manually.
 
 Breach/credential lookup remains key-dependent and is handled by the stage: harvested
 emails are the input, and the lookup is skipped cleanly when no breach API key is present.
@@ -89,7 +88,7 @@ async def check_mail_dns_security(
     """Assess *domain*'s email/DNS security posture (keyless DNS lookups).
 
     Covers SPF and DMARC (the classic anti-spoofing pair) plus the wider keyless DNS
-    security records BBOT checks — CAA (certificate issuance control), BIMI, MTA-STS and
+    security records — CAA (certificate issuance control), BIMI, MTA-STS and
     TLS-RPT. Records are stored for the dashboard; only genuinely weak/missing anti-spoofing
     posture produces findings (we don't cry wolf about optional records like BIMI).
 
@@ -101,7 +100,7 @@ async def check_mail_dns_security(
       * missing CAA (info: any CA may issue certs for the domain).
 
     Returns ``(records, findings, emails)`` — ``emails`` are any ``iodef:mailto:`` contact
-    addresses extracted from CAA records (BBOT dnscaa), for the harvest/breach chain.
+    addresses extracted from CAA records, for the harvest/breach chain.
     """
     records: list[OsintRecord] = []
     findings: list[Finding] = []
@@ -183,7 +182,7 @@ async def check_mail_dns_security(
     if caa_values:
         for v in caa_values:
             records.append(OsintRecord(kind="caa", value=v, source=source))
-            # BBOT dnscaa: a CAA `iodef` violation-reporting destination often exposes an
+            # A CAA `iodef` violation-reporting destination often exposes an
             # internal contact email (or URL). Extract mailto: addresses as harvested emails
             # so they feed the breach/leak lookups — an on-domain address here is real OSINT.
             for m in re.findall(r"mailto:([^\s\"';]+@[^\s\"';]+)", v, re.IGNORECASE):
@@ -214,7 +213,7 @@ async def check_mail_dns_security(
         hit = next((t for t in txt if t.lower().startswith(prefix)), None)
         if hit:
             records.append(OsintRecord(kind=kind, value=hit, source=source))
-            # TLS-RPT (and MTA-STS) records carry rua/mailto reporting addresses (BBOT
+            # TLS-RPT (and MTA-STS) records carry rua/mailto reporting addresses
             # dnstlsrpt) — harvest any so they feed the email → breach/leak chain.
             for m in re.findall(r"mailto:([^\s\"';,!]+@[^\s\"';,!]+)", hit, re.IGNORECASE):
                 addr = m.strip().lower().strip(".")
@@ -236,7 +235,7 @@ async def map_m365_tenant(domain: str) -> tuple[list[OsintRecord], list[Finding]
         for federated domains, the federation brand/auth URL.
       * OpenID configuration (``login.microsoftonline.com/<domain>/.well-known/...``) —
         reveals the tenant GUID when the domain is a Microsoft tenant.
-      * ODC ``federationprovider`` (``odc.officeapps.live.com``) — BBOT's current keyless
+      * ODC ``federationprovider`` (``odc.officeapps.live.com``) — the current keyless
         method; returns the tenant id and federation brand reliably. The old SOAP
         ``GetFederationInformation`` domain-enumeration trick is intentionally not used
         (Microsoft patched it 2025-05-23, MC1081538).
@@ -324,7 +323,7 @@ async def map_m365_tenant(domain: str) -> tuple[list[OsintRecord], list[Finding]
         except (httpx.HTTPError, ValueError) as exc:
             logger.debug("openid-config failed for %s: %s", domain, exc)
 
-        # 3) ODC federationprovider -> tenant id + brand (BBOT's current keyless method).
+        # 3) ODC federationprovider -> tenant id + brand (current keyless method).
         try:
             resp = await client.get(
                 "https://odc.officeapps.live.com/odc/v2.1/federationprovider",
@@ -357,7 +356,7 @@ async def map_m365_tenant(domain: str) -> tuple[list[OsintRecord], list[Finding]
             logger.debug("ODC federationprovider failed for %s: %s", domain, exc)
 
         # 4) Extra tenant domains — other domains registered to the SAME tenant.
-        #    Uses azmap.dev (the current keyless source BBOT's azure_tenant relies on).
+        #    Uses azmap.dev (a current keyless azure-tenant mapping source).
         #    The old SOAP GetFederationInformation domain list was patched (2025-05-23).
         try:
             resp = await client.get(
@@ -444,7 +443,7 @@ def assess_spoofability(spf: str | None, dmarc: str | None) -> tuple[bool, str]:
 async def check_exposed_git(host: str) -> Finding | None:
     """Detect a publicly exposed ``/.git/`` directory on *host* (detect-only, no download).
 
-    Uses BBOT ``git.py``'s reliable confirmation: GET ``/.git/config``, and only report if
+    Reliable confirmation: GET ``/.git/config``, and only report if
     the response is HTTP 200, the body contains the ``[core]`` git-config marker, and the
     body is not HTML (guards against soft-404 pages that return 200 with a page). Reported as
     HIGH/FIRM — an exposed .git typically allows full source-code reconstruction.
@@ -485,7 +484,7 @@ async def check_exposed_git(host: str) -> Finding | None:
 async def harvest_emails(domain: str) -> list[Email]:
     """Keyless email harvesting from email-format.com and skymem.info.
 
-    Mirrors BBOT's ``emailformat`` module (querying email-format.com, decoding Cloudflare
+    Queries email-format.com (decoding Cloudflare
     ``data-cfemail`` obfuscation) plus a skymem.info pass. Both are free/keyless. Any HTTP
     failure is swallowed and simply yields fewer results — never an error.
 
@@ -894,10 +893,10 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
     return ranked[:max_candidates]
 
 
-# --- Additional keyless OSINT harvests (BBOT parity: pgp, securitytxt, social) ------------
+# --- Additional keyless OSINT harvests: pgp, securitytxt, social ------------
 
 # Public PGP keyservers expose a HKP search endpoint that returns UIDs (name <email>) for a
-# domain — BBOT's `pgp` module. Keyless.
+# domain. Keyless.
 _PGP_KEYSERVERS = [
     "https://keys.openpgp.org/pks/lookup",
     "https://pgp.mit.edu/pks/lookup",
@@ -906,7 +905,7 @@ _PGP_KEYSERVERS = [
 
 
 async def harvest_pgp_emails(domain: str) -> list[Email]:
-    """Harvest emails for *domain* from public PGP keyservers (BBOT ``pgp``). Keyless.
+    """Harvest emails for *domain* from public PGP keyservers. Keyless.
 
     Queries each keyserver's HKP ``index`` endpoint for the domain and extracts on-domain
     addresses from the returned key UIDs. Any network failure just yields fewer results.
@@ -932,7 +931,7 @@ async def harvest_pgp_emails(domain: str) -> list[Email]:
 
 
 async def fetch_securitytxt(domain: str) -> tuple[list[Email], list[OsintRecord]]:
-    """Fetch and parse ``security.txt`` (BBOT ``securitytxt``). Keyless, two HTTP GETs.
+    """Fetch and parse ``security.txt``. Keyless, two HTTP GETs.
 
     RFC 9116 puts the file at ``/.well-known/security.txt`` (legacy: ``/security.txt``). We
     extract ``Contact:`` emails (on-domain) and record any Contact/Policy URLs. Returns
@@ -967,7 +966,7 @@ async def fetch_securitytxt(domain: str) -> tuple[list[Email], list[OsintRecord]
     return ([Email(address=a, source=s) for a, s in sorted(emails.items())], records)
 
 
-# Social-profile patterns BBOT's `social` module recognises in page links.
+# Social-profile patterns recognised in page links.
 _SOCIAL_PATTERNS = {
     "github": re.compile(r"https?://(?:www\.)?github\.com/([A-Za-z0-9-]+)/?", re.I),
     "gitlab": re.compile(r"https?://(?:www\.)?gitlab\.com/([A-Za-z0-9._-]+)/?", re.I),
@@ -983,7 +982,7 @@ _SOCIAL_IGNORE = {"share", "sharer", "intent", "home", "login", "signup", "about
 
 
 async def discover_social_profiles(domain: str) -> tuple[list[OsintRecord], list[str]]:
-    """Find the org's social profiles from its homepage (BBOT ``social``). Keyless.
+    """Find the org's social profiles from its homepage. Keyless.
 
     Fetches the apex over https (then http) and extracts social-media profile links from the
     HTML — one lightweight page fetch, NOT a crawl. Returns ``(records, github_handles)``;

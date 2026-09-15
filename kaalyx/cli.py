@@ -57,7 +57,7 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-# Kaalyx --help, laid out ReconFTW-style: a Usage line, flags grouped into labelled sections,
+# Kaalyx --help: a Usage line, flags grouped into labelled sections,
 # then a USAGE EXAMPLES block. Colours follow Kaalyx's palette — section headers bold cyan,
 # flag names bold yellow, descriptions dim, example commands bold vs. their dim comments.
 _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
@@ -114,7 +114,7 @@ _HELP_EXAMPLES: list[tuple[str, str]] = [
 
 
 def _render_help() -> None:
-    """Render the ReconFTW-style grouped help (banner is printed separately by run())."""
+    """Render the grouped help (banner is printed separately by run())."""
     console.print(
         "[bold]Usage:[/] [bold white]kaalyx[/] "
         "[bright_cyan]scan[/] [bold yellow]<domain>[/] [dim][OPTIONS][/]   "
@@ -133,7 +133,7 @@ def _render_help() -> None:
 
 
 def _show_help(ctx: typer.Context) -> None:
-    """Print the custom ReconFTW-style help, then exit. Banner is printed by ``run()``."""
+    """Print the custom grouped help, then exit. Banner is printed by ``run()``."""
     _render_help()
     raise typer.Exit()
 
@@ -991,7 +991,7 @@ def run() -> None:
     root_help = not argv or all(a in ("-h", "--help") for a in argv)
     if root_help:
         # Root help (bare `kaalyx`, `kaalyx -h`, `kaalyx --help`): banner + our custom
-        # ReconFTW-style grouped help, then exit — bypassing Typer's default box help so the
+        # custom grouped help, then exit — bypassing Typer's default box help so the
         # two never both print. Subcommand help (e.g. `kaalyx scan --help`) still goes to Typer.
         from .ui import print_main_banner
 

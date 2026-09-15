@@ -57,9 +57,84 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+# Kaalyx --help, laid out ReconFTW-style: a Usage line, flags grouped into labelled sections,
+# then a USAGE EXAMPLES block. Colours follow Kaalyx's palette — section headers bold cyan,
+# flag names bold yellow, descriptions dim, example commands bold vs. their dim comments.
+_HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("TARGET OPTIONS", [
+        ("-t, --target <domain>", "Single domain to scan (apex or subdomain)."),
+        ("-l, --target-list <file>", "File of domains, one per line; scanned in sequence."),
+        ("    <domain>", "Positional shortcut for -t (one target)."),
+    ]),
+    ("SCAN MODE OPTIONS", [
+        ("-o, --osint-only", "Run OSINT only (standalone)."),
+        ("-f, --full", "Subdomains → Hosts → Web → Vuln (the default chain)."),
+        ("-n, --no-vuln", "Full chain but stop before Vuln."),
+        ("-a, --all", "Everything: OSINT + the full chain."),
+    ]),
+    ("OSINT SELECTION", [
+        ("-O, --only-osint a,b,c", "Run ONLY these OSINT sources."),
+        ("-K, --skip-osint a,b,c", "Skip these OSINT sources (see 'kaalyx osint-sources')."),
+    ]),
+    ("SCAN TWEAKS", [
+        ("-S, --as-subdomain", "Force-treat the target as a subdomain (skip sub-enum)."),
+        ("-A, --as-apex", "Force-treat the target as an apex domain."),
+        ("-M, --full-nmap", "Deep nmap -p- -A -O scan (auto-skips CDN IPs)."),
+        ("-N, --notify", "Send Telegram alerts (needs config.env credentials)."),
+        ("-d, --dashboard", "Launch the local web dashboard after the scan."),
+        ("-r, --report", "Generate a consolidated final report file."),
+    ]),
+    ("GENERAL OPTIONS", [
+        ("-c, --config <file>", "Path to a config.yaml (default: ./config.yaml)."),
+        ("-vv, --verbose", "Debug-level logging to console + file."),
+        ("-R, --resume", "Resume this target's last scan from its checkpoint."),
+        ("-h, --help", "Show this help and exit."),
+        ("-v, --version", "Show version and exit."),
+        ("-u, --update", "Update Kaalyx from GitHub (add -vv for detail)."),
+    ]),
+    ("COMMANDS", [
+        ("scan <domain>", "Run a recon scan against a target."),
+        ("resume <domain>", "Resume an interrupted scan from its checkpoint."),
+        ("tools", "Check (--check) or install (--install) external tools."),
+        ("config --path", "Show where config.yaml and config.env live."),
+        ("web", "Launch the local web dashboard."),
+        ("update", "Update Kaalyx to the latest version."),
+    ]),
+]
+
+# (command, explanatory comment) example pairs for the USAGE EXAMPLES block.
+_HELP_EXAMPLES: list[tuple[str, str]] = [
+    ("kaalyx scan example.com", "full default chain against one target"),
+    ("kaalyx scan example.com --osint-only", "OSINT only, nothing else"),
+    ("kaalyx scan example.com --all", "OSINT + Subdomains → Hosts → Web → Vuln"),
+    ("kaalyx scan example.com --only-osint whois,dns,mail_dns,m365", "a subset of OSINT sources"),
+    ("kaalyx scan -l targets.txt --no-vuln", "many targets, stop before the Vuln stage"),
+    ("kaalyx tools --check", "see which external tools are installed vs. missing"),
+]
+
+
+def _render_help() -> None:
+    """Render the ReconFTW-style grouped help (banner is printed separately by run())."""
+    console.print(
+        "[bold]Usage:[/] [bold white]kaalyx[/] "
+        "[bright_cyan]scan[/] [bold yellow]<domain>[/] [dim][OPTIONS][/]   "
+        "[dim](or: kaalyx <command> [OPTIONS])[/]\n"
+    )
+    for header, rows in _HELP_SECTIONS:
+        console.print(f"[bold bright_cyan]{header}[/]")
+        width = max(len(flag) for flag, _ in rows)
+        for flag, desc in rows:
+            console.print(f"  [bold yellow]{flag:<{width}}[/]  [dim]{desc}[/]")
+        console.print()
+    console.print("[bold bright_cyan]USAGE EXAMPLES[/]")
+    for cmd, comment in _HELP_EXAMPLES:
+        console.print(f"  [bold white]{cmd}[/]")
+        console.print(f"      [dim]# {comment}[/]")
+
+
 def _show_help(ctx: typer.Context) -> None:
-    """Print the standard help, then exit. The banner + quick-start are printed by ``run()``."""
-    console.print(ctx.get_help())
+    """Print the custom ReconFTW-style help, then exit. Banner is printed by ``run()``."""
+    _render_help()
     raise typer.Exit()
 
 
@@ -913,13 +988,17 @@ def run() -> None:
     import sys
 
     argv = sys.argv[1:]
-    root_help = not argv or (
-        all(a in ("-h", "--help") for a in argv) and len(argv) >= 1
-    )
+    root_help = not argv or all(a in ("-h", "--help") for a in argv)
     if root_help:
+        # Root help (bare `kaalyx`, `kaalyx -h`, `kaalyx --help`): banner + our custom
+        # ReconFTW-style grouped help, then exit — bypassing Typer's default box help so the
+        # two never both print. Subcommand help (e.g. `kaalyx scan --help`) still goes to Typer.
         from .ui import print_main_banner
 
         print_main_banner()
+        console.print()
+        _render_help()
+        return
     app()
 
 

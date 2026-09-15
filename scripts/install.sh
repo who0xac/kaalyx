@@ -23,10 +23,76 @@ export GOPATH="${HOME}/go"
 export GOBIN="${GOBIN_DIR}"
 export PATH="${BIN_DIR}:${GOBIN_DIR}:${CARGO_BIN}:${PATH}"
 
+# --- Colors (single source of truth; consistent with Kaalyx's rich palette) ---------------
+#   art=red  tagline=yellow  author=dim   phase headers=bold cyan
+#   success=green  skipped=yellow  failed=red   Finished!=bold green
+C_RED=$'\033[0;31m';  C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+C_CYAN=$'\033[0;36m'; C_DIM=$'\033[2m';       C_BOLD=$'\033[1m'; C_NC=$'\033[0m'
+
 log()  { printf '\n\033[1;32m[+]\033[0m %s\n' "$1"; }
 info() { printf '\033[1;36m[*]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31m[-]\033[0m %s\n' "$1"; exit 1; }
+
+# ReconFTW-style phase header: "Running: <phase>" in bold cyan.
+phase() { printf '\n%s%sRunning: %s%s\n' "${C_BOLD}" "${C_CYAN}" "$1" "${C_NC}"; }
+
+# --- Per-tool progress counters + category tallies -----------------------------------------
+# Each install phase resets the counter, sets a total, then calls tool_step for every tool.
+# Results roll up into per-category OK/skipped/failed tallies printed in the final summary.
+_STEP_i=0          # current index within the active category
+_STEP_total=0      # total tools in the active category (shown as [i/total])
+declare -A _CAT_OK _CAT_SKIP _CAT_FAIL _CAT_TOTAL
+
+begin_category() {  # begin_category <label> <total>
+    _CAT_LABEL="$1"; _STEP_total="$2"; _STEP_i=0
+    _CAT_OK["$1"]=0; _CAT_SKIP["$1"]=0; _CAT_FAIL["$1"]=0; _CAT_TOTAL["$1"]="$2"
+}
+
+# tool_step <name> <ok|skipped|failed> — print "[i/total] name <status>" in the right color.
+tool_step() {
+    local name="$1" status="$2"
+    _STEP_i=$((_STEP_i + 1))
+    case "${status}" in
+        ok)      _CAT_OK["${_CAT_LABEL}"]=$(( ${_CAT_OK["${_CAT_LABEL}"]} + 1 ))
+                 printf '  [%d/%d] %s %sinstalled%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_GREEN}" "${C_NC}" ;;
+        skipped) _CAT_SKIP["${_CAT_LABEL}"]=$(( ${_CAT_SKIP["${_CAT_LABEL}"]} + 1 ))
+                 printf '  [%d/%d] %s %sskipped%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_YELLOW}" "${C_NC}" ;;
+        *)       _CAT_FAIL["${_CAT_LABEL}"]=$(( ${_CAT_FAIL["${_CAT_LABEL}"]} + 1 ))
+                 printf '  [%d/%d] %s %sfailed%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_RED}" "${C_NC}" ;;
+    esac
+}
+
+# run_tool <name> <command...> — run an install command, classify the outcome, count it.
+# "skipped" = the tool is already present (nothing to do); "ok" = command succeeded;
+# "failed" = command returned non-zero. Never aborts the run (mirrors `try`).
+run_tool() {
+    local name="$1"; shift
+    if command -v "${name}" >/dev/null 2>&1; then
+        tool_step "${name}" skipped
+        return 0
+    fi
+    if "$@" >/dev/null 2>&1 && command -v "${name}" >/dev/null 2>&1; then
+        tool_step "${name}" ok
+    else
+        tool_step "${name}" failed
+    fi
+}
+
+# Network connectivity precheck — one clear "Network OK" / failure line before any install.
+network_precheck() {
+    phase "Network precheck"
+    local host
+    for host in github.com raw.githubusercontent.com; do
+        if curl -fsS --max-time 8 -o /dev/null "https://${host}" 2>/dev/null; then
+            printf '  %sNetwork OK%s (reached %s)\n' "${C_GREEN}" "${C_NC}" "${host}"
+            return 0
+        fi
+    done
+    printf '  %sNetwork unreachable%s — could not reach github.com. Check your connection/proxy and retry.\n' \
+        "${C_RED}" "${C_NC}"
+    return 1
+}
 
 # Runs one independent install step without letting its failure abort the
 # rest of the script. Each tool below is unrelated to the others, so a
@@ -42,20 +108,32 @@ try() {
 #  Banner + help
 # ============================================================================
 
-print_banner() {
-    cat <<'BANNER'
+# Build/version line, ReconFTW-style: "main-v1.0.0-<short-sha>". The sha is best-effort from
+# the repo the script lives in (blank when run outside a checkout).
+build_version() {
+    local sha=""
+    sha="$(git -C "$(dirname "${BASH_SOURCE[0]:-$0}")/.." rev-parse --short HEAD 2>/dev/null || true)"
+    if [[ -n "${sha}" ]]; then
+        printf 'main-v1.0.0-%s' "${sha}"
+    else
+        printf 'main-v1.0.0'
+    fi
+}
 
+print_banner() {
+    # Art in red, tagline in yellow, author dim — same palette as the main Kaalyx banner.
+    printf '%s\n' "${C_RED}"
+    cat <<'ART'
  _  __           _
 | |/ /__ _  __ _| |_   ___  __
 | ' // _` |/ _` | | | | \ \/ /
 | . \ (_| | (_| | | |_| |>  <
 |_|\_\__,_|\__,_|_|\__, /_/\_\
                     |___/
-
-    ─────────────────────────────────────────────────
-    v1.0.0  |  Automated Recon & Vulnerability Engine
-    Author: who0xac
-BANNER
+ART
+    printf '%s' "${C_NC}"
+    printf '    %s%s%s\n' "${C_YELLOW}" "Automated Recon & Vulnerability Engine" "${C_NC}"
+    printf '    %s%s  ·  Author: who0xac%s\n' "${C_DIM}" "$(build_version)" "${C_NC}"
 }
 
 print_help() {
@@ -229,7 +307,16 @@ fi
 
 print_banner
 
+phase "Install/Update"
+printf '  phases: %s%s%s\n' "${C_CYAN}" "${PHASES[*]}" "${C_NC}"
+
 trap 'fail "Installation failed around line ${LINENO}."' ERR
+
+# Network connectivity precheck before touching anything — a clear early failure beats a
+# confusing mid-install one.
+if ! network_precheck; then
+    fail "No network connectivity — aborting before installing anything."
+fi
 
 if [[ "${EUID}" -eq 0 ]]; then
     SUDO=""
@@ -606,25 +693,24 @@ install_chromium() {
 # ============================================================================
 
 install_phase_subdomains() {
-    log "=== Installing Part 2 — Subdomain tools ==="
+    phase "Installing Part 2 — Subdomain tools (15)"
+    begin_category "Subdomain tools" 15
 
-    try install_massdns
-
-    go_install subfinder          github.com/projectdiscovery/subfinder/v2/cmd/subfinder
-    go_install assetfinder        github.com/tomnomnom/assetfinder
-    go_install chaos              github.com/projectdiscovery/chaos-client/cmd/chaos
-    go_install dnsx               github.com/projectdiscovery/dnsx/cmd/dnsx
-    go_install puredns            github.com/d3mondev/puredns/v2
-    go_install alterx             github.com/projectdiscovery/alterx/cmd/alterx
-    go_install github-subdomains  github.com/gwen001/github-subdomains
-
-    try install_findomain
-    try install_sublist3r
-    try install_crtsh
-    try install_shodan
-    try install_subdominator
-    try install_censys
-    try install_dnsreaper
+    run_tool massdns          install_massdns
+    run_tool subfinder        go_install subfinder         github.com/projectdiscovery/subfinder/v2/cmd/subfinder
+    run_tool assetfinder      go_install assetfinder       github.com/tomnomnom/assetfinder
+    run_tool chaos            go_install chaos             github.com/projectdiscovery/chaos-client/cmd/chaos
+    run_tool dnsx             go_install dnsx              github.com/projectdiscovery/dnsx/cmd/dnsx
+    run_tool puredns          go_install puredns           github.com/d3mondev/puredns/v2
+    run_tool alterx           go_install alterx            github.com/projectdiscovery/alterx/cmd/alterx
+    run_tool github-subdomains go_install github-subdomains github.com/gwen001/github-subdomains
+    run_tool findomain        install_findomain
+    run_tool sublist3r        install_sublist3r
+    run_tool crtsh            install_crtsh
+    run_tool shodan           install_shodan
+    run_tool subdominator     install_subdominator
+    run_tool censys           install_censys
+    run_tool dnsreaper        install_dnsreaper
 }
 
 install_findomain() {
@@ -778,27 +864,24 @@ EOF
 # ============================================================================
 
 install_phase_osint() {
-    log "=== Installing Part 1 — OSINT tools ==="
+    phase "Installing Part 1 — OSINT tools (14)"
+    begin_category "OSINT tools" 14
 
     # whois + dnsutils come from system packages; dnsx/github-subdomains are Go tools.
-    go_install dnsx               github.com/projectdiscovery/dnsx/cmd/dnsx
-    go_install github-subdomains  github.com/gwen001/github-subdomains
-    go_install misconfig-mapper   github.com/intigriti/misconfig-mapper/cmd/misconfig-mapper
-
-    try install_trufflehog
-    try install_cloud_enum
-    go_install s3scanner          github.com/sa7mon/s3scanner
-    try install_badsecrets
-    try install_retirejs
-    try install_theharvester
-    try install_h8mail
-    try install_leaksearch
-    try install_porch_pirate
-    try install_swaggerspy
-    try install_gato
-    try install_git_dumper
-    try install_msftrecon
-    try install_spoofy
+    run_tool dnsx              go_install dnsx              github.com/projectdiscovery/dnsx/cmd/dnsx
+    run_tool github-subdomains go_install github-subdomains github.com/gwen001/github-subdomains
+    run_tool misconfig-mapper  go_install misconfig-mapper  github.com/intigriti/misconfig-mapper/cmd/misconfig-mapper
+    run_tool trufflehog        install_trufflehog
+    run_tool cloud_enum        install_cloud_enum
+    run_tool s3scanner         go_install s3scanner         github.com/sa7mon/s3scanner
+    run_tool badsecrets        install_badsecrets
+    run_tool retire            install_retirejs
+    run_tool theHarvester      install_theharvester
+    run_tool h8mail            install_h8mail
+    run_tool LeakSearch        install_leaksearch
+    run_tool porch-pirate      install_porch_pirate
+    run_tool swaggerspy        install_swaggerspy
+    run_tool gato              install_gato
 }
 
 install_trufflehog() {
@@ -941,11 +1024,12 @@ install_spoofy() {
 # ============================================================================
 
 install_phase_hosts() {
-    log "=== Installing Part 3 — Host tools ==="
+    phase "Installing Part 3 — Host tools (3)"
+    begin_category "Host tools" 3
     # nmap comes from system packages.
-    go_install naabu   github.com/projectdiscovery/naabu/v2/cmd/naabu
-    go_install httpx   github.com/projectdiscovery/httpx/cmd/httpx
-    try install_wafw00f
+    run_tool naabu   go_install naabu github.com/projectdiscovery/naabu/v2/cmd/naabu
+    run_tool httpx   go_install httpx github.com/projectdiscovery/httpx/cmd/httpx
+    run_tool wafw00f install_wafw00f
 }
 
 install_wafw00f() { pipx_install wafw00f wafw00f; }
@@ -955,21 +1039,21 @@ install_wafw00f() { pipx_install wafw00f wafw00f; }
 # ============================================================================
 
 install_phase_web() {
-    log "=== Installing Part 4 — Web analysis tools ==="
+    phase "Installing Part 4 — Web analysis tools (9)"
+    begin_category "Web tools" 9
 
-    try install_chromium   # gowitness screenshots
+    try install_chromium   # gowitness screenshots (not a counted tool)
 
-    go_install gowitness    github.com/sensepost/gowitness
-    go_install gau          github.com/lc/gau/v2/cmd/gau
-    go_install waybackurls  github.com/tomnomnom/waybackurls
-    go_install katana       github.com/projectdiscovery/katana/cmd/katana
-    go_install gospider     github.com/jaeles-project/gospider
-    go_install gf           github.com/tomnomnom/gf
-
-    try install_uro
-    try install_secretfinder
-    try install_trufflehog     # also used in web JS/secret analysis
-    try install_gf_patterns
+    run_tool gowitness    go_install gowitness   github.com/sensepost/gowitness
+    run_tool gau          go_install gau         github.com/lc/gau/v2/cmd/gau
+    run_tool waybackurls  go_install waybackurls github.com/tomnomnom/waybackurls
+    run_tool katana       go_install katana      github.com/projectdiscovery/katana/cmd/katana
+    run_tool gospider     go_install gospider    github.com/jaeles-project/gospider
+    run_tool gf           go_install gf          github.com/tomnomnom/gf
+    run_tool uro          install_uro
+    run_tool secretfinder install_secretfinder
+    run_tool trufflehog   install_trufflehog     # also used in web JS/secret analysis
+    try install_gf_patterns   # gf pattern set (a ~/.gf dir, not a PATH binary — not counted)
 }
 
 install_uro() { pipx_install uro uro; }
@@ -1005,18 +1089,18 @@ install_gf_patterns() {
 # ============================================================================
 
 install_phase_vuln() {
-    log "=== Installing Part 5 — Vulnerability tools ==="
+    phase "Installing Part 5 — Vulnerability tools (8)"
+    begin_category "Vulnerability tools" 8
 
-    go_install kxss               github.com/Emoe/kxss
-    go_install dalfox             github.com/hahwul/dalfox/v2
-    go_install nuclei             github.com/projectdiscovery/nuclei/v3/cmd/nuclei
-    go_install interactsh-client  github.com/projectdiscovery/interactsh/cmd/interactsh-client
-
-    try install_sqlmap
-    try install_sstimap
-    try install_corsy
-    try install_oralyzer
-    try update_nuclei_templates
+    run_tool kxss              go_install kxss              github.com/Emoe/kxss
+    run_tool dalfox            go_install dalfox            github.com/hahwul/dalfox/v2
+    run_tool nuclei            go_install nuclei            github.com/projectdiscovery/nuclei/v3/cmd/nuclei
+    run_tool interactsh-client go_install interactsh-client github.com/projectdiscovery/interactsh/cmd/interactsh-client
+    run_tool sqlmap           install_sqlmap
+    run_tool sstimap          install_sstimap
+    run_tool corsy            install_corsy
+    run_tool oralyzer         install_oralyzer
+    try update_nuclei_templates   # refreshes nuclei's template DB (not a counted tool)
 }
 
 install_sqlmap() {
@@ -1188,57 +1272,52 @@ fi
 export PATH="${HOME}/.local/bin:/usr/local/go/bin:${GOBIN_DIR}:${CARGO_BIN}:${BIN_DIR}:${PATH}"
 
 # ============================================================================
-#  Final verification report (only the selected phases' tools)
+#  Tool Installation Summary — per-category OK / skipped / failed counts
 # ============================================================================
 
-declare -a VERIFY_TOOLS
-collect_selected_tools VERIFY_TOOLS
+print_summary() {
+    printf '\n%s%s--- Tool Installation Summary ---%s\n' "${C_BOLD}" "${C_CYAN}" "${C_NC}"
+    local cat
+    for cat in "OSINT tools" "Subdomain tools" "Host tools" "Web tools" "Vulnerability tools"; do
+        [[ -n "${_CAT_TOTAL[${cat}]:-}" ]] || continue   # only categories that actually ran
+        printf '  %-20s %s%d OK%s, %s%d skipped%s, %s%d failed%s (of %d)\n' \
+            "${cat}:" \
+            "${C_GREEN}"  "${_CAT_OK[${cat}]:-0}"   "${C_NC}" \
+            "${C_YELLOW}" "${_CAT_SKIP[${cat}]:-0}" "${C_NC}" \
+            "${C_RED}"    "${_CAT_FAIL[${cat}]:-0}" "${C_NC}" \
+            "${_CAT_TOTAL[${cat}]:-0}"
+    done
+}
 
-echo
-echo "============================================================"
-echo "                 INSTALLATION CHECK"
-echo "     phases: ${PHASES[*]}"
-echo "============================================================"
+print_apikey_reminder() {
+    printf '\n%s%sRemember to set your API keys%s in %s~/.config/kaalyx/config.env%s:\n' \
+        "${C_BOLD}" "${C_CYAN}" "${C_NC}" "${C_BOLD}" "${C_NC}"
+    printf '  %sGITHUB_TOKEN%s      github-subdomains, trufflehog, GitHub Actions audit, org discovery\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sSHODAN_API_KEY%s    Shodan subdomain / host search\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sCENSYS_API_ID%s     Censys subdomain search (+ CENSYS_API_SECRET)\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sCHAOS_API_KEY%s     ProjectDiscovery Chaos dataset\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sIPINFO_TOKEN%s      IP geolocation / ASN (host stage)\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sTELEGRAM_BOT_TOKEN%s  scan alerts (+ TELEGRAM_CHAT_ID)\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sH8MAIL_CONFIG / BREACH_COMP_PATH / LOCAL_BREACH_PATH%s  optional: h8mail leaked-credential recovery\n' "${C_DIM}" "${C_NC}"
+    printf '  %sMissing keys simply disable their source — Kaalyx never crashes for an absent key.%s\n' "${C_DIM}" "${C_NC}"
+}
 
-for tool in "${VERIFY_TOOLS[@]}"; do
-    if command -v "${tool}" >/dev/null 2>&1; then
-        printf '\033[1;32m[OK]\033[0m      %-18s %s\n' "${tool}" "$(command -v "${tool}")"
-    else
-        printf '\033[1;31m[MISSING]\033[0m %-18s\n' "${tool}"
-    fi
-done
-
-echo "============================================================"
+print_summary
+print_apikey_reminder
 
 cat <<EOF
 
-Done.
+Install paths:  src=${SRC_DIR}  go=${GOBIN_DIR}  cargo=${CARGO_BIN}  bin=${BIN_DIR}
 
-Source checkouts:   ${SRC_DIR}
-Go binaries:        ${GOBIN_DIR}
-Cargo binaries:     ${CARGO_BIN}
-Custom binary path: ${BIN_DIR}
-Shell config:       ${HOME}/.bashrc  ${HOME}/.zshrc
-
-Install Kaalyx itself (from the project root):
-    pipx install .
-    kaalyx scan example.com
-
-Recommended: start a new shell so PATH changes take effect:
-    exec zsh      # or: exec bash
-
+Install Kaalyx itself (from the project root):  pipx install .   then:  kaalyx scan example.com
+Start a new shell so PATH changes take effect:  exec zsh   (or: exec bash)
+Use the installed tools only against systems you own or are authorised to assess.
 EOF
 
 if [[ "${EUID}" -ne 0 ]]; then
-    cat <<EOF
-Docker group membership may require logging out and back in. Until then,
-dnsreaper keeps using sudo internally (see its wrapper), so it works either way.
-
-EOF
+    printf '%sDocker group change may need a re-login; dnsreaper falls back to sudo until then.%s\n' \
+        "${C_DIM}" "${C_NC}"
 fi
 
-cat <<EOF
-Use the installed tools only against systems you own or have explicit
-permission to assess.
-
-EOF
+printf '\n%s%sFinished!%s\n' "${C_BOLD}" "${C_GREEN}" "${C_NC}"
+printf '%s────────────────────────────────────────────────────────────%s\n' "${C_GREEN}" "${C_NC}"

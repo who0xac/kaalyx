@@ -99,6 +99,7 @@ _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("config --path", "Show where config.yaml and config.env live."),
         ("web", "Launch the local web dashboard."),
         ("update", "Update Kaalyx to the latest version."),
+        ("changelog", "Show recent Kaalyx changes."),
     ]),
 ]
 
@@ -837,6 +838,54 @@ def _run_while_advancing(progress, task, fn, start_pct: int, ceiling_pct: int):
     return result.get("value")
 
 
+# Conventional-commit prefix -> (nuclei-style tag, rich style). A message with no known
+# prefix becomes an [INF] line with the raw text.
+_COMMIT_TAGS: dict[str, tuple[str, str]] = {
+    "fix":      ("FIX", "yellow"),
+    "feat":     ("NEW", "green"),
+    "chore":    ("CHG", "dim cyan"),
+    "refactor": ("CHG", "dim cyan"),
+    "docs":     ("CHG", "dim cyan"),
+}
+_TAG_STYLE = {"INF": "cyan", "FIX": "yellow", "NEW": "green", "CHG": "dim cyan"}
+
+
+def _tag_for_commit(subject: str) -> tuple[str, str, str]:
+    """Map a commit subject to ``(tag, style, cleaned_message)``.
+
+    ``fix:`` → FIX, ``feat:`` → NEW, ``chore:``/``refactor:``/``docs:`` → CHG (prefix stripped);
+    anything unprefixed → INF with the raw message.
+    """
+    head, sep, rest = subject.partition(":")
+    key = head.strip().lower()
+    # Drop a conventional-commit scope like "feat(cli)" -> "feat".
+    key = key.split("(", 1)[0]
+    if sep and key in _COMMIT_TAGS:
+        tag, style = _COMMIT_TAGS[key]
+        return tag, style, rest.strip()
+    return "INF", _TAG_STYLE["INF"], subject.strip()
+
+
+def _render_update_changelog(old_ref: str, new_ref: str, commits: list[tuple[str, str]]) -> None:
+    """Print the nuclei-style bracketed-tag update summary (no borders, left-aligned tags)."""
+    n = len(commits)
+    plural = "commit" if n == 1 else "commits"
+    count = f" ({n} {plural})" if n else ""
+    console.print(
+        f"[cyan]\\[INF][/] kaalyx updated [bold]{old_ref}[/] → [bold]{new_ref}[/]{count}"
+    )
+    if commits:
+        console.print()
+        for _sha, subject in commits:
+            tag, style, msg = _tag_for_commit(subject)
+            console.print(f"[{style}]\\[{tag}][/] {msg}")
+    console.print()
+    console.print(
+        "[cyan]\\[INF][/] run [bold]kaalyx changelog[/] anytime · "
+        "full history: [dim]github.com/who0xac/kaalyx/commits/main[/]"
+    )
+
+
 def _do_update(verbose: bool = False) -> None:
     """Check GitHub for a newer Kaalyx and, if found, reinstall via pipx.
 
@@ -954,16 +1003,12 @@ def _do_update(verbose: bool = False) -> None:
     # on-disk commit; fall back to the remote full SHA if metadata was unreadable.
     updater.write_installed_commit(installed_now or remote_full)
 
-    if new_version != current:
-        # Version string actually changed — the clearest signal of a real update.
-        console.print(f"[green]✔ Updated:[/] v{current} → v{new_version} ({remote_sha})")
-    elif local_sha and local_sha != remote_sha:
-        # Same version string but the code moved to a newer commit.
-        console.print(f"[green]✔ Updated:[/] {local_sha} → {remote_sha} (v{new_version})")
-    else:
-        # We could not prove the prior commit (first self-update on a pipx install); we did
-        # reinstall the latest. State is now recorded, so subsequent runs report accurately.
-        console.print(f"[green]✔ Updated to the latest version[/] (v{new_version}, {remote_sha})")
+    # Nuclei-style bracketed-tag changelog, matching the visual language of the tools Kaalyx
+    # drives. Headline + one tagged line per commit, no borders.
+    old_ref = local_sha or f"v{current}"
+    new_ref = remote_sha
+    commits = updater.commits_between(local_sha, remote_full)
+    _render_update_changelog(old_ref, new_ref, commits)
 
 
 @app.command(context_settings=_HELP_CTX, short_help="Update Kaalyx to the latest version.")
@@ -976,6 +1021,31 @@ def update(
     """Update Kaalyx to the latest version from GitHub (reinstalls via pipx)."""
     setup_logging()
     _do_update(verbose=verbose)
+
+
+@app.command(context_settings=_HELP_CTX, short_help="Show recent Kaalyx changes.")
+def changelog(
+    limit: int = typer.Option(20, "--limit", "-n", help="How many recent commits to show."),
+) -> None:
+    """Show recent Kaalyx changes as nuclei-style tagged lines (newest first)."""
+    setup_logging()
+    from .core import updater
+
+    commits = updater.recent_commits(limit=limit)
+    if not commits:
+        console.print(
+            "[yellow]\\[INF][/] couldn't fetch the changelog — "
+            "see [dim]github.com/who0xac/kaalyx/commits/main[/]"
+        )
+        raise typer.Exit(code=1)
+    for _sha, subject in commits:
+        tag, style, msg = _tag_for_commit(subject)
+        console.print(f"[{style}]\\[{tag}][/] {msg}")
+    console.print()
+    console.print(
+        "[cyan]\\[INF][/] full history: "
+        "[dim]github.com/who0xac/kaalyx/commits/main[/]"
+    )
 
 
 def run() -> None:

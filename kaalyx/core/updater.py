@@ -108,6 +108,86 @@ def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str, str] | None:
         return None
 
 
+def commits_between(base: str | None, head: str, timeout: float = 15.0) -> list[tuple[str, str]]:
+    """Return ``[(short_sha, subject), …]`` for the commits from *base* (exclusive) to *head*.
+
+    Uses GitHub's compare API (``/compare/{base}...{head}``), newest first. The *subject* is
+    each commit message's first line, verbatim (prefix stripping is a display concern left to
+    the caller). Returns an empty list on any failure or when *base* is unknown — the caller
+    then just shows the headline without a per-commit changelog.
+    """
+    if not base or base == head:
+        return []
+    url = f"https://api.github.com/repos/{REPO}/compare/{base}...{head}"
+    try:
+        resp = httpx.get(
+            url,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "kaalyx-updater"},
+            timeout=timeout, follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            logger.debug("compare API returned HTTP %s", resp.status_code)
+            return []
+        commits = resp.json().get("commits") or []
+        out: list[tuple[str, str]] = []
+        for c in commits:
+            sha = str(c.get("sha", ""))[:7]
+            msg = str((c.get("commit") or {}).get("message", "")).strip()
+            subject = msg.splitlines()[0] if msg else ""
+            if sha and subject:
+                out.append((sha, subject))
+        out.reverse()  # compare returns oldest-first; show newest-first
+        return out
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("Could not fetch commit list %s: %s", url, exc)
+        return []
+
+
+def recent_commits(limit: int = 20, timeout: float = 15.0) -> list[tuple[str, str]]:
+    """Return ``[(short_sha, subject), …]`` for the most recent commits, newest first.
+
+    Prefers a local git checkout (``git log``); falls back to GitHub's commits API for a
+    pipx install with no ``.git``. Empty list on total failure.
+    """
+    repo_dir = Path(__file__).resolve().parent.parent.parent
+    if (repo_dir / ".git").exists():
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo_dir), "log", f"-{max(1, limit)}",
+                 "--format=%h%x09%s"],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            rows = [
+                (line.split("\t", 1)[0], line.split("\t", 1)[1])
+                for line in out.stdout.splitlines() if "\t" in line
+            ]
+            if rows:
+                return rows
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # pipx-install fallback: GitHub commits API.
+    try:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{REPO}/commits",
+            params={"sha": BRANCH, "per_page": max(1, min(limit, 100))},
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "kaalyx-updater"},
+            timeout=timeout, follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return []
+        out2: list[tuple[str, str]] = []
+        for c in resp.json() or []:
+            sha = str(c.get("sha", ""))[:7]
+            msg = str((c.get("commit") or {}).get("message", "")).strip()
+            subject = msg.splitlines()[0] if msg else ""
+            if sha and subject:
+                out2.append((sha, subject))
+        return out2
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("Could not fetch recent commits: %s", exc)
+        return []
+
+
 def pipx_available() -> bool:
     return shutil.which("pipx") is not None
 

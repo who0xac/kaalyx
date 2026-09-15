@@ -290,7 +290,7 @@ def _scan_one(
         # The selected mode's stages aren't built yet (e.g. explicit --full today). Point
         # the user at what actually works instead of leaving them stuck.
         console.print(
-            "[yellow]Only the OSINT phase is currently implemented.[/] Run:\n"
+            "[yellow]Only the OSINT stage is currently implemented.[/] Run:\n"
             f"  [bold cyan]kaalyx scan {target.domain} --osint-only[/]"
         )
         return
@@ -558,7 +558,7 @@ def scan(
     if not selected_modes:
         console.print(
             "[dim]No scan mode given — running [cyan]--osint-only[/] "
-            "(the only phase implemented so far). Use --full/--all once more phases land.[/]"
+            "(the only stage implemented so far). Use --full/--all once more stages land.[/]"
         )
 
     # Resolve the target source.
@@ -669,18 +669,18 @@ def tools(
         False, "--check-only",
         help="Report status only and exit (explicit alias for the default).",
     ),
-    osint: bool = typer.Option(False, "--osint", help="With --install: OSINT-phase tools only."),
-    subdomains: bool = typer.Option(False, "--subdomains", help="With --install: Subdomains-phase tools only."),
-    hosts: bool = typer.Option(False, "--hosts", help="With --install: Hosts-phase tools only."),
-    web_phase: bool = typer.Option(False, "--web", help="With --install: Web-phase tools only."),
-    vuln: bool = typer.Option(False, "--vuln", help="With --install: Vuln-phase tools only."),
+    osint: bool = typer.Option(False, "--osint", help="With --install: OSINT-stage tools only."),
+    subdomains: bool = typer.Option(False, "--subdomains", help="With --install: Subdomains-stage tools only."),
+    hosts: bool = typer.Option(False, "--hosts", help="With --install: Hosts-stage tools only."),
+    web_stage: bool = typer.Option(False, "--web", help="With --install: Web-stage tools only."),
+    vuln: bool = typer.Option(False, "--vuln", help="With --install: Vuln-stage tools only."),
 ) -> None:
     """Report which external tools are on PATH, and optionally install the missing ones.
 
     [bold]kaalyx tools[/]                    report status (default).
     [bold]kaalyx tools --check-only[/]       same as default, stated explicitly.
     [bold]kaalyx tools --install[/]          report, then install everything missing.
-    [bold]kaalyx tools --install --osint[/]  install only the OSINT-phase tools.
+    [bold]kaalyx tools --install --osint[/]  install only the OSINT-stage tools.
 
     Installation is delegated to [bold]scripts/install.sh[/] (apt/pacman; Linux/Kali/Arch),
     so there is one source of truth for how each tool is installed.
@@ -688,20 +688,20 @@ def tools(
     setup_logging()
     load_config(config)  # validate the config file even though its values aren't used here
 
-    # Which phase to (optionally) install. Multiple phase flags are not combined — pick one.
-    phase_flags = [
+    # Which stage to (optionally) install. Multiple stage flags are not combined — pick one.
+    stage_flags = [
         ("osint", osint), ("subdomains", subdomains), ("hosts", hosts),
-        ("web", web_phase), ("vuln", vuln),
+        ("web", web_stage), ("vuln", vuln),
     ]
-    selected = [name for name, on in phase_flags if on]
+    selected = [name for name, on in stage_flags if on]
     if len(selected) > 1:
         console.print(
-            f"[red]Pick a single phase for --install[/] (got: {', '.join(selected)})."
+            f"[red]Pick a single stage for --install[/] (got: {', '.join(selected)})."
         )
         raise typer.Exit(code=2)
-    phase = selected[0] if selected else "all"
+    stage = selected[0] if selected else "all"
 
-    _report_tool_status(phase if selected else None)
+    _report_tool_status(stage if selected else None)
 
     missing = [s.key for s in tool_registry.missing_tools()]
     if not missing:
@@ -714,16 +714,16 @@ def tools(
         )
         console.print(
             "Kaalyx skips missing tools gracefully. Run [bold]kaalyx tools --install[/] "
-            "to install them (or [bold]--install --osint[/] for just one phase)."
+            "to install them (or [bold]--install --osint[/] for just one stage)."
         )
         return
 
-    # --install: delegate to scripts/install.sh for the chosen phase.
+    # --install: delegate to scripts/install.sh for the chosen stage.
     from .core import installer
 
-    label = "all phases" if phase == "all" else f"the {phase} phase"
+    label = "all stages" if stage == "all" else f"the {stage} stage"
     console.print(f"\n[cyan]Installing missing tools for {label} via scripts/install.sh…[/]")
-    code = installer.run_install(phase)
+    code = installer.run_install(stage)
     if code == 0:
         console.print("[green]Installer finished. Re-run 'kaalyx tools' to confirm.[/]")
     else:
@@ -734,12 +734,12 @@ def tools(
         raise typer.Exit(code=code)
 
 
-def _report_tool_status(phase: Optional[str]) -> None:
-    """Print the tool-availability table, optionally filtered to one pipeline phase."""
+def _report_tool_status(stage: Optional[str]) -> None:
+    """Print the tool-availability table, optionally filtered to one pipeline stage."""
     report = tool_registry.availability_report()
     title = "Kaalyx external tool availability"
-    if phase:
-        title += f"  ({phase} phase)"
+    if stage:
+        title += f"  ({stage} stage)"
     table = Table(title=title)
     table.add_column("Tool", style="cyan")
     table.add_column("Part")
@@ -748,7 +748,7 @@ def _report_tool_status(phase: Optional[str]) -> None:
     for key, available in sorted(report.items()):
         spec = tool_registry.get(key)
         assert spec is not None
-        if phase and spec.part.value != phase:
+        if stage and spec.part.value != stage:
             continue
         status = "[green]yes[/]" if available else "[red]no[/]"
         table.add_row(key, spec.part.value, status, spec.requires_secret or "")

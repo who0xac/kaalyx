@@ -33,13 +33,13 @@ Kaalyx Python package itself.
 aborts the rest — and idempotent, so you can re-run it any time.
 
 ```bash
-# Full install (all pipeline phases):
+# Full install (all pipeline stages):
 ./scripts/install.sh              # or: --install / --all
 
 # See what's installed vs. missing without installing anything:
 ./scripts/install.sh --check
 
-# Install only the tools for one phase:
+# Install only the tools for one stage:
 ./scripts/install.sh --osint-only
 ./scripts/install.sh --subdomains-only
 ./scripts/install.sh --hosts-only

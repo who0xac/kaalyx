@@ -24,7 +24,7 @@ export GOBIN="${GOBIN_DIR}"
 export PATH="${BIN_DIR}:${GOBIN_DIR}:${CARGO_BIN}:${PATH}"
 
 # --- Colors (single source of truth; consistent with Kaalyx's rich palette) ---------------
-#   art=red  tagline=yellow  author=dim   phase headers=bold cyan
+#   art=red  tagline=yellow  author=dim   stage headers=bold cyan
 #   success=green  skipped=yellow  failed=red   Finished!=bold green
 C_RED=$'\033[0;31m';  C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
 C_CYAN=$'\033[0;36m'; C_DIM=$'\033[2m';       C_BOLD=$'\033[1m'; C_NC=$'\033[0m'
@@ -34,11 +34,11 @@ info() { printf '\033[1;36m[*]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31m[-]\033[0m %s\n' "$1"; exit 1; }
 
-# Phase header: "Running: <phase>" in bold cyan.
-phase() { printf '\n%s%sRunning: %s%s\n' "${C_BOLD}" "${C_CYAN}" "$1" "${C_NC}"; }
+# Stage header: "Running: <name>" in bold cyan.
+stage_header() { printf '\n%s%sRunning: %s%s\n' "${C_BOLD}" "${C_CYAN}" "$1" "${C_NC}"; }
 
 # --- Per-tool progress counters + category tallies -----------------------------------------
-# Each install phase resets the counter, sets a total, then calls tool_step for every tool.
+# Each install stage resets the counter, sets a total, then calls tool_step for every tool.
 # Results roll up into per-category OK/skipped/failed tallies printed in the final summary.
 _STEP_i=0          # current index within the active category
 _STEP_total=0      # total tools in the active category (shown as [i/total])
@@ -87,11 +87,11 @@ run_tool() {
 
 # Network connectivity precheck — one clear "Network OK" / failure line before any install.
 network_precheck() {
-    phase "Network precheck"
+    stage_header "Network precheck"
     local host
     for host in github.com raw.githubusercontent.com; do
         if curl -fsS --max-time 8 -o /dev/null "https://${host}" 2>/dev/null; then
-            printf '  %sNetwork OK%s (reached %s)\n' "${C_GREEN}" "${C_NC}" "${host}"
+            printf '  %sNetwork OK%s\n' "${C_GREEN}" "${C_NC}"
             return 0
         fi
     done
@@ -162,18 +162,18 @@ GENERAL
     -h, --help          Show this help and exit.
         --check         Report which required tools are already installed vs.
                         missing, and exit. Installs nothing (dry run).
-        --install       Run the full install (all phases). Default behaviour.
+        --install       Run the full install (all stages). Default behaviour.
         --all           Alias for --install.
 
-INSTALL A SINGLE PHASE ONLY
+INSTALL A SINGLE STAGE ONLY
         --osint-only        Tools for Part 1 — OSINT.
         --subdomains-only   Tools for Part 2 — Subdomain enumeration.
         --hosts-only        Tools for Part 3 — Host / port / service analysis.
         --web-only          Tools for Part 4 — Web analysis / URL collection.
         --vuln-only         Tools for Part 5 — Vulnerability checks.
 
-    Phase installs still install the shared foundation first (system packages,
-    Go, Rust, Docker as needed) so the phase tools can build.
+    Stage installs still install the shared foundation first (system packages,
+    Go, Rust, Docker as needed) so the stage tools can build.
 
 INSTALL KAALYX ITSELF (separate from this script)
     Kaalyx is a Python package installed with pipx, from the project root:
@@ -193,35 +193,35 @@ HELP
 }
 
 # ============================================================================
-#  Argument parsing — decide the run MODE and which PHASES to install
+#  Argument parsing — decide the run MODE and which STAGES to install
 # ============================================================================
 
 MODE="install"            # install | check
-declare -a PHASES=()      # empty => all phases
+declare -a STAGES=()      # empty => all stages
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
-        PHASES=(osint subdomains hosts web vuln)
+        STAGES=(osint subdomains hosts web vuln)
         return
     fi
     case "$1" in
         -h|--help)          print_help; exit 0 ;;
-        --check)            MODE="check"; PHASES=(osint subdomains hosts web vuln) ;;
-        --install|--all)    PHASES=(osint subdomains hosts web vuln) ;;
-        --osint-only)       PHASES=(osint) ;;
-        --subdomains-only)  PHASES=(subdomains) ;;
-        --hosts-only)       PHASES=(hosts) ;;
-        --web-only)         PHASES=(web) ;;
-        --vuln-only)        PHASES=(vuln) ;;
+        --check)            MODE="check"; STAGES=(osint subdomains hosts web vuln) ;;
+        --install|--all)    STAGES=(osint subdomains hosts web vuln) ;;
+        --osint-only)       STAGES=(osint) ;;
+        --subdomains-only)  STAGES=(subdomains) ;;
+        --hosts-only)       STAGES=(hosts) ;;
+        --web-only)         STAGES=(web) ;;
+        --vuln-only)        STAGES=(vuln) ;;
         *)                  warn "Unknown option: $1"; print_help; exit 2 ;;
     esac
 }
 
-want_phase() {
-    local phase="$1"
+want_stage() {
+    local stage="$1"
     local p
-    for p in "${PHASES[@]}"; do
-        [[ "${p}" == "${phase}" ]] && return 0
+    for p in "${STAGES[@]}"; do
+        [[ "${p}" == "${stage}" ]] && return 0
     done
     return 1
 }
@@ -229,8 +229,8 @@ want_phase() {
 parse_args "$@"
 
 # ============================================================================
-#  Phase → tool mapping (for --check and for the per-phase verification report).
-#  Kept in sync with the tools each pipeline phase actually invokes.
+#  Stage → tool mapping (for --check and for the per-stage verification report).
+#  Kept in sync with the tools each pipeline stage actually invokes.
 # ============================================================================
 
 # Part 1 — OSINT (final spec incl. the 5 gap-closing additions).
@@ -257,11 +257,11 @@ FOUNDATION_TOOLS=(go rustc cargo docker uv anew)
 collect_selected_tools() {
     local -n out="$1"
     out=("${FOUNDATION_TOOLS[@]}")
-    want_phase osint      && out+=("${OSINT_TOOLS[@]}")
-    want_phase subdomains && out+=("${SUBDOMAIN_TOOLS[@]}")
-    want_phase hosts      && out+=("${HOST_TOOLS[@]}")
-    want_phase web        && out+=("${WEB_TOOLS[@]}")
-    want_phase vuln       && out+=("${VULN_TOOLS[@]}")
+    want_stage osint      && out+=("${OSINT_TOOLS[@]}")
+    want_stage subdomains && out+=("${SUBDOMAIN_TOOLS[@]}")
+    want_stage hosts      && out+=("${HOST_TOOLS[@]}")
+    want_stage web        && out+=("${WEB_TOOLS[@]}")
+    want_stage vuln       && out+=("${VULN_TOOLS[@]}")
     # Deduplicate while preserving order.
     local seen="" t deduped=()
     for t in "${out[@]}"; do
@@ -286,7 +286,7 @@ run_check() {
     echo
     echo "============================================================"
     echo "                 TOOL STATUS  (--check)"
-    echo "     phases: ${PHASES[*]}"
+    echo "     stages: ${STAGES[*]}"
     echo "============================================================"
 
     local ok=0 missing=0
@@ -303,7 +303,7 @@ run_check() {
     echo "============================================================"
     printf 'Installed: \033[1;32m%d\033[0m   Missing: \033[1;31m%d\033[0m\n' "${ok}" "${missing}"
     echo
-    echo "Run without --check (or with a phase flag) to install the missing tools."
+    echo "Run without --check (or with a stage flag) to install the missing tools."
     exit 0
 }
 
@@ -317,8 +317,7 @@ fi
 
 print_banner
 
-phase "Install/Update"
-printf '  phases: %s%s%s\n' "${C_CYAN}" "${PHASES[*]}" "${C_NC}"
+stage_header "Install/Update"
 
 trap 'fail "Installation failed around line ${LINENO}."' ERR
 
@@ -523,12 +522,12 @@ install_rust() {
     log "Cargo: $(cargo --version)"
 }
 
-# Rust is only needed to build findomain from source (a subdomain-phase tool).
-# Skip it entirely for phase installs that don't need it, to save time.
-if want_phase subdomains; then
+# Rust is only needed to build findomain from source (a Subdomains-stage tool).
+# Skip it entirely for stage installs that don't need it, to save time.
+if want_stage subdomains; then
     install_rust
 else
-    info "Skipping Rust toolchain (no selected phase needs a cargo build)."
+    info "Skipping Rust toolchain (no selected stage needs a cargo build)."
 fi
 
 install_docker() {
@@ -699,7 +698,7 @@ install_chromium() {
 }
 
 # ============================================================================
-#  PHASE 2 — Subdomains
+#  Subdomains
 # ============================================================================
 
 install_findomain() {
@@ -849,7 +848,7 @@ EOF
 }
 
 # ============================================================================
-#  PHASE 1 — OSINT   (includes the 5 gap-closing tools)
+#  OSINT   (includes the 5 gap-closing tools)
 # ============================================================================
 
 
@@ -989,13 +988,13 @@ install_spoofy() {
 }
 
 # ============================================================================
-#  PHASE 3 — Hosts
+#  Hosts
 # ============================================================================
 
 install_wafw00f() { pipx_install wafw00f wafw00f; }
 
 # ============================================================================
-#  PHASE 4 — Web analysis
+#  Web analysis
 # ============================================================================
 
 
@@ -1028,7 +1027,7 @@ install_gf_patterns() {
 }
 
 # ============================================================================
-#  PHASE 5 — Vulnerability checks
+#  Vulnerability checks
 # ============================================================================
 
 
@@ -1108,10 +1107,10 @@ update_nuclei_templates() {
 }
 
 # ============================================================================
-#  Run the selected phases
+#  Run the selected stages
 # ============================================================================
 
-# anew is a shared plumbing tool used across phases; install it up front (not counted).
+# anew is a shared plumbing tool used across stages; install it up front (not counted).
 go_install anew github.com/tomnomnom/anew
 
 # ============================================================================
@@ -1119,12 +1118,12 @@ go_install anew github.com/tomnomnom/anew
 #
 #  Tools are installed in three categorised, separately-counted groups by INSTALL METHOD —
 #  Go tools, Python/pip tools, and cloned repositories — rather than one flat list. Each
-#  manifest row is:  <phases>|<method>|<name>|<install-cmd...>
-#    phases : comma list (osint,subdomains,hosts,web,vuln) — row runs if any is selected
+#  manifest row is:  <stages>|<method>|<name>|<install-cmd...>
+#    stages : comma list (osint,subdomains,hosts,web,vuln) — row runs if any is selected
 #    method : go | py | repo
 #    name   : the resulting binary/command on PATH
 #    rest   : the install invocation (a go_install/pipx-backed helper/git helper call)
-#  A tool needed by several phases appears once; dedup keeps it from installing twice.
+#  A tool needed by several stages appears once; dedup keeps it from installing twice.
 # ============================================================================
 MANIFEST=(
   # --- Go tools ---
@@ -1179,17 +1178,17 @@ MANIFEST=(
   "vuln|repo|sstimap|install_sstimap"
 )
 
-# manifest_selected <method> -> emit "name<TAB>cmd..." rows for the given method whose phases
-# intersect the selected PHASES, de-duplicated by tool name (first occurrence wins).
+# manifest_selected <method> -> emit "name<TAB>cmd..." rows for the given method whose stages
+# intersect the selected STAGES, de-duplicated by tool name (first occurrence wins).
 manifest_selected() {
-    local want_method="$1" seen="" row phases method name rest p hit
+    local want_method="$1" seen="" row stages method name rest p hit
     for row in "${MANIFEST[@]}"; do
-        IFS='|' read -r phases method name rest <<<"${row}"
+        IFS='|' read -r stages method name rest <<<"${row}"
         [[ "${method}" == "${want_method}" ]] || continue
         [[ ",${seen}," == *",${name},"* ]] && continue
         hit=0
-        IFS=',' read -ra _ph <<<"${phases}"
-        for p in "${_ph[@]}"; do want_phase "${p}" && { hit=1; break; }; done
+        IFS=',' read -ra _ph <<<"${stages}"
+        for p in "${_ph[@]}"; do want_stage "${p}" && { hit=1; break; }; done
         [[ "${hit}" -eq 1 ]] || continue
         seen="${seen},${name}"
         printf '%s\t%s\n' "${name}" "${rest}"
@@ -1204,7 +1203,7 @@ install_group() {
     while IFS= read -r line; do [[ -n "${line}" ]] && rows+=("${line}"); done < <(manifest_selected "${method}")
     local total="${#rows[@]}"
     [[ "${total}" -gt 0 ]] || return 0
-    phase "Installing ${label} (${total})"
+    stage_header "Installing ${label} (${total})"
     begin_category "${label}" "${total}"
     local name cmd
     for line in "${rows[@]}"; do
@@ -1219,9 +1218,9 @@ install_group py   "Python tools" "ready"
 install_group repo "Repositories" "ready"
 
 # Supporting side-steps that aren't counted tools (a headless browser for screenshots, the gf
-# pattern set, and the nuclei template DB refresh). Run only for the phases that need them.
-if want_phase web;  then try install_chromium; try install_gf_patterns; fi
-if want_phase vuln; then try update_nuclei_templates; fi
+# pattern set, and the nuclei template DB refresh). Run only for the stages that need them.
+if want_stage web;  then try install_chromium; try install_gf_patterns; fi
+if want_stage vuln; then try update_nuclei_templates; fi
 
 # ============================================================================
 #  httpx name-collision guard (Python httpx CLI vs ProjectDiscovery httpx)
@@ -1266,7 +1265,7 @@ resolve_httpx_conflict() {
     hash -r 2>/dev/null || true
 }
 
-if want_phase hosts; then try resolve_httpx_conflict; fi
+if want_stage hosts; then try resolve_httpx_conflict; fi
 
 # ============================================================================
 #  Publish everything to /usr/local/bin

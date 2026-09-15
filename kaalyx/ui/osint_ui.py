@@ -45,7 +45,7 @@ def format_duration(seconds: float) -> str:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
-# The OSINT phase header: a fixed double-line box drawn by hand so it renders identically
+# The OSINT stage header: a fixed double-line box drawn by hand so it renders identically
 # on every terminal, regardless of font metrics.
 _HEADER_LINES = [
     "╔══════════════════════════════════════════════════════════╗",
@@ -55,13 +55,13 @@ _HEADER_LINES = [
 
 
 def print_banner(domain: str, source_count: int) -> None:
-    """Print the OSINT phase header: main banner, a blank line, the double-line box, then a
+    """Print the OSINT stage header: main banner, a blank line, the double-line box, then a
     target/source-count line."""
     from . import print_main_banner
 
     console = get_console()
 
-    # Main banner + one blank line precede the phase header (the confirmed sequence).
+    # Main banner + one blank line precede the stage header (the confirmed sequence).
     print_main_banner()
     console.print()
 
@@ -350,7 +350,7 @@ def summary_panel(
     duration_s: float,
     verified_counts: dict[str, int] | None = None,
 ) -> Panel:
-    """Build the bordered end-of-phase summary panel.
+    """Build the bordered end-of-stage summary panel.
 
     Args:
         domain: target.

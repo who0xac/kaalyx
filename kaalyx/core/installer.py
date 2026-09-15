@@ -1,7 +1,7 @@
 """Drive ``scripts/install.sh`` for the ``kaalyx tools --install`` command.
 
 Kaalyx does not reimplement tool-installation logic in Python — that lives once, in
-``scripts/install.sh`` (with its ``--osint-only`` / ``--subdomains-only`` / … phase flags),
+``scripts/install.sh`` (with its ``--osint-only`` / ``--subdomains-only`` / … stage flags),
 so there is a single source of truth for how each external tool is installed.
 
 Locating the script has to work in two very different situations:
@@ -34,8 +34,8 @@ logger = get_logger("installer")
 # Raw URL of the installer in the repo (kept in one place; branch matches the updater).
 _RAW_INSTALL_URL = "https://raw.githubusercontent.com/who0xac/kaalyx/main/scripts/install.sh"
 
-# CLI phase name -> the install.sh flag that installs just that phase's tools.
-PHASE_FLAG = {
+# CLI stage name -> the install.sh flag that installs just that stage's tools.
+STAGE_FLAG = {
     "osint": "--osint-only",
     "subdomains": "--subdomains-only",
     "hosts": "--hosts-only",
@@ -93,16 +93,16 @@ def resolve_install_script() -> tuple[Path | None, str]:
     return None, ""
 
 
-def run_install(phase: str) -> int:
-    """Run the installer for *phase* ('osint'|'subdomains'|'hosts'|'web'|'vuln'|'all').
+def run_install(stage: str) -> int:
+    """Run the installer for *stage* ('osint'|'subdomains'|'hosts'|'web'|'vuln'|'all').
 
     Streams the installer's output to the terminal (it has its own coloured logging).
     Returns the script's exit code, or a non-zero sentinel if it could not be run. Never
     raises — the caller surfaces the outcome.
     """
-    flag = PHASE_FLAG.get(phase)
+    flag = STAGE_FLAG.get(stage)
     if flag is None:
-        logger.error("Unknown install phase '%s'", phase)
+        logger.error("Unknown install stage '%s'", stage)
         return 2
 
     if not bash_available():

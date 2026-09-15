@@ -39,40 +39,49 @@ stage_header() { printf '\n%s%sRunning: %s%s\n' "${C_BOLD}" "${C_CYAN}" "$1" "${
 
 # --- Per-tool progress counters + category tallies -----------------------------------------
 # Each install stage resets the counter, sets a total, then calls tool_step for every tool.
-# Results roll up into per-category OK/skipped/failed tallies printed in the final summary.
+# Four DISTINCT per-tool states, so the output/summary is never ambiguous:
+#   present  → already installed, no action needed. A SUCCESS state; counts toward OK.
+#   ok       → we just installed it (this run). Counts toward OK.
+#   skipped  → genuinely not attempted, an unmet precondition (shown WITH a reason).
+#   failed   → the install ran and failed.
+# The summary reports "X OK (Y already installed), Z skipped, W failed" so already-present and
+# freshly-installed are both OK, and a real skip (with its reason) stands apart.
 _STEP_i=0          # current index within the active category
 _STEP_total=0      # total tools in the active category (shown as [i/total])
-declare -A _CAT_OK _CAT_SKIP _CAT_FAIL _CAT_TOTAL
+declare -A _CAT_OK _CAT_PRESENT _CAT_SKIP _CAT_FAIL _CAT_TOTAL
 
 begin_category() {  # begin_category <label> <total>
     _CAT_LABEL="$1"; _STEP_total="$2"; _STEP_i=0
-    _CAT_OK["$1"]=0; _CAT_SKIP["$1"]=0; _CAT_FAIL["$1"]=0; _CAT_TOTAL["$1"]="$2"
+    _CAT_OK["$1"]=0; _CAT_PRESENT["$1"]=0; _CAT_SKIP["$1"]=0; _CAT_FAIL["$1"]=0; _CAT_TOTAL["$1"]="$2"
 }
 
-# tool_step <name> <ok|skipped|failed> [ok_verb] — print "[i/total] name <status>" coloured,
-# and roll the result into the active category's tally. *ok_verb* customises the success word
-# per category (Go: "installed", Python: "ready", Repos: "ready"); defaults to "installed".
+# tool_step <name> <present|ok|skipped|failed> [verb_or_reason] — print "[i/total] name
+# <status>" coloured, and roll the result into the active category's tally. For "ok" the third
+# arg is the success verb (installed/ready); for "skipped" it is the reason shown after the tag.
 tool_step() {
-    local name="$1" status="$2" ok_verb="${3:-installed}"
+    local name="$1" status="$2" extra="${3:-}"
     _STEP_i=$((_STEP_i + 1))
     case "${status}" in
+        present) _CAT_PRESENT["${_CAT_LABEL}"]=$(( ${_CAT_PRESENT["${_CAT_LABEL}"]} + 1 ))
+                 printf '  [%d/%d] %s %salready installed%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_CYAN}" "${C_NC}" ;;
         ok)      _CAT_OK["${_CAT_LABEL}"]=$(( ${_CAT_OK["${_CAT_LABEL}"]} + 1 ))
-                 printf '  [%d/%d] %s %s%s%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_GREEN}" "${ok_verb}" "${C_NC}" ;;
+                 printf '  [%d/%d] %s %s%s%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_GREEN}" "${extra:-installed}" "${C_NC}" ;;
         skipped) _CAT_SKIP["${_CAT_LABEL}"]=$(( ${_CAT_SKIP["${_CAT_LABEL}"]} + 1 ))
-                 printf '  [%d/%d] %s %sskipped%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_YELLOW}" "${C_NC}" ;;
+                 printf '  [%d/%d] %s %sskipped%s%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_YELLOW}" "${C_NC}" \
+                        "${extra:+$(printf ' %s(%s)%s' "${C_DIM}" "${extra}" "${C_NC}")}" ;;
         *)       _CAT_FAIL["${_CAT_LABEL}"]=$(( ${_CAT_FAIL["${_CAT_LABEL}"]} + 1 ))
                  printf '  [%d/%d] %s %sfailed%s\n' "${_STEP_i}" "${_STEP_total}" "${name}" "${C_RED}" "${C_NC}" ;;
     esac
 }
 
 # run_tool <name> <ok_verb> <command...> — run an install command, classify the outcome, count
-# it. "skipped" = already present (nothing to do); "ok" = command succeeded and the binary is
-# now present; "failed" = otherwise. Never aborts the run (mirrors `try`). For repositories we
-# print a "(clone)" progress line before running so the clone is visible even when slow.
+# it. Already-present => "present" (already installed, counts OK); command succeeds and the
+# binary appears => "ok"; otherwise "failed". Never aborts the run (mirrors `try`). For
+# repositories we print a "(clone)" progress line before running so the clone is visible.
 run_tool() {
     local name="$1" ok_verb="$2"; shift 2
     if command -v "${name}" >/dev/null 2>&1; then
-        tool_step "${name}" skipped
+        tool_step "${name}" present
         return 0
     fi
     if [[ "${ok_verb}" == "ready" && "${_CAT_LABEL}" == "Repositories" ]]; then
@@ -81,8 +90,13 @@ run_tool() {
     if "$@" >/dev/null 2>&1 && command -v "${name}" >/dev/null 2>&1; then
         tool_step "${name}" ok "${ok_verb}"
     else
-        tool_step "${name}" failed "${ok_verb}"
+        tool_step "${name}" failed
     fi
+}
+
+# skip_tool <name> <reason> — record a genuine skip (unmet precondition), shown with its reason.
+skip_tool() {
+    tool_step "$1" skipped "$2"
 }
 
 # Network connectivity precheck — one clear "Network OK" / failure line before any install.
@@ -197,24 +211,54 @@ HELP
 # ============================================================================
 
 MODE="install"            # install | check
+VERBOSE=0                 # -vv/--verbose: show underlying tools' raw output (apt/rust/nuclei…)
 declare -a STAGES=()      # empty => all stages
+_STAGE_SET=0              # whether a stage flag was given
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
         STAGES=(osint subdomains hosts web vuln)
         return
     fi
-    case "$1" in
-        -h|--help)          print_help; exit 0 ;;
-        --check)            MODE="check"; STAGES=(osint subdomains hosts web vuln) ;;
-        --install|--all)    STAGES=(osint subdomains hosts web vuln) ;;
-        --osint-only)       STAGES=(osint) ;;
-        --subdomains-only)  STAGES=(subdomains) ;;
-        --hosts-only)       STAGES=(hosts) ;;
-        --web-only)         STAGES=(web) ;;
-        --vuln-only)        STAGES=(vuln) ;;
-        *)                  warn "Unknown option: $1"; print_help; exit 2 ;;
-    esac
+    # Loop so -vv/--verbose can appear together with a mode/stage flag in any order.
+    local a
+    for a in "$@"; do
+        case "${a}" in
+            -h|--help)          print_help; exit 0 ;;
+            -vv|--verbose)      VERBOSE=1 ;;
+            --check)            MODE="check"; STAGES=(osint subdomains hosts web vuln); _STAGE_SET=1 ;;
+            --install|--all)    STAGES=(osint subdomains hosts web vuln); _STAGE_SET=1 ;;
+            --osint-only)       STAGES=(osint); _STAGE_SET=1 ;;
+            --subdomains-only)  STAGES=(subdomains); _STAGE_SET=1 ;;
+            --hosts-only)       STAGES=(hosts); _STAGE_SET=1 ;;
+            --web-only)         STAGES=(web); _STAGE_SET=1 ;;
+            --vuln-only)        STAGES=(vuln); _STAGE_SET=1 ;;
+            *)                  warn "Unknown option: ${a}"; print_help; exit 2 ;;
+        esac
+    done
+    # Only -vv given (no stage/mode flag) => full install, verbose.
+    [[ "${_STAGE_SET}" -eq 1 ]] || STAGES=(osint subdomains hosts web vuln)
+}
+
+# run_quiet <label> <command...> — run a noisy foundation command (apt, rustup, nuclei
+# templates). By default its output is hidden and we print a single clean status line; with
+# -vv the raw output streams through. Returns the command's exit code.
+run_quiet() {
+    local label="$1"; shift
+    if [[ "${VERBOSE}" -eq 1 ]]; then
+        "$@"
+        return $?
+    fi
+    local out rc
+    out="$("$@" 2>&1)"; rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+        printf '  %s%s%s\n' "${C_GREEN}" "${label}" "${C_NC}"
+    else
+        printf '  %s%s (see -vv for detail)%s\n' "${C_YELLOW}" "${label}" "${C_NC}"
+        # On failure, surface the tail of the captured output so it isn't lost entirely.
+        printf '%s\n' "${out}" | tail -5
+    fi
+    return ${rc}
 }
 
 want_stage() {
@@ -433,7 +477,8 @@ install_system_packages() {
     fi
 }
 
-install_system_packages
+stage_header "Foundation (system packages, Go, Rust, Docker)"
+run_quiet "System dependencies: up to date" install_system_packages
 
 configure_shell() {
     local rc="$1"
@@ -494,7 +539,7 @@ install_go() {
     log "Go installed: $(/usr/local/go/bin/go version)"
 }
 
-install_go
+run_quiet "Go toolchain: ready" install_go
 
 install_rust() {
 
@@ -525,7 +570,7 @@ install_rust() {
 # Rust is only needed to build findomain from source (a Subdomains-stage tool).
 # Skip it entirely for stage installs that don't need it, to save time.
 if want_stage subdomains; then
-    install_rust
+    run_quiet "Rust toolchain: ready" install_rust
 else
     info "Skipping Rust toolchain (no selected stage needs a cargo build)."
 fi
@@ -549,7 +594,7 @@ install_docker() {
     warn "A new login/session may be required for docker group changes."
 }
 
-install_docker
+run_quiet "Docker: ready" install_docker
 
 # ============================================================================
 #  Shared install helpers
@@ -1101,8 +1146,7 @@ update_nuclei_templates() {
     export PATH="${GOBIN_DIR}:${BIN_DIR}:${PATH}"
 
     if command -v nuclei >/dev/null 2>&1; then
-        log "Updating Nuclei templates..."
-        nuclei -update-templates || warn "Nuclei template update failed."
+        run_quiet "Nuclei templates: updated" nuclei -update-templates
     fi
 }
 
@@ -1306,14 +1350,16 @@ export PATH="${HOME}/.local/bin:/usr/local/go/bin:${GOBIN_DIR}:${CARGO_BIN}:${BI
 
 print_summary() {
     printf '\n%s%s--- Tool Installation Summary ---%s\n' "${C_BOLD}" "${C_CYAN}" "${C_NC}"
-    local cat
+    local cat present okc
     for cat in "Go tools" "Python tools" "Repositories"; do
         [[ -n "${_CAT_TOTAL[${cat}]:-}" ]] || continue   # only categories that actually ran
-        printf '  %-20s %s%d OK%s, %s%d skipped%s, %s%d failed%s (of %d)\n' \
+        present="${_CAT_PRESENT[${cat}]:-0}"
+        okc=$(( ${_CAT_OK[${cat}]:-0} + present ))       # OK = freshly installed + already present
+        printf '  %-20s %s%d OK%s (%d already installed), %s%d skipped%s, %s%d failed%s (of %d)\n' \
             "${cat}:" \
-            "${C_GREEN}"  "${_CAT_OK[${cat}]:-0}"   "${C_NC}" \
-            "${C_YELLOW}" "${_CAT_SKIP[${cat}]:-0}" "${C_NC}" \
-            "${C_RED}"    "${_CAT_FAIL[${cat}]:-0}" "${C_NC}" \
+            "${C_GREEN}"  "${okc}"                    "${C_NC}" "${present}" \
+            "${C_YELLOW}" "${_CAT_SKIP[${cat}]:-0}"   "${C_NC}" \
+            "${C_RED}"    "${_CAT_FAIL[${cat}]:-0}"   "${C_NC}" \
             "${_CAT_TOTAL[${cat}]:-0}"
     done
 }

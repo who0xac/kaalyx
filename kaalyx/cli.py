@@ -675,6 +675,10 @@ def tools(
     hosts: bool = typer.Option(False, "--hosts", help="With --install: Hosts-stage tools only."),
     web_stage: bool = typer.Option(False, "--web", help="With --install: Web-stage tools only."),
     vuln: bool = typer.Option(False, "--vuln", help="With --install: Vuln-stage tools only."),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-vv",
+        help="With --install: show the underlying tools' raw output (apt/rustup/nuclei).",
+    ),
 ) -> None:
     """Report which external tools are on PATH, and optionally install the missing ones.
 
@@ -702,14 +706,16 @@ def tools(
         raise typer.Exit(code=2)
     stage = selected[0] if selected else "all"
 
-    _report_tool_status(stage if selected else None)
-
-    missing = [s.key for s in tool_registry.missing_tools()]
-    if not missing:
-        console.print("[green]All registered tools are available.[/]")
-        return
-
-    if check_only or not install:
+    # Status-check paths (default, or --check-only) print the availability table. The
+    # --install path goes STRAIGHT to install.sh — its own banner + phased, counted output
+    # already shows what is installed/skipped/failed, so a leading table would just be a
+    # redundant second block stacked above it.
+    if not install:
+        _report_tool_status(stage if selected else None)
+        missing = [s.key for s in tool_registry.missing_tools()]
+        if not missing:
+            console.print("[green]All registered tools are available.[/]")
+            return
         console.print(
             f"[yellow]{len(missing)} tool(s) not found on PATH:[/] {', '.join(missing)}"
         )
@@ -719,15 +725,13 @@ def tools(
         )
         return
 
-    # --install: delegate to scripts/install.sh for the chosen stage.
+    # --install: delegate to scripts/install.sh for the chosen stage (no leading table).
     from .core import installer
 
-    label = "all stages" if stage == "all" else f"the {stage} stage"
-    console.print(f"\n[cyan]Installing missing tools for {label} via scripts/install.sh…[/]")
-    code = installer.run_install(stage)
-    if code == 0:
-        console.print("[green]Installer finished. Re-run 'kaalyx tools' to confirm.[/]")
-    else:
+    # install.sh prints its own banner, staged output, and Finished! line — don't echo a
+    # duplicate success line here. Only surface a non-zero exit as an error.
+    code = installer.run_install(stage, verbose=verbose)
+    if code != 0:
         console.print(
             f"[yellow]Installer exited with code {code}.[/] "
             "See the messages above; you can also run scripts/install.sh manually."

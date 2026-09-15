@@ -93,12 +93,13 @@ def resolve_install_script() -> tuple[Path | None, str]:
     return None, ""
 
 
-def run_install(stage: str) -> int:
+def run_install(stage: str, verbose: bool = False) -> int:
     """Run the installer for *stage* ('osint'|'subdomains'|'hosts'|'web'|'vuln'|'all').
 
-    Streams the installer's output to the terminal (it has its own coloured logging).
-    Returns the script's exit code, or a non-zero sentinel if it could not be run. Never
-    raises — the caller surfaces the outcome.
+    Streams the installer's output to the terminal (it has its own coloured logging). When
+    *verbose* is True, passes ``-vv`` so the installer shows the underlying tools' raw output
+    (apt/rustup/nuclei) instead of the clean one-line summaries. Returns the script's exit
+    code, or a non-zero sentinel if it could not be run. Never raises.
     """
     flag = STAGE_FLAG.get(stage)
     if flag is None:
@@ -123,6 +124,8 @@ def run_install(stage: str) -> int:
     if source == "github":
         logger.info("Using installer fetched from GitHub.")
     cmd = ["bash", str(script), flag]
+    if verbose:
+        cmd.append("-vv")
     try:
         completed = subprocess.run(cmd, check=False)
         return completed.returncode

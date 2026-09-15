@@ -167,15 +167,20 @@ def installed_commit(timeout: float = 5.0) -> str | None:
 
 
 def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[int, str]:
-    """Reinstall Kaalyx from the GitHub repo via ``pipx install --force``.
+    """Reinstall Kaalyx from the GitHub repo by uninstalling then re-installing via pipx.
+
+    Deliberately does NOT use ``pipx install --force``: on pipx's uv backend (the current
+    Debian/Kali default), ``--force`` refuses to replace a venv it did not create in the
+    current session ("Not removing existing venv ... because it was not created in this
+    session"), so the update fails. Uninstalling first removes the venv outright; the install
+    afterwards creates a fresh one with nothing to overwrite.
 
     *ref* is the git ref to install; pass the full commit SHA (from
     :func:`latest_remote_commit`) so the install is pinned to exactly that commit. This is
     what makes an update genuine: ``git+…@main`` is the *same URL* every run, so pip happily
-    serves a cached clone/wheel and pipx exits 0 without new code landing; ``git+…@<sha>`` is
-    a distinct URL per commit, sidestepping that cache. We *also* pass ``--no-cache-dir`` and
-    ``--force-reinstall`` to pip as a belt-and-braces guarantee of a fresh build. Falls back
-    to ``main`` only if no ref is given.
+    serves a cached clone/wheel; ``git+…@<sha>`` is a distinct URL per commit, sidestepping
+    that cache. We *also* pass ``--no-cache-dir`` and ``--force-reinstall`` to pip as a
+    belt-and-braces guarantee of a fresh build. Falls back to ``main`` only if no ref is given.
 
     When *capture* is True, pipx's output is captured (hidden) and returned so the caller can
     show it only under --verbose; when False it streams to the terminal. Returns
@@ -199,11 +204,9 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
 
     spec = f"git+{REPO_URL}.git@{target}"
 
-    # Force a fresh venv even when pipx's backend is `uv` (Kali's default). On `pipx install
-    # --force`, uv's `uv venv` REFUSES to overwrite the existing venv unless told to, failing
-    # with "A virtual environment already exists" — pipx's own --force does not pass this
-    # through. UV_VENV_CLEAR=1 makes uv clear it; it is simply ignored when the backend is pip,
-    # so it's safe to set unconditionally.
+    # UV_VENV_CLEAR=1 tells uv (pipx's default backend on current Debian/Kali) it may replace an
+    # existing venv; harmlessly ignored by the pip backend. Kept as belt-and-braces, but it is
+    # NOT the primary mechanism — see below.
     env = dict(os.environ)
     env["UV_VENV_CLEAR"] = "1"
 
@@ -223,35 +226,37 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
         except OSError as exc:  # pragma: no cover
             return 4, f"Failed to launch pipx ({' '.join(cmd)}): {exc}"
 
-    # Attempts, most-preferred first. Each pins the exact commit (genuine update). If one
-    # fails for anything other than a network problem, fall through to the next:
-    #   1. pinned + --pip-args (no-cache, force-reinstall) — the belt-and-braces path.
-    #   2. plain pinned --force — covers older pipx that mishandle the multi-flag --pip-args.
-    #   3. uninstall THEN install — sidesteps the uv venv-overwrite check entirely (no --force,
-    #      so there's no existing venv for uv to refuse to clear), the surest recovery.
-    attempts = [
-        (["pipx", "install", "--force",
-          "--pip-args=--no-cache-dir --force-reinstall", spec], "pinned + --pip-args"),
-        (["pipx", "install", "--force", spec], "plain --force"),
-    ]
-
+    # PRIMARY path: uninstall THEN install — no `--force` at all. This is the surest fix for the
+    # uv backend, whose `pipx install --force` refuses to replace a venv it did not create in
+    # the current session ("Not removing existing venv ... because it was not created in this
+    # session" / "A virtual environment already exists"). Uninstalling first removes the venv
+    # outright, so the install afterwards creates a brand-new one with nothing to overwrite and
+    # no session-ownership check to trip. `pipx uninstall` on a package that is somehow already
+    # gone is harmless. Then a plain `pipx install <spec>` (pinned to the exact commit) does the
+    # genuine reinstall. --pip-args carries the no-cache/force-reinstall belt-and-braces.
     output_parts: list[str] = []
-    code = 1
-    for cmd, label in attempts:
-        code, out = _run(cmd)
-        output_parts.append(f"[attempt: {label}]\n{out}")
-        if code == 0:
-            return code, "\n".join(output_parts)
-        if is_network_error(out):
-            # A retry won't fix a network/DNS problem — stop and report it.
-            return code, "\n".join(output_parts)
 
-    # Final recovery: uninstall then install. `pipx uninstall` removes the venv cleanly, so the
-    # subsequent install creates a brand-new one and uv has nothing to overwrite.
-    unc, unout = _run(["pipx", "uninstall", "kaalyx"])
-    output_parts.append(f"[attempt: uninstall kaalyx]\n{unout}")
-    code, out = _run(["pipx", "install", spec])
-    output_parts.append(f"[attempt: reinstall after uninstall]\n{out}")
+    _, unout = _run(["pipx", "uninstall", "kaalyx"])
+    output_parts.append(f"[step: pipx uninstall kaalyx]\n{unout}")
+
+    install_cmd = [
+        "pipx", "install",
+        "--pip-args=--no-cache-dir --force-reinstall",
+        spec,
+    ]
+    code, out = _run(install_cmd)
+    output_parts.append(f"[step: pipx install (pinned)]\n{out}")
+    if code == 0:
+        return code, "\n".join(output_parts)
+
+    if is_network_error(out):
+        # A retry won't fix a network/DNS problem — stop and report it.
+        return code, "\n".join(output_parts)
+
+    # FALLBACK: some older pipx builds mishandle the multi-flag --pip-args string. Retry the
+    # install without it (still uninstalled first above, so still a fresh venv, still pinned).
+    code, out2 = _run(["pipx", "install", spec])
+    output_parts.append(f"[step: retry pipx install without --pip-args]\n{out2}")
     return code, "\n".join(output_parts)
 
 

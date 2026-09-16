@@ -93,6 +93,12 @@ class OsintStage(Stage):
         ctx = self.ctx
         osint_cfg = ctx.config.osint
 
+        # Start from a clean stage folder so this scan's output is fully isolated — no stale
+        # files from an earlier build and no artifacts from a different target can linger. The
+        # orchestrator only reaches run() for a fresh/re-run stage (a resumed-complete stage is
+        # skipped before here), so wiping our own <target>/osint/ dir is always safe.
+        ctx.writer.reset_stage_dir(self.name)
+
         # Map each source name to (enabled?, coroutine). Disabled ones are dropped before
         # running; the toggle comes from config (a --no-<source> CLI flag overrides config
         # by mutating ctx.config.osint before the stage runs).

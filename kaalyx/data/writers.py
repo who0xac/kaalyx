@@ -12,7 +12,12 @@ Directory layout::
         kaalyx.log                      # full run log (attached by core.logging)
         <stage>/                        # osint | subdomains | hosts | web | vulns
             <artifact>.txt              # e.g. subfinder.txt, all_subdomains.txt
-            raw/<tool>.stdout.txt       # verbatim tool stdout for traceability
+            tool_output/<source>.<ext>  # verbatim, unprocessed output per source/tool
+
+Everything for one scan lives under ``results/<domain-slug>/`` and NOTHING is ever written
+outside that per-target tree, so two targets can never contaminate each other's folder. A
+stage also wipes its own output directory at the start of a run (:meth:`reset_stage_dir`) so a
+re-scan can't inherit stale files from an earlier build or a different target.
 """
 
 from __future__ import annotations
@@ -49,6 +54,27 @@ class ResultWriter:
         except OSError as exc:
             logger.warning("Could not create stage dir %s: %s", path, exc)
         return path
+
+    def reset_stage_dir(self, stage: str) -> None:
+        """Wipe and recreate *stage*'s output directory before the stage runs.
+
+        Guarantees a stage's folder contains ONLY the current scan's output — so a re-scan (or
+        a folder that accumulated files from an earlier build, or any stray artifact) starts
+        clean and can never present stale or cross-target data. Scoped strictly to
+        ``<base>/<stage>`` (the current target's own tree); never touches anything outside it.
+        Best-effort — a failure to clean is logged and the stage still runs.
+        """
+        import shutil
+        path = self.base / stage
+        try:
+            if path.exists():
+                shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning("Could not reset stage dir %s: %s", path, exc)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not recreate stage dir %s: %s", path, exc)
 
     def log_path(self) -> Path:
         """Path of the per-scan text log file (used by core.logging)."""
@@ -103,8 +129,8 @@ class ResultWriter:
             logger.warning("Could not append to %s: %s", path, exc)
 
     def raw_tool_output(self, stage: str, tool: str, stdout: str) -> Path | None:
-        """Persist a tool's verbatim stdout under ``<stage>/raw/<tool>.stdout.txt``."""
-        raw_dir = self.stage_dir(stage) / "raw"
+        """Persist a tool's verbatim stdout under ``<stage>/tool_output/<tool>.stdout.txt``."""
+        raw_dir = self.stage_dir(stage) / "tool_output"
         try:
             raw_dir.mkdir(parents=True, exist_ok=True)
             path = raw_dir / f"{tool}.stdout.txt"
@@ -116,12 +142,12 @@ class ResultWriter:
 
     def raw_source_output(self, stage: str, source: str, content: str,
                           ext: str = "txt", header: str = "") -> Path | None:
-        """Persist ONE dedicated raw file per source under ``<stage>/raw/<source>.<ext>`` —
+        """Persist ONE dedicated raw file per source under ``<stage>/tool_output/<source>.<ext>`` —
         UNCONDITIONALLY, even when *content* is empty (an empty file records that the source
         ran and found nothing, mirroring the reference tool). *header* is an optional first
         line (e.g. a skip reason) so an empty file still says why.
         """
-        raw_dir = self.stage_dir(stage) / "raw"
+        raw_dir = self.stage_dir(stage) / "tool_output"
         try:
             raw_dir.mkdir(parents=True, exist_ok=True)
             path = raw_dir / f"{source}.{ext}"

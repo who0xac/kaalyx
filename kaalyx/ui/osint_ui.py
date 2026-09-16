@@ -575,11 +575,10 @@ class OsintProgress:
                    if s.state not in ("queued", "running"))
 
         lines = []
-        # 1) Header: [◆] OSINT :: <target>  (orange accent)
-        lines.append(Text.assemble(("[◆] ", "bold orange1"), ("OSINT", "bold orange1"),
-                                    (" :: ", MUTED), (self._target or "", "bold orange1")))
-        lines.append(Text(""))
-        # 2) Progress bar + N/total :: elapsed
+        # NO stage header here — the single stage header ([◆] KAALYX::OSINT + TARGET/SOURCES/MODE)
+        # is printed once by print_banner() BEFORE the board. The live board renders only the
+        # progress bar + per-source rows beneath it, so the header never appears twice.
+        # 1) Progress bar + N/total :: elapsed
         elapsed = time.monotonic() - self._start
         bar = self._progress_bar(done, total)
         bar_line = Text("    ")

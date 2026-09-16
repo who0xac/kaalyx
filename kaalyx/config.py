@@ -198,6 +198,13 @@ class OsintConfig:
     exposed_git: bool = True         # in-process /.git/config detection (keyless)
     github_actions: bool = True      # gato — GitHub Actions audit (external tool, needs token)
     google_dorks: bool = True        # dork URL generation (no scraping)
+    # Shodan-backed OSINT (needs SHODAN_API_KEY; each skips cleanly without it or when the
+    # account's tier doesn't permit the query). These go beyond the domain-scoped hostname/ssl
+    # search in the Subdomains stage — see PROJECT_MEMORY.md (paid-membership reversal).
+    shodan_org: bool = True          # org/ASN infrastructure search (forgotten/internal hosts)
+    shodan_favicon: bool = True      # favicon-hash pivot to related/look-alike infrastructure
+    shodan_vulns: bool = True        # passive CVE/vuln tags for resolved IPs (no packets sent)
+    shodan_host: bool = True         # per-IP deep lookup (ports/banners/history from cache)
 
 
 @dataclass

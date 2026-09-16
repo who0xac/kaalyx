@@ -222,6 +222,10 @@ _DISPLAY_NAMES: dict[str, str] = {
     "google_dorks": "GOOGLE_DORKS",
     "breach_lookup": "BREACH_LOOKUP[h8mail]",
     "leak_search": "LEAKSEARCH",
+    "shodan_org": "SHODAN_ORG[asn]",
+    "shodan_favicon": "SHODAN_FAVICON[pivot]",
+    "shodan_vulns": "SHODAN_CVE[tags]",
+    "shodan_host": "SHODAN_HOST[deep]",
 }
 
 
@@ -708,6 +712,9 @@ _CATEGORY_TITLES = [
     ("third-party-misconfig", "Third-party Misconfigurations"),
     ("email-security", "Email / DNS Security"),
     ("tenant-mapping", "Tenant Mapping"),
+    ("attack-surface", "Attack Surface (Shodan org/ASN)"),
+    ("related-infra", "Related Infrastructure (favicon pivot)"),
+    ("cve", "Known CVE Tags (Shodan, passive)"),
 ]
 _SEV_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 

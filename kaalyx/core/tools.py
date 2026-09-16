@@ -101,7 +101,7 @@ _SPECS: list[ToolSpec] = [
     ToolSpec("chaos", Part.SUBDOMAINS, "ProjectDiscovery Chaos dataset",
              requires_secret="CHAOS_API_KEY"),
     ToolSpec("subdominator", Part.SUBDOMAINS, "Passive subdomain enumeration"),
-    ToolSpec("shodan", Part.SUBDOMAINS, "Shodan CLI (domain-scoped hostname/ssl only)",
+    ToolSpec("shodan", Part.SUBDOMAINS, "Shodan CLI (domain-scoped hostname/ssl search)",
              requires_secret="SHODAN_API_KEY"),
     ToolSpec("censys", Part.SUBDOMAINS, "Censys CLI subdomain search",
              requires_secret="CENSYS_API_ID"),

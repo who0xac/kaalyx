@@ -36,11 +36,14 @@ Credential/leak coverage (post-harvest chaining):
 
 from __future__ import annotations
 
+import httpx
+
 from ..core.stage import Stage, StageResult
 from ..data.models import Confidence, Email, Finding, OsintRecord, Severity
 from ..monitor.flags import flag_all
 from ..ui import osint_ui
 from . import osint_inproc
+from . import shodan_inproc
 from ..parsers import osint_parsers as P
 from .sources import SourceResult, run_sources
 
@@ -67,6 +70,10 @@ SOURCE_LABELS: dict[str, str] = {
     "exposed_git": "Exposed .git",
     "github_actions": "GitHub Actions audit",
     "google_dorks": "Google dorks",
+    "shodan_org": "Shodan org/ASN",
+    "shodan_favicon": "Shodan favicon pivot",
+    "shodan_vulns": "Shodan CVE tags",
+    "shodan_host": "Shodan host deep-lookup",
 }
 
 
@@ -100,6 +107,10 @@ class OsintStage(Stage):
             "exposed_git": (osint_cfg.exposed_git, self._src_exposed_git),
             "github_actions": (osint_cfg.github_actions, self._src_github_actions),
             "google_dorks": (osint_cfg.google_dorks, self._src_google_dorks),
+            "shodan_org": (osint_cfg.shodan_org, self._src_shodan_org),
+            "shodan_favicon": (osint_cfg.shodan_favicon, self._src_shodan_favicon),
+            "shodan_vulns": (osint_cfg.shodan_vulns, self._src_shodan_vulns),
+            "shodan_host": (osint_cfg.shodan_host, self._src_shodan_host),
         }
         sources = {name: fn for name, (enabled, fn) in candidates.items() if enabled}
         disabled = [name for name, (enabled, _) in candidates.items() if not enabled]
@@ -968,4 +979,105 @@ class OsintStage(Stage):
             total += len(urls)
         self.ctx.writer.write_lines(self.name, "google_dorks.txt", lines, sort=False)
         res.note = f"{total} dork URLs across {len(by_category)} categories"
+        return res
+
+    # -- Shodan-backed sources (key-gated; passive — query Shodan's cache, never the target) --
+
+    async def _resolved_ips(self) -> list[str]:
+        """The target apex's resolved IP(s), memoised across Shodan sources so we resolve once.
+
+        Uses the same keyless DoH resolver as ip_info; the Shodan sources consume the result to
+        build a ``known_ips`` set (so infrastructure with no DNS trail can be flagged) and to
+        drive the per-IP lookups."""
+        cached = self.ctx.get_shared("resolved_ips")
+        if cached is not None:
+            return cached
+        ips = await osint_inproc.resolve_ips(self.ctx.target.registrable)
+        self.ctx.set_shared("resolved_ips", ips)
+        return ips
+
+    def _shodan_client(self, http: httpx.AsyncClient) -> "shodan_inproc.ShodanClient":
+        return shodan_inproc.ShodanClient(self.ctx.secrets.shodan_api_key, http)
+
+    async def _src_shodan_org(self) -> SourceResult:
+        res = SourceResult(name="shodan_org", raw_ext="txt")
+        if not self.ctx.secrets.has_shodan:
+            res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
+            res.raw = "# skipped: SHODAN_API_KEY not set"
+            return res
+        slugs = osint_inproc._company_slugs(self.ctx.target)
+        known = set(await self._resolved_ips())
+        async with httpx.AsyncClient() as http:
+            try:
+                records, findings, raw = await shodan_inproc.org_asn_search(
+                    self._shodan_client(http), slugs, known)
+            except shodan_inproc.ShodanTierError as exc:
+                res.skipped, res.note = True, f"skipped: {exc.reason}"
+                res.raw = f"# skipped: {exc.reason}"
+                return res
+        res.osint, res.findings, res.raw = records, findings, raw
+        res.note = f"{len(records)} host(s), {len(findings)} with no DNS trail"
+        return res
+
+    async def _src_shodan_favicon(self) -> SourceResult:
+        res = SourceResult(name="shodan_favicon", raw_ext="txt")
+        if not self.ctx.secrets.has_shodan:
+            res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
+            res.raw = "# skipped: SHODAN_API_KEY not set"
+            return res
+        apex = self.ctx.target.registrable
+        live_hosts = [f"https://{apex}", f"https://www.{apex}"]
+        known = set(await self._resolved_ips())
+        async with httpx.AsyncClient(
+            headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}, follow_redirects=True,
+        ) as http:
+            try:
+                records, findings, raw = await shodan_inproc.favicon_search(
+                    self._shodan_client(http), http, live_hosts, known)
+            except shodan_inproc.ShodanTierError as exc:
+                res.skipped, res.note = True, f"skipped: {exc.reason}"
+                res.raw = f"# skipped: {exc.reason}"
+                return res
+        res.osint, res.findings, res.raw = records, findings, raw
+        if not records:
+            res.note = "no favicon found on apex/www"
+        else:
+            res.note = f"{len(records)} favicon match record(s), {len(findings)} related host(s)"
+        return res
+
+    async def _src_shodan_vulns(self) -> SourceResult:
+        return await self._shodan_host_lookup(
+            "shodan_vulns", want_vulns=True, want_deep=False, history=False)
+
+    async def _src_shodan_host(self) -> SourceResult:
+        return await self._shodan_host_lookup(
+            "shodan_host", want_vulns=False, want_deep=True, history=True)
+
+    async def _shodan_host_lookup(
+        self, name: str, want_vulns: bool, want_deep: bool, history: bool,
+    ) -> SourceResult:
+        """Shared driver for the two per-IP capabilities (CVE tags / deep lookup). Both read
+        ``/shodan/host/<ip>``; they're separate sources so each can be toggled independently,
+        but each resolves the same memoised IP set."""
+        res = SourceResult(name=name, raw_ext="txt")
+        if not self.ctx.secrets.has_shodan:
+            res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
+            res.raw = "# skipped: SHODAN_API_KEY not set"
+            return res
+        ips = await self._resolved_ips()
+        if not ips:
+            res.skipped, res.note = True, "skipped: no resolvable IP to look up"
+            res.raw = "# skipped: no resolvable IP"
+            return res
+        async with httpx.AsyncClient() as http:
+            try:
+                records, findings, raw = await shodan_inproc.host_deep_lookup(
+                    self._shodan_client(http), ips, history=history,
+                    want_vulns=want_vulns, want_deep=want_deep)
+            except shodan_inproc.ShodanTierError as exc:
+                res.skipped, res.note = True, f"skipped: {exc.reason}"
+                res.raw = f"# skipped: {exc.reason}"
+                return res
+        res.osint, res.findings, res.raw = records, findings, raw
+        res.note = f"{len(ips)} IP(s) looked up, {len(records)} record(s), {len(findings)} finding(s)"
         return res

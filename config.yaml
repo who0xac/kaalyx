@@ -84,6 +84,11 @@ osint:
   exposed_git: true            # in-process /.git/config detection (keyless)
   github_actions: true         # gato — GitHub Actions audit (needs GITHUB_TOKEN)
   google_dorks: true           # dork URL generation (no scraping)
+  # Shodan-backed OSINT (needs SHODAN_API_KEY; skips cleanly without it or on tier limits).
+  shodan_org: true             # org/ASN infrastructure search (forgotten/internal hosts)
+  shodan_favicon: true         # favicon-hash pivot to related/look-alike infrastructure
+  shodan_vulns: true           # passive CVE/vuln tags for resolved IPs (no packets sent)
+  shodan_host: true            # per-IP deep lookup (ports/banners/history from cache)
 
 # --- Interesting-subdomain auto-flagging (Part 6) ---
 flagging:

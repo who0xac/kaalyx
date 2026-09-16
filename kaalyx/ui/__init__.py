@@ -44,30 +44,71 @@ def severity_style(severity: str | Severity) -> str:
     return SEVERITY_STYLE.get(key, SEVERITY_STYLE["unknown"])
 
 
-# --- Stage-header palette (FINAL, permanent; identical across all 6 stage headers) ---------
-# A warm orange/red/yellow family. The scheme never changes per stage — only the stage
-# name/subtitle text and the domain/count values differ.
-STAGE_BAR = "orange1"          # the ▌ vertical bar
-STAGE_TITLE = "bold orange1"   # the stage NAME (matches the bar)
-STAGE_SUBTITLE = MUTED         # the subtitle line — dim gray
-STAGE_LABEL = MUTED            # the "target" label — dim gray
-STAGE_DOMAIN = "red"           # the domain name
-STAGE_COUNT = "yellow"         # the source/host count
+# --- Stage-header palette + format (FINAL, PERMANENT; identical across ALL 6 stage headers) --
+# The header is locked to this exact shape for every stage — only the stage NAME, the subtitle,
+# and the info rows' values differ. Do NOT change the format or the palette per stage.
+#
+#   [◆] KAALYX::OSINT
+#       initializing passive recon engine...
+#
+#       TARGET  ›  polycab.com
+#       SOURCES ›  32 registered
+#       MODE    ›  passive · zero packets to target
+#
+STAGE_TITLE = "bold orange1"   # "[◆] KAALYX::<STAGE>" — bold orange (locked warm palette)
+STAGE_SUBTITLE = MUTED         # the "initializing…" line — dim gray
+STAGE_LABEL = MUTED            # the TARGET/SOURCES/MODE labels — dim gray
+STAGE_SEP = MUTED              # the "›" separator — muted
+STAGE_DOMAIN = "bold white"    # the target domain value — bold white
+STAGE_COUNT = "bold yellow"    # the count value — bold yellow
+STAGE_MODE = "white"           # the MODE value
+
+_STAGE_LABEL_W = 8             # pad labels to a common width — wide enough that even the
+                               # longest ("SOURCES") keeps a space before the "›" separator
 
 
-def stage_header(title: str, subtitle: str = ""):
-    """Build the shared per-stage header renderable (used by all 6 pipeline stages).
+def _stage_info_row(label: str, value, value_style: str):
+    """One aligned 'LABEL  ›  value' info row for a stage header."""
+    from rich.text import Text
+    row = Text("    ")                                   # 4-space indent under the header
+    row.append(f"{label:<{_STAGE_LABEL_W}}", style=STAGE_LABEL)
+    row.append("›  ", style=STAGE_SEP)
+    if isinstance(value, Text):
+        row.append_text(value)
+    else:
+        row.append(str(value), style=value_style)
+    return row
 
-    Style (FINAL warm palette): an ORANGE vertical bar (▌) on each line, the stage TITLE bold
-    orange (matching the bar), the subtitle dim gray — no boxes/dividers.
+
+def stage_header(stage: str, subtitle: str, info: list[tuple[str, object, str]] | None = None):
+    """Build the shared, PERMANENT per-stage header used by all 6 pipeline stages.
+
+    Renders exactly::
+
+        [◆] KAALYX::<STAGE>
+            <subtitle>
+
+            LABEL   ›  value
+            ...
+
+    * *stage* — the uppercase stage name (``"OSINT"``, ``"SUBDOMAINS"``, …); the title is always
+      ``[◆] KAALYX::<STAGE>`` in bold orange (the locked warm palette).
+    * *subtitle* — the dim-gray line under the title (e.g. "initializing passive recon engine...").
+    * *info* — ordered ``(label, value, value_style)`` rows (TARGET/SOURCES/MODE/…); label dim,
+      "›" muted, value in the given style. Only the stage name, subtitle and these values change
+      between stages — the format and palette never do.
     """
     from rich.console import Group
     from rich.text import Text
 
-    line1 = Text.assemble(("▌ ", STAGE_BAR), (title, STAGE_TITLE))
-    parts = [line1]
-    if subtitle:
-        parts.append(Text.assemble(("▌ ", STAGE_BAR), (subtitle, STAGE_SUBTITLE)))
+    parts = [
+        Text.assemble(("[◆] ", STAGE_TITLE), (f"KAALYX::{stage}", STAGE_TITLE)),
+        Text.assemble(("    ", ""), (subtitle, STAGE_SUBTITLE)),
+    ]
+    if info:
+        parts.append(Text(""))
+        for label, value, style in info:
+            parts.append(_stage_info_row(label, value, style))
     return Group(*parts)
 
 

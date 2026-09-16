@@ -297,10 +297,11 @@ def format_duration(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 def print_banner(domain: str, source_count: int) -> None:
-    """Print the OSINT stage header (Style 3: accent bar + bold title + dim subtitle),
-    preceded by the main banner, then a target/source-count line."""
+    """Print the OSINT stage header in the PERMANENT ``[◆] KAALYX::<STAGE>`` format, preceded by
+    the main banner. Only the stage name/subtitle and the TARGET/SOURCES/MODE values differ
+    between stages — the format and palette are locked (see :func:`ui.stage_header`)."""
     from . import (print_main_banner, stage_header,
-                   STAGE_LABEL, STAGE_DOMAIN, STAGE_COUNT)
+                   STAGE_DOMAIN, STAGE_COUNT, STAGE_MODE)
 
     console = get_console()
 
@@ -308,15 +309,16 @@ def print_banner(domain: str, source_count: int) -> None:
     print_main_banner()
     console.print()
 
-    console.print(stage_header("OSINT", "Passive Footprinting & Intelligence Gathering"))
-    # Target line uses the warm-palette values: "target" label dim, domain red, count yellow.
-    target_line = Text.assemble(
-        ("target ", STAGE_LABEL),
-        (domain, STAGE_DOMAIN),
-        ("   ", ""),
-        (f"{source_count} sources", STAGE_COUNT),
-    )
-    console.print(target_line)
+    console.print(stage_header(
+        "OSINT",
+        "initializing passive recon engine...",
+        info=[
+            ("TARGET", domain, STAGE_DOMAIN),
+            ("SOURCES", f"{source_count} registered", STAGE_COUNT),
+            ("MODE", "passive · queries third-party data, no packets to the target",
+             STAGE_MODE),
+        ],
+    ))
     console.print()
 
 

@@ -101,12 +101,27 @@ def main_banner():
 
     from .. import __version__
 
-    version_line = Text.assemble(
+    # Show the installed commit next to the version so a STALE install is immediately visible —
+    # e.g. an old pipx build that predates a source/fix (the "MOBILE_APPS missing / key not read
+    # even though update was run" class of confusion). Best-effort; never breaks the banner.
+    sha = None
+    try:
+        from ..core.updater import installed_commit
+        sha = installed_commit(timeout=2.0)
+    except Exception:
+        sha = None
+
+    version_bits = [
         ("    ", ""),
         (f"v{__version__}", "bold yellow"),
+    ]
+    if sha:
+        version_bits += [(" (", MUTED), (sha, "yellow"), (")", MUTED)]
+    version_bits += [
         ("  |  ", MUTED),
         ("Automated Recon & Vulnerability Engine", "bold green"),
-    )
+    ]
+    version_line = Text.assemble(*version_bits)
 
     return Group(
         Text(_BANNER_ART, style="bold red"),

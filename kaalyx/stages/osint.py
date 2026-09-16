@@ -68,6 +68,7 @@ SOURCE_LABELS: dict[str, str] = {
     "third_party_misconfig": "3rd-party misconfig",
     "api_leaks": "API leaks (Postman/Swagger)",
     "exposed_git": "Exposed .git",
+    "firebase": "Firebase RTDB exposure",
     "github_actions": "GitHub Actions audit",
     "google_dorks": "Google dorks",
     "shodan_org": "Shodan org/ASN",
@@ -105,6 +106,7 @@ class OsintStage(Stage):
             "third_party_misconfig": (osint_cfg.third_party_misconfig, self._src_misconfig),
             "api_leaks": (osint_cfg.api_leaks, self._src_api_leaks),
             "exposed_git": (osint_cfg.exposed_git, self._src_exposed_git),
+            "firebase": (osint_cfg.firebase, self._src_firebase),
             "github_actions": (osint_cfg.github_actions, self._src_github_actions),
             "google_dorks": (osint_cfg.google_dorks, self._src_google_dorks),
             "shodan_org": (osint_cfg.shodan_org, self._src_shodan_org),
@@ -816,6 +818,35 @@ class OsintStage(Stage):
                 res.findings.append(finding)
         if not res.findings:
             res.note = "no exposed .git found"
+        return res
+
+    async def _src_firebase(self) -> SourceResult:
+        """Check for an exposed Firebase Realtime Database (keyless, in-process).
+
+        Distinct from the generic cloud_enum/s3scanner bucket checks: a Firebase RTDB has its
+        own REST exposure pattern (``https://<id>.firebaseio.com/.json`` and the regional
+        ``firebasedatabase.app`` variants). Candidate project ids reuse the SAME keyword
+        variants as cloud-bucket enumeration. A world-readable DB is MEDIUM; if a
+        non-destructive empty-merge PATCH is also accepted it is world-writable → HIGH. Always
+        writes a dedicated raw file listing the candidates probed."""
+        res = SourceResult(name="firebase", raw_ext="txt")
+        candidates = osint_inproc._firebase_candidates(self.ctx.target)
+        records, findings = await osint_inproc.check_firebase_exposure(candidates)
+        res.osint, res.findings = records, findings
+        # Raw file: what we probed + any exposures (so the artifact exists even with 0 hits).
+        raw_lines = [f"# firebase candidates probed: {', '.join(candidates)}",
+                     f"# host families: firebaseio.com + firebasedatabase.app regional", ""]
+        if findings:
+            for f in findings:
+                raw_lines.append(f"[{f.severity.value.upper()}] {f.target} — {f.title}")
+        else:
+            raw_lines.append("# no exposed Firebase Realtime Database found")
+        res.raw = "\n".join(raw_lines)
+        if not findings:
+            res.note = f"no exposure ({len(candidates)} candidate(s) probed)"
+        else:
+            hi = sum(1 for f in findings if f.severity.value == "high")
+            res.note = f"{len(findings)} exposed DB(s)" + (f", {hi} writable" if hi else "")
         return res
 
     async def _src_github_actions(self) -> SourceResult:

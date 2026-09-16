@@ -218,6 +218,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "third_party_misconfig": "3RDPARTY_MISCONFIG",
     "api_leaks": "API_LEAKS[postman/swagger]",
     "exposed_git": "EXPOSED_GIT",
+    "firebase": "FIREBASE_RTDB[exposure]",
     "github_actions": "GITHUB_ACTIONS[gato]",
     "google_dorks": "GOOGLE_DORKS",
     "breach_lookup": "BREACH_LOOKUP[h8mail]",

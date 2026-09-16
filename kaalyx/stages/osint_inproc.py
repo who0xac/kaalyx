@@ -699,6 +699,150 @@ async def check_exposed_git(host: str) -> Finding | None:
     return None
 
 
+# Firebase Realtime Database exposure ------------------------------------------------------
+# A Firebase RTDB is reachable over a plain REST endpoint at the database root + ``.json``.
+# Two host families exist: the classic ``<id>.firebaseio.com`` and the newer regional
+# ``<id>.<region>.firebasedatabase.app`` (and the ``-default-rtdb`` instance suffix). A DB
+# that answers with data (or ``null``) instead of a permission-denied error is world-readable.
+_FIREBASE_REGIONS = [
+    "firebaseio.com",                       # classic (us-central1)
+    "asia-southeast1.firebasedatabase.app",
+    "europe-west1.firebasedatabase.app",
+    "us-central1.firebasedatabase.app",
+]
+# Keys whose VALUES look sensitive — redacted in the preview so we never copy a third party's
+# exposed secrets verbatim into our logs (distinct from the no-mask rule for OUR OWN findings).
+_FIREBASE_SENSITIVE_KEY = re.compile(
+    r"pass|pwd|secret|token|api[_-]?key|apikey|auth|credential|private|session|cookie|ssn|card",
+    re.IGNORECASE,
+)
+
+
+def _firebase_candidates(target) -> list[str]:
+    """Candidate Firebase project-id names, using the SAME variants as cloud-bucket enumeration:
+    the bare base label, the full registrable domain, its dotted-to-hyphen form, and the
+    hyphen-collapsed base. Also adds the ``<base>-default-rtdb`` default-instance name Firebase
+    assigns new projects. Order-preserving, de-duplicated."""
+    reg = target.registrable
+    base = reg.split(".")[0]
+    variants = [base, reg, reg.replace(".", "-")]
+    if "-" in base:
+        variants.append(base.replace("-", ""))
+    variants.append(f"{base}-default-rtdb")  # Firebase's default RTDB instance name
+    seen: set[str] = set()
+    return [v for v in variants if v and not (v in seen or seen.add(v))]
+
+
+def _firebase_preview(text: str, limit: int = 300) -> str:
+    """A short, safe preview of an exposed DB's JSON: redact values under sensitive-looking keys
+    and truncate, so we evidence the exposure without dumping (or copying secrets from) the DB.
+    """
+    import json as _json
+
+    def _redact(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if _FIREBASE_SENSITIVE_KEY.search(str(k)):
+                    out[k] = f"[redacted:{len(str(v))}]"
+                else:
+                    out[k] = _redact(v)
+            return out
+        if isinstance(obj, list):
+            return [_redact(x) for x in obj[:5]]  # cap list previews too
+        return obj
+
+    try:
+        data = _json.loads(text)
+        preview = _json.dumps(_redact(data), separators=(",", ":"))
+    except (ValueError, TypeError):
+        preview = text  # not JSON we can parse — fall back to raw truncation
+    preview = preview.strip()
+    if len(preview) > limit:
+        preview = preview[:limit] + f"… (+{len(preview) - limit} more chars, truncated)"
+    return preview
+
+
+async def check_firebase_exposure(candidates: list[str]) -> tuple[list[OsintRecord], list[Finding]]:
+    """Check candidate Firebase project ids for an exposed Realtime Database.
+
+    For each candidate × host-family, GET ``https://<id>.<host>/.json``. A permission-denied
+    error means the DB is secured (no finding). Any other data-bearing response means the DB is
+    WORLD-READABLE. For a readable DB we then probe writability with a NON-DESTRUCTIVE
+    ``PATCH .json`` carrying an empty object ``{}`` — this makes Firebase evaluate the write
+    rules while merging zero keys, so nothing is created, changed or deleted; a 200 means the DB
+    is also world-WRITABLE. Severity: HIGH if writable, MEDIUM if read-only. A small, redacted,
+    truncated JSON preview is captured as evidence (never the full DB).
+
+    Keyless. Returns ``(records, findings)``; never raises (per-candidate errors are skipped).
+    """
+    records: list[OsintRecord] = []
+    findings: list[Finding] = []
+    seen_urls: set[str] = set()
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for cid in candidates:
+            for host in _FIREBASE_REGIONS:
+                base = f"https://{cid}.{host}"
+                url = f"{base}/.json"
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                try:
+                    resp = await client.get(url)
+                except httpx.HTTPError as exc:
+                    logger.debug("firebase probe failed for %s: %s", url, exc)
+                    continue
+
+                body = resp.text or ""
+                low = body.lower()
+                # Secured DBs answer 401/403 with {"error":"Permission denied"}; non-existent
+                # projects answer 404 or a "not found"/deprecated error. Neither is exposure.
+                if resp.status_code in (401, 403) or '"error"' in low and (
+                    "permission denied" in low or "not found" in low or "deprecated" in low):
+                    logger.debug("firebase %s: secured/absent (HTTP %s)", url, resp.status_code)
+                    continue
+                if resp.status_code != 200:
+                    continue
+                # 200 with an error body is still not real exposure.
+                if '"error"' in low and "permission denied" in low:
+                    continue
+
+                # Exposed & readable. Empty DB legitimately returns the literal ``null``.
+                preview = _firebase_preview(body)
+                records.append(OsintRecord(kind="firebase_db", value=base,
+                                           detail=f"exposed (readable): {preview}",
+                                           source="firebase"))
+
+                # Non-destructive writability probe: PATCH an empty object at root.
+                writable = False
+                try:
+                    wresp = await client.patch(url, content=b"{}",
+                                               headers={"content-type": "application/json"})
+                    # A writable DB accepts the no-op merge (200). Secured write rules reject it.
+                    writable = wresp.status_code == 200
+                except httpx.HTTPError as exc:
+                    logger.debug("firebase write-probe failed for %s: %s", url, exc)
+
+                sev = Severity.HIGH if writable else Severity.MEDIUM
+                access = "READ+WRITE" if writable else "read-only"
+                findings.append(Finding(
+                    title=f"Exposed Firebase Realtime Database ({access}): {cid}",
+                    category="cloud", severity=sev, confidence=Confidence.FIRM,
+                    target=base, tool="firebase",
+                    description=(f"The Firebase Realtime Database at {url} is publicly "
+                                 f"{'readable and WRITABLE' if writable else 'readable'} — it "
+                                 "returned data instead of a permission-denied error"
+                                 + (". A non-destructive empty-merge PATCH was accepted, so "
+                                    "anyone can also modify the data." if writable else ".")),
+                    evidence=f"GET {url} → HTTP 200\npreview: {preview}",
+                    reference=url, raw=preview))
+                # A project's RTDB lives on ONE host family; once found, don't re-report it
+                # across the other regional domains for the same candidate id.
+                break
+    return records, findings
+
+
 async def harvest_emails(domain: str) -> list[Email]:
     """Keyless email harvesting from email-format.com and skymem.info.
 

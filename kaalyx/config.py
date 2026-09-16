@@ -196,6 +196,7 @@ class OsintConfig:
     third_party_misconfig: bool = True  # misconfig-mapper (external tool)
     api_leaks: bool = True           # porch-pirate (Postman) + SwaggerSpy (external tools)
     exposed_git: bool = True         # in-process /.git/config detection (keyless)
+    firebase: bool = True            # Firebase Realtime DB exposure check (keyless)
     github_actions: bool = True      # gato — GitHub Actions audit (external tool, needs token)
     google_dorks: bool = True        # dork URL generation (no scraping)
     # Shodan-backed OSINT (needs SHODAN_API_KEY; each skips cleanly without it or when the

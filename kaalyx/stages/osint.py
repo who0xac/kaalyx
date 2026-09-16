@@ -115,33 +115,50 @@ class OsintStage(Stage):
         if (osint_cfg.trufflehog or osint_cfg.github_actions) and ctx.secrets.has_github:
             await self._discover_github_org()
 
-        # Live progress board that updates in place as sources start/finish. Silence the
-        # console log handler while the board owns the screen so the two don't interleave
-        # (the file log keeps capturing everything).
+        # Live progress board that updates in place. EVERYTHING — the concurrent fan-out AND
+        # the post-steps (breach_lookup, leak_search) — runs inside this one board; the console
+        # log handler is silenced for the whole span so no per-source lines print outside it
+        # (the file log keeps capturing everything). Post-steps are shown as rows too, queued
+        # up front, so the full pipeline is visible.
         from ..core.logging import set_console_logging
 
         labels = {name: SOURCE_LABELS.get(name, name) for name in sources}
-        progress = osint_ui.OsintProgress(labels)
+        # Post-step rows (only when enabled) so they appear queued from the start.
+        if ctx.config.osint.breach_lookup:
+            labels["breach_lookup"] = SOURCE_LABELS.get("breach_lookup", "breach_lookup")
+        if ctx.config.osint.leak_search:
+            labels["leak_search"] = SOURCE_LABELS.get("leak_search", "leak_search")
+        progress = osint_ui.OsintProgress(labels, target=ctx.domain)
+        self._progress = progress
         set_console_logging(False)
         try:
             with progress.live():
                 results = await run_sources(sources, progress.hook)
+                # Breach lookup + LeakSearch run AFTER harvesting (they consume harvested
+                # emails), but INSIDE the board so their rows update live in place.
+                if ctx.config.osint.breach_lookup:
+                    progress.hook("start", "breach_lookup", None)
+                    await self._enrich_breaches(results)
+                    progress.hook("finish", "breach_lookup",
+                                  self._result_for("breach_lookup", results))
+                if ctx.config.osint.leak_search:
+                    progress.hook("start", "leak_search", None)
+                    await self._run_leak_search(results)
+                    progress.hook("finish", "leak_search",
+                                  self._result_for("leak_search", results))
         finally:
             set_console_logging(True)
-
-        # Breach lookup runs AFTER harvesting so it can enrich the emails we found
-        # (h8mail chaining). It's a post-step, not a concurrent source.
-        if ctx.config.osint.breach_lookup:
-            await self._enrich_breaches(results)
-
-        # LeakSearch also runs post-harvest so it can query both the domain and each
-        # harvested email against the ProxyNova/COMB credential dump for ACTUAL leaked
-        # passwords — value distinct from h8mail's breach membership. Post-step for the same
-        # reason: it consumes the harvested emails.
-        if ctx.config.osint.leak_search:
-            await self._run_leak_search(results)
+            self._progress = None
 
         return self._persist(results)
+
+    @staticmethod
+    def _result_for(name: str, results: list[SourceResult]) -> SourceResult:
+        """Return the appended post-step SourceResult by name (for the board finish hook)."""
+        for r in results:
+            if r.name == name:
+                return r
+        return SourceResult(name=name, ok=True)
 
     # -- persistence + rendering -------------------------------------------------------
 
@@ -425,7 +442,6 @@ class OsintStage(Stage):
         """
         if not self.ctx.runner.tool_available("LeakSearch") and \
                 not self.ctx.runner.tool_available("leaksearch"):
-            self.log.info("leak search skipped — LeakSearch not on PATH")
             results.append(SourceResult(name="leak_search", ok=True, skipped=True,
                                         note="skipped: LeakSearch not on PATH", raw_ext="json"))
             return
@@ -435,6 +451,11 @@ class OsintStage(Stage):
         keys: list[str] = [self.ctx.target.registrable]
         seen_emails = {e.address.lower() for r in results for e in r.emails}
         keys += sorted(seen_emails)
+
+        # Live N/total counter on the LEAKSEARCH board row (one increment per key queried).
+        prog = getattr(self, "_progress", None)
+        if prog is not None:
+            prog.set_progress("leak_search", 0, len(keys))
 
         stage_dir = self.ctx.writer.stage_dir(self.name)
         findings: list[Finding] = []
@@ -447,8 +468,9 @@ class OsintStage(Stage):
                 [binary, "-k", key, "-d", "ProxyNova", "-n", "100", "-o", str(outfile)],
                 timeout=600, label="LeakSearch",
             )
+            if prog is not None:
+                prog.set_progress("leak_search", i + 1, len(keys))
             if not out.started:
-                self.log.info("leak search skipped — LeakSearch not runnable")
                 results.append(SourceResult(name="leak_search", ok=True, skipped=True,
                                             note="skipped: LeakSearch not runnable",
                                             raw_ext="json"))
@@ -912,10 +934,14 @@ class OsintStage(Stage):
 
     async def _src_social(self) -> SourceResult:
         res = SourceResult(name="social")
-        records, _handles = await osint_inproc.discover_social_profiles(self.ctx.target.registrable)
+        records, _handles, blocked = await osint_inproc.discover_social_profiles(
+            self.ctx.target.registrable)
         res.osint = records
         if not records:
-            res.note = "no social profiles found"
+            # Distinguish "site blocked our request" (a WAF/403) from a genuine no-profiles
+            # result, so the empty file/row isn't misleading.
+            res.note = ("homepage blocked (WAF/403) — no social profiles readable"
+                        if blocked else "no social profiles found")
         return res
 
     async def _src_google_dorks(self) -> SourceResult:

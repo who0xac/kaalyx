@@ -198,6 +198,37 @@ def _skip_note(note: str) -> str:
     return n
 
 
+# Source name -> the hacker-terminal display name (UPPERCASE_SNAKE with optional [context]).
+# Keyed by the internal source name; falls back to upper-casing the name if absent.
+_DISPLAY_NAMES: dict[str, str] = {
+    "whois": "WHOIS",
+    "dns": "DNS_RECORDS[dnsx]",
+    "ip_info": "IP_INTEL[geo/asn]",
+    "mail_dns": "MAIL_DNS_SEC",
+    "m365": "M365_TENANT",
+    "email_harvest": "EMAIL_HARVEST",
+    "social": "SOCIAL_PROFILES",
+    "github_subdomains": "GITHUB_SUBDOMAINS",
+    "trufflehog": "TRUFFLEHOG[org]",
+    "cloud_enum": "CLOUD_ENUM",
+    "s3scanner": "S3_SCANNER",
+    "badsecrets": "BADSECRETS",
+    "retirejs": "RETIRE_JS",
+    "theharvester": "THEHARVESTER",
+    "third_party_misconfig": "3RDPARTY_MISCONFIG",
+    "api_leaks": "API_LEAKS[postman/swagger]",
+    "exposed_git": "EXPOSED_GIT",
+    "github_actions": "GITHUB_ACTIONS[gato]",
+    "google_dorks": "GOOGLE_DORKS",
+    "breach_lookup": "BREACH_LOOKUP[h8mail]",
+    "leak_search": "LEAKSEARCH",
+}
+
+
+def _display_name(source_name: str, fallback_label: str = "") -> str:
+    return _DISPLAY_NAMES.get(source_name) or source_name.upper() or fallback_label
+
+
 @dataclass
 class _SourceState:
     label: str
@@ -207,6 +238,9 @@ class _SourceState:
     note: str = ""
     started: float = 0.0
     finished: float = 0.0
+    # Optional live progress "done/total" for a running source (e.g. LEAKSEARCH 23/47).
+    prog_done: int = 0
+    prog_total: int = 0
 
 
 class OsintProgress:
@@ -222,13 +256,23 @@ class OsintProgress:
     sub-check's state at a glance rather than a silent wait.
     """
 
-    def __init__(self, labels: dict[str, str]) -> None:
+    def __init__(self, labels: dict[str, str], target: str = "") -> None:
         self._console = get_console()
+        self._target = target
         self._states: dict[str, _SourceState] = {
             name: _SourceState(label=label) for name, label in labels.items()
         }
         self._live = None
         self._start = time.monotonic()
+
+    def set_progress(self, name: str, done: int, total: int) -> None:
+        """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Redraws
+        the SAME row in place — never prints a new line."""
+        st = self._states.get(name)
+        if st is None:
+            return
+        st.prog_done, st.prog_total = done, total
+        self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
         """The progress hook passed to ``run_sources``."""
@@ -253,69 +297,133 @@ class OsintProgress:
                 st.state = "done"
         self._refresh()
 
-    def _elapsed_for(self, st: "_SourceState", now: float) -> str:
-        """Per-source elapsed time: live (now - started) while running, frozen at
-        (finished - started) once done/skipped/failed, blank while still queued."""
-        if st.started <= 0:
-            return ""
-        end = st.finished if st.finished > 0 else now
-        return format_duration(max(0.0, end - st.started))
+
+    # Column geometry for the source rows (aligned; leaders fill the middle).
+    _NAME_W = 30      # width reserved for "NAME[context]" before the dotted leader
+    _RESULT_W = 9     # right-aligned result field ("00 hits" / "RUNNING" / "23/47")
+    _BAR_W = 46       # progress-bar inner width
+
+    def _mmss(self, secs: float) -> str:
+        """Time for the bar/running rows: 'S.Ss' under a minute, zero-padded 'MM:SS' at/above
+        (e.g. 5.2s, 02:25), and 'H:MM:SS' past an hour."""
+        secs = max(0.0, secs)
+        if secs < 60:
+            return f"{secs:0.1f}s"
+        total = int(round(secs))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _progress_bar(self, done: int, total: int) -> "Text":
+        """[=====>....] filled with '=', a '>' arrowhead at the leading edge, '.' unfilled."""
+        total = max(total, 1)
+        filled = int(round(self._BAR_W * done / total))
+        filled = min(filled, self._BAR_W)
+        if filled <= 0:
+            inner = "." * self._BAR_W
+        elif filled >= self._BAR_W:
+            inner = "=" * self._BAR_W
+        else:
+            inner = ("=" * (filled - 1)) + ">" + ("." * (self._BAR_W - filled))
+        return Text.assemble(("[", ACCENT_DIM), (inner, ACCENT), ("]", ACCENT_DIM))
+
+    def _row(self, st: "_SourceState", name: str, now: float, frame: str) -> "Text":
+        """One source row: '[icon] NAME ......... RESULT :: TIME' (name = display name)."""
+        # --- status icon + name/result/time by state ---
+        note = ""
+        show_time = True
+        if st.state == "running":
+            icon = Text("~", style="bold cyan")
+            name_style = "bold white"
+            # LEAKSEARCH-style live counter, else "RUNNING".
+            if st.prog_total > 0:
+                result = Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
+            else:
+                result = Text("RUNNING", style="cyan")
+        elif st.state == "done":
+            icon = Text("✓", style="bold green")
+            name_style = "white"
+            result = Text(f"{min(st.items, 99):02d} hits", style="green")
+        elif st.state == "not_installed":
+            icon = Text("✘", style="bold orange1")
+            name_style = "orange1"
+            result = Text("not installed", style="bold orange1")
+            note = "run: kaalyx tools --install"
+            show_time = False
+        elif st.state == "no_key":
+            icon = Text(" ", style=MUTED)
+            name_style = "yellow"
+            result = Text("no key", style="yellow")
+            note = _skip_note(st.note)
+            show_time = False
+        elif st.state == "skipped":
+            icon = Text(" ", style=MUTED)
+            name_style = MUTED
+            result = Text("skipped", style=MUTED)
+            note = _skip_note(st.note)
+            show_time = False
+        elif st.state == "failed":
+            icon = Text("✘", style="bold red")
+            name_style = "red"
+            result = Text("FAILED", style="bold red")
+            note = st.note
+            show_time = False
+        else:  # queued
+            icon = Text(" ", style=MUTED)
+            name_style = MUTED
+            result = Text("queued", style=MUTED)
+            show_time = False
+
+        # Dotted leader: name, then dots to fill, then result. Compute visible widths.
+        name_txt = Text(name, style=name_style)
+        # dots between name and result (leave a space each side)
+        result_len = len(result.plain)
+        pad = max(1, self._NAME_W + self._RESULT_W - len(name) - result_len)
+        line = Text("    ")                         # 4-space indent
+        line.append("[", style=MUTED)
+        line.append_text(icon)
+        line.append("] ", style=MUTED)
+        line.append_text(name_txt)
+        line.append(" " + "." * pad + " ", style=MUTED)
+        line.append_text(result)
+        if show_time:
+            end = st.finished if st.finished > 0 else now
+            t = self._mmss(max(0.0, end - st.started)) if st.started > 0 else ""
+            line.append(" :: ", style=MUTED)
+            line.append(f"{t:>5}", style="white" if st.state == "done" else "cyan")
+        elif note:
+            # Keep the row on ONE line — trim an over-long note so the board never wraps.
+            n = note if len(note) <= 40 else note[:39] + "…"
+            line.append("  ", style=MUTED)
+            line.append(n, style=MUTED)
+        return line
 
     def _render(self):
-        table = Table.grid(padding=(0, 1))
-        table.add_column(width=2)          # icon
-        table.add_column(width=22)         # label
-        table.add_column(width=10)         # state
-        table.add_column(justify="right", width=6)  # items
-        table.add_column(justify="right", width=8)   # per-source elapsed
-        table.add_column(ratio=1, style=MUTED)       # note
-
         now = time.monotonic()
         frame = _SPINNER_FRAMES[int((now * 12)) % len(_SPINNER_FRAMES)]
-        for st in self._states.values():
-            note = ""
-            if st.state == "running":
-                icon, state_txt = Text(frame, style=ACCENT), Text("running", style="cyan")
-            elif st.state == "done":
-                icon, state_txt = Text("✔", style="green"), Text("done", style="green")
-            elif st.state == "not_installed":
-                # Most actionable: tool isn't installed. Urgent orange ✘ + how to fix.
-                icon = Text("✘", style="bold orange1")
-                state_txt = Text("not installed", style="bold orange1")
-                note = "run: kaalyx tools --install"
-            elif st.state == "no_key":
-                # Deliberate no-key skip — yellow, less urgent than a missing tool.
-                icon, state_txt = Text("○", style="yellow"), Text("no key", style="yellow")
-                note = _skip_note(st.note)
-            elif st.state == "skipped":
-                # No-input / clean deliberate skip — dim.
-                icon, state_txt = Text("○", style=MUTED), Text("skipped", style=MUTED)
-                note = _skip_note(st.note)
-            elif st.state == "failed":
-                icon, state_txt = Text("✘", style="red"), Text("failed", style="bold red")
-                note = st.note
-            else:
-                icon, state_txt = Text("·", style=MUTED), Text("queued", style=MUTED)
-            items = str(st.items) if st.state == "done" and st.items else ""
-            # Per-source elapsed: live while running (so the user sees which source is slow in
-            # real time), frozen once finished. Dim while running, brighter when settled.
-            elapsed_txt = Text(
-                self._elapsed_for(st, now),
-                style=MUTED if st.state == "running" else "white",
-            )
-            table.add_row(icon, Text(st.label, style="white"), state_txt, items, elapsed_txt,
-                          Text(note, style=MUTED))
-
+        total = len(self._states)
         done = sum(1 for s in self._states.values()
                    if s.state not in ("queued", "running"))
+
+        lines = []
+        # 1) Header: [◆] OSINT :: <target>  (orange accent)
+        lines.append(Text.assemble(("[◆] ", "bold orange1"), ("OSINT", "bold orange1"),
+                                    (" :: ", MUTED), (self._target or "", "bold orange1")))
+        lines.append(Text(""))
+        # 2) Progress bar + N/total :: elapsed
         elapsed = time.monotonic() - self._start
-        header = Text.assemble(
-            ("running OSINT sources  ", "bold white"),
-            (f"{done}/{len(self._states)}", ACCENT),
-            (f"   {format_duration(elapsed)}", MUTED),
-        )
-        return Panel(table, title=header, title_align="left",
-                     border_style=ACCENT_DIM, box=ROUNDED, padding=(0, 1))
+        bar = self._progress_bar(done, total)
+        bar_line = Text("    ")
+        bar_line.append_text(bar)
+        bar_line.append(f" {done}/{total} ", style="white")
+        bar_line.append(":: ", style=MUTED)
+        bar_line.append(self._mmss(elapsed), style="white")
+        lines.append(bar_line)
+        lines.append(Text(""))
+        # 3) One row per source, in insertion order (pipeline order).
+        for name, st in self._states.items():
+            lines.append(self._row(st, _display_name(name, st.label), now, frame))
+        return Group(*lines)
 
     def _refresh(self) -> None:
         if self._live is not None:

@@ -1083,30 +1083,54 @@ _SOCIAL_IGNORE = {"share", "sharer", "intent", "home", "login", "signup", "about
                   "privacy", "policies", "tos", "legal", "features"}
 
 
-async def discover_social_profiles(domain: str) -> tuple[list[OsintRecord], list[str]]:
+async def discover_social_profiles(domain: str) -> tuple[list[OsintRecord], list[str], bool]:
     """Find the org's social profiles from its homepage. Keyless.
 
     Fetches the apex over https (then http) and extracts social-media profile links from the
-    HTML — one lightweight page fetch, NOT a crawl. Returns ``(records, github_handles)``;
+    HTML — one lightweight page fetch, NOT a crawl. Returns ``(records, github_handles, blocked)``
+    where *blocked* is True when the homepage returned a bot-block page (403/429/…) so the
+    caller can say "homepage blocked" instead of the misleading "no profiles found";
     the GitHub/GitLab handles are candidate org names that strengthen org discovery.
     """
     records: list[OsintRecord] = []
     handles: list[str] = []
     seen: set[str] = set()
     html = ""
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
-                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
-        for scheme in ("https", "http"):
-            try:
-                resp = await client.get(f"{scheme}://{domain}/")
-                if resp.status_code < 400 and resp.text:
+    blocked = False
+    # A realistic browser User-Agent + Accept headers — an obvious bot UA is more likely to be
+    # challenged/blocked by a WAF (Cloudflare etc.). We also try the apex and www., http and
+    # https, and parse the body EVEN on a 4xx/5xx block page (its markup may still leak the
+    # footer social links); only a truly empty body is a dead end.
+    browser_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    headers = {
+        "user-agent": browser_ua,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+    }
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        for host in (domain, f"www.{domain}"):
+            for scheme in ("https", "http"):
+                try:
+                    resp = await client.get(f"{scheme}://{host}/")
+                except httpx.HTTPError as exc:
+                    logger.debug("social homepage %s://%s failed: %s", scheme, host, exc)
+                    continue
+                if resp.text:
                     html = resp.text
-                    break
-            except httpx.HTTPError as exc:
-                logger.debug("social homepage %s://%s failed: %s", scheme, domain, exc)
-                continue
+                    # A 403/429/503 with a short body is almost certainly a bot-block page.
+                    if resp.status_code in (401, 403, 405, 406, 429, 503):
+                        blocked = True
+                    # Stop as soon as we have a body that actually carries social links.
+                    if any(s in html.lower() for s in ("facebook.com", "linkedin.com",
+                                                       "twitter.com", "youtube.com",
+                                                       "instagram.com", "github.com")):
+                        blocked = False
+                        break
+            if html and not blocked:
+                break
     if not html:
-        return records, handles
+        return records, handles, blocked
     for platform, pat in _SOCIAL_PATTERNS.items():
         for m in pat.finditer(html):
             handle = (m.group(m.lastindex) if m.lastindex else m.group(1)).strip("/").lower()
@@ -1120,4 +1144,7 @@ async def discover_social_profiles(domain: str) -> tuple[list[OsintRecord], list
                                        detail=platform, source="social"))
             if platform in ("github", "gitlab"):
                 handles.append(handle)
-    return records, handles
+    # If we found links, we weren't really blocked (some WAFs serve a partial page with links).
+    if records:
+        blocked = False
+    return records, handles, blocked

@@ -738,19 +738,28 @@ def _finding_card(row):
     body.add_row(Text(sev.upper(), style=severity_style(sev)), _verified_cell(row))
     tgt = _row_get(row, "target")
     if tgt:
-        body.add_row("Target", tgt)
-    # evidence is newline-separated "Label: value" lines (from the parser) — show each on
-    # its own row; fall back to the description for findings without structured evidence.
+        body.add_row("Target", Text(tgt))
+    # evidence is newline-separated lines. Some are structured "Label: value" (from the Postman
+    # parser); others are free text that legitimately contains a colon (a URL like
+    # ``https://host/.json``, ``preview: {...}`` with JSON). Only split on the first colon when
+    # the part before it looks like a short label — no spaces, no slashes, and reasonably short —
+    # so a colon inside a URL/value never gets mistaken for a label separator.
     ev = _row_get(row, "evidence")
     if "\n" in ev:
         for line in ev.split("\n"):
-            if ":" in line:
+            head = line.partition(":")[0]
+            is_label = (":" in line and head.strip()
+                        and " " not in head.strip() and "/" not in head
+                        and len(head.strip()) <= 16)
+            # Wrap value cells in Text() so a value containing rich-markup brackets — a full
+            # secret value, or a "[redacted:N]" marker — renders literally, never as markup.
+            if is_label:
                 lbl, _, val = line.partition(":")
-                body.add_row(lbl.strip(), val.strip())
+                body.add_row(lbl.strip(), Text(val.strip()))
             elif line.strip():
-                body.add_row("", line.strip())
+                body.add_row("", Text(line.strip()))
     else:
-        body.add_row("Detail", ev or _row_get(row, "description"))
+        body.add_row("Detail", Text(ev or _row_get(row, "description")))
     return Panel(body, title=Text(title, style="bold white"), title_align="left",
                  border_style=severity_style(sev), box=ROUNDED, padding=(0, 1))
 

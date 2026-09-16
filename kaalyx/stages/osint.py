@@ -161,21 +161,30 @@ class OsintStage(Stage):
         progress = osint_ui.OsintProgress(labels, target=ctx.domain)
         self._progress = progress
         set_console_logging(False)
+
+        # Wrap the UI hook so that as EACH source finishes we immediately flush its raw file to
+        # disk — completed sources' data is then durable if a later source crashes, and can be
+        # inspected while the rest still run (same per-unit-of-work durability as checkpoints).
+        def _hook(event: str, name: str, result) -> None:
+            progress.hook(event, name, result)
+            if event == "finish" and result is not None:
+                self._flush_source(result)
+
         try:
             with progress.live():
-                results = await run_sources(sources, progress.hook)
+                results = await run_sources(sources, _hook)
                 # Breach lookup + LeakSearch run AFTER harvesting (they consume harvested
                 # emails), but INSIDE the board so their rows update live in place.
                 if ctx.config.osint.breach_lookup:
-                    progress.hook("start", "breach_lookup", None)
+                    _hook("start", "breach_lookup", None)
                     await self._enrich_breaches(results)
-                    progress.hook("finish", "breach_lookup",
-                                  self._result_for("breach_lookup", results))
+                    _hook("finish", "breach_lookup",
+                          self._result_for("breach_lookup", results))
                 if ctx.config.osint.leak_search:
-                    progress.hook("start", "leak_search", None)
+                    _hook("start", "leak_search", None)
                     await self._run_leak_search(results)
-                    progress.hook("finish", "leak_search",
-                                  self._result_for("leak_search", results))
+                    _hook("finish", "leak_search",
+                          self._result_for("leak_search", results))
         finally:
             set_console_logging(True)
             self._progress = None
@@ -314,32 +323,44 @@ class OsintStage(Stage):
             lines.append(f"{r.name:22} {state:7} items={r.total}{note}")
         self.ctx.writer.write_lines(self.name, "_sources_status.txt", lines, sort=False)
 
-    def _write_raw_source_files(self, results: list[SourceResult]) -> None:
-        """Write ONE dedicated raw file per source, ALWAYS — even when a source was skipped or
-        found nothing (an empty file records that it ran). Uses the source's ``raw`` payload
-        (tool stdout / raw JSON) when it set one; otherwise dumps that source's own records as
-        text so in-process sources (m365, mail_dns, social, exposed_git, ip_info, …) also leave
-        a dedicated artifact on disk under ``osint/raw/<source>.<ext>``.
-        """
-        def _dump(r: SourceResult) -> str:
-            parts: list[str] = []
-            for o in r.osint:
-                parts.append(f"{o.kind}\t{o.value}" + (f"\t{o.detail}" if o.detail else ""))
-            for s in r.subdomains:
-                parts.append(f"subdomain\t{s.hostname}")
-            for e in r.emails:
-                parts.append(f"email\t{e.address}" + (f"\t{e.source}" if e.source else ""))
-            for e in r.employees:
-                parts.append(f"employee\t{e.name}" + (f"\t{e.role}" if e.role else ""))
-            for f in r.findings:
-                parts.append(f"finding\t[{f.severity.value}] {f.category}: {f.title}\t{f.target}"
-                             + (f"\t{f.evidence}" if f.evidence else ""))
-            return "\n".join(parts)
+    @staticmethod
+    def _dump_source(r: SourceResult) -> str:
+        """Text dump of a source's own records, used as the raw-file body when the source didn't
+        set an explicit ``raw`` payload (so in-process sources still leave a readable artifact)."""
+        parts: list[str] = []
+        for o in r.osint:
+            parts.append(f"{o.kind}\t{o.value}" + (f"\t{o.detail}" if o.detail else ""))
+        for s in r.subdomains:
+            parts.append(f"subdomain\t{s.hostname}")
+        for e in r.emails:
+            parts.append(f"email\t{e.address}" + (f"\t{e.source}" if e.source else ""))
+        for e in r.employees:
+            parts.append(f"employee\t{e.name}" + (f"\t{e.role}" if e.role else ""))
+        for f in r.findings:
+            parts.append(f"finding\t[{f.severity.value}] {f.category}: {f.title}\t{f.target}"
+                         + (f"\t{f.evidence}" if f.evidence else ""))
+        return "\n".join(parts)
 
-        for r in results:
-            content = r.raw if r.raw else _dump(r)
+    def _flush_source(self, r: SourceResult) -> None:
+        """Persist ONE source's raw file the moment it finishes, so completed sources' data is on
+        disk immediately — durable if a later source crashes/interrupts the scan, and inspectable
+        while the rest still run. Idempotent: called per-source on the finish hook, and the raw
+        pass at the end simply rewrites the same files. Never raises (a write error must not take
+        down the live scan)."""
+        try:
+            content = r.raw if r.raw else self._dump_source(r)
             header = r.note if (not content and r.note) else ""
             self.ctx.writer.raw_source_output(self.name, r.name, content, r.raw_ext, header)
+        except Exception as exc:  # noqa: BLE001 — a raw-file write must never break the scan
+            self.log.debug("per-source flush failed for %s: %s", r.name, exc)
+
+    def _write_raw_source_files(self, results: list[SourceResult]) -> None:
+        """Write ONE dedicated raw file per source, ALWAYS — even when a source was skipped or
+        found nothing (an empty file records that it ran). Sources are already flushed
+        individually as they finish (:meth:`_flush_source`); this final pass guarantees every
+        source has its file even if a finish hook was missed."""
+        for r in results:
+            self._flush_source(r)
 
     # -- breach enrichment (post-harvest chaining) -------------------------------------
 
@@ -1182,8 +1203,10 @@ class OsintStage(Stage):
     async def _src_shodan_org(self) -> SourceResult:
         res = SourceResult(name="shodan_org", raw_ext="txt")
         if not self.ctx.secrets.has_shodan:
+            diag = self.ctx.secrets.diagnose_key("SHODAN_API_KEY")
             res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
-            res.raw = "# skipped: SHODAN_API_KEY not set"
+            res.raw = f"# skipped: SHODAN_API_KEY not set\n# {diag}"
+            self.log.info("shodan skip — %s", diag)
             return res
         slugs = osint_inproc._company_slugs(self.ctx.target)
         known = set(await self._resolved_ips())
@@ -1202,8 +1225,10 @@ class OsintStage(Stage):
     async def _src_shodan_favicon(self) -> SourceResult:
         res = SourceResult(name="shodan_favicon", raw_ext="txt")
         if not self.ctx.secrets.has_shodan:
+            diag = self.ctx.secrets.diagnose_key("SHODAN_API_KEY")
             res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
-            res.raw = "# skipped: SHODAN_API_KEY not set"
+            res.raw = f"# skipped: SHODAN_API_KEY not set\n# {diag}"
+            self.log.info("shodan skip — %s", diag)
             return res
         apex = self.ctx.target.registrable
         live_hosts = [f"https://{apex}", f"https://www.{apex}"]
@@ -1241,8 +1266,10 @@ class OsintStage(Stage):
         but each resolves the same memoised IP set."""
         res = SourceResult(name=name, raw_ext="txt")
         if not self.ctx.secrets.has_shodan:
+            diag = self.ctx.secrets.diagnose_key("SHODAN_API_KEY")
             res.skipped, res.note = True, "skipped: SHODAN_API_KEY not set"
-            res.raw = "# skipped: SHODAN_API_KEY not set"
+            res.raw = f"# skipped: SHODAN_API_KEY not set\n# {diag}"
+            self.log.info("shodan skip — %s", diag)
             return res
         ips = await self._resolved_ips()
         if not ips:

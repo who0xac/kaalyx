@@ -950,6 +950,12 @@ def _do_update(verbose: bool = False) -> None:
             return
 
         # --- Step 2/3: prepare + reinstall via pipx (bar fills during the real reinstall). ---
+        # One-line note so a full reinstall doesn't read as a bug: pipx installs from a git ref,
+        # which has no in-place patch — every update replaces the whole venv. This is expected.
+        # progress.console.print renders cleanly ABOVE the live bar (no stop/start needed).
+        progress.console.print(
+            "[dim]Note: Kaalyx installs from GitHub via pipx, so each update is a full "
+            "reinstall of the package — normal for git-based installs, not a bug.[/]")
         # Pin the install to the exact remote commit so pip cannot serve a cached build.
         progress.update(task, description="Update found, preparing", completed=40)
         progress.update(task, description="Pulling latest changes", completed=45)

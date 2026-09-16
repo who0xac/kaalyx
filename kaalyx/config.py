@@ -364,12 +364,34 @@ class Secrets:
     breach_comp_path: str | None = None
     local_breach_path: str | None = None
 
+    # The config.env file these secrets were actually loaded from (``None`` = env-only). Recorded
+    # so a source can report EXACTLY which file was read when a key looks missing — the CWD's
+    # ./config.env silently wins over ~/.config/kaalyx/config.env, a common source of confusion.
+    env_path: "Path | None" = None
+
     # Round-robin cursor for GitHub token rotation (not persisted; per-process).
     _gh_cursor: int = 0
 
     @property
     def has_shodan(self) -> bool:
         return bool(self.shodan_api_key)
+
+    def diagnose_key(self, env_name: str) -> str:
+        """One-line, non-secret diagnostic for *env_name* (e.g. ``"SHODAN_API_KEY"``): which
+        config.env was read and whether that file/the environment actually defines the key
+        (masked). Used in skip messages so "no key" is never ambiguous about which file is in
+        play. Never prints the raw secret — only a short masked marker."""
+        where = str(self.env_path) if self.env_path else "no config.env found (environment only)"
+        file_has = ""
+        if self.env_path is not None:
+            try:
+                fv = dotenv_values(str(self.env_path)).get(env_name)
+                file_has = "set" if (fv and fv.strip()) else "blank/absent"
+            except Exception:  # noqa: BLE001
+                file_has = "unreadable"
+        env_present = bool((os.environ.get(env_name) or "").strip())
+        return (f"{env_name}: read from {where} (file={file_has or 'n/a'}, "
+                f"env={'set' if env_present else 'unset'})")
 
     @property
     def has_censys(self) -> bool:
@@ -455,6 +477,7 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
         h8mail_config=_get("H8MAIL_CONFIG"),
         breach_comp_path=_get("BREACH_COMP_PATH"),
         local_breach_path=_get("LOCAL_BREACH_PATH"),
+        env_path=Path(env_path) if env_path is not None else None,
     )
 
 

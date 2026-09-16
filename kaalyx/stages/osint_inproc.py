@@ -44,6 +44,16 @@ _TXT, _CAA = 16, 257
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+# Common/provider-default DKIM selectors to probe. DKIM selectors are NOT discoverable from
+# DNS (there's no enumeration), so the standard approach is to guess widely-used ones. A
+# not-found here is normal — the domain may use a custom selector we can't guess.
+_DKIM_SELECTORS = [
+    "default", "google", "selector1", "selector2", "s1", "s2", "k1", "k2",
+    "mail", "dkim", "smtp", "mandrill", "mailgun", "sendgrid", "amazonses",
+    "protonmail", "protonmail2", "protonmail3", "zoho", "zmail", "everlytickey1",
+    "everlytickey2", "mxvault", "dk", "dkim1", "sig1", "mailjet",
+]
+
 
 async def _doh_query(domain: str, rtype: str) -> list[dict]:
     """Low-level DoH query returning raw Answer dicts (empty on failure)."""
@@ -232,6 +242,7 @@ async def check_mail_dns_security(
                 )
             )
     else:
+        records.append(OsintRecord(kind="spf", value="not found", source=source))
         findings.append(
             Finding(
                 title="Missing SPF record",
@@ -264,6 +275,7 @@ async def check_mail_dns_security(
                 )
             )
     else:
+        records.append(OsintRecord(kind="dmarc", value="not found", source=source))
         findings.append(
             Finding(
                 title="Missing DMARC record",
@@ -305,6 +317,8 @@ async def check_mail_dns_security(
         )
 
     # --- BIMI / MTA-STS / TLS-RPT (informational presence checks) ---
+    # Emit a record for each ALWAYS — present with its value, or "not found" — so every checked
+    # record type is visible in the posture table rather than silently omitted.
     for label, kind in (
         (f"default._bimi.{domain}", "bimi"),
         (f"_mta-sts.{domain}", "mta_sts"),
@@ -315,12 +329,38 @@ async def check_mail_dns_security(
         hit = next((t for t in txt if t.lower().startswith(prefix)), None)
         if hit:
             records.append(OsintRecord(kind=kind, value=hit, source=source))
-            # TLS-RPT (and MTA-STS) records carry rua/mailto reporting addresses
-            # dnstlsrpt) — harvest any so they feed the email → breach/leak chain.
+            # TLS-RPT (and MTA-STS) records carry rua/mailto reporting addresses — harvest any
+            # so they feed the email → breach/leak chain.
             for m in re.findall(r"mailto:([^\s\"';,!]+@[^\s\"';,!]+)", hit, re.IGNORECASE):
                 addr = m.strip().lower().strip(".")
                 if "@" in addr:
                     caa_emails.append(Email(address=addr, source=f"{kind}-rua"))
+        else:
+            records.append(OsintRecord(kind=kind, value="not found", source=source))
+
+    # --- CAA: also emit a record when absent, so CAA always appears in the table ---
+    if not caa_values:
+        records.append(OsintRecord(kind="caa", value="not found", source=source))
+
+    # --- DKIM (selector probe) ---
+    # DKIM keys live at <selector>._domainkey.<domain>; the selector isn't discoverable from
+    # DNS, so we probe a set of common/provider-default selectors. A hit means DKIM is at least
+    # configured for that selector. Reports which selectors were found, or "not found (probed N
+    # common selectors)" — a not-found is normal and expected (the real selector may be custom).
+    dkim_found: list[str] = []
+    for sel in _DKIM_SELECTORS:
+        rec = await resolve_txt(f"{sel}._domainkey.{domain}")
+        hit = next((t for t in rec if "v=dkim1" in t.lower() or "k=rsa" in t.lower()
+                    or "p=" in t.lower()), None)
+        if hit:
+            dkim_found.append(sel)
+            records.append(OsintRecord(kind="dkim", value=f"{sel}: {hit[:120]}",
+                                       detail=sel, source=source))
+    if not dkim_found:
+        records.append(OsintRecord(
+            kind="dkim",
+            value=f"not found (probed {len(_DKIM_SELECTORS)} common selectors)",
+            source=source))
 
     return records, findings, caa_emails
 

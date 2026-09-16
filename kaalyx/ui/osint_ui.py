@@ -501,30 +501,73 @@ def employees_table(rows: list) -> Table | None:
     return table
 
 
+# Fixed display order for the email/DNS posture table — every type ALWAYS shown (found or not).
+_MAIL_ROW_ORDER = ("spf", "dmarc", "dkim", "caa", "mta_sts", "tls_rpt", "bimi")
+
+
+def _dmarc_interpretation(dmarc_value: str) -> str:
+    """One-line plain-English takeaway for a DMARC record's PRIMARY policy (the ``p=`` tag).
+
+    Keys strictly on the ``p=`` value (not any occurrence of 'reject'/'quarantine' — a
+    ``sp=reject`` subdomain policy must not be mistaken for the main policy).
+    """
+    import re as _re
+    low = (dmarc_value or "").lower()
+    if "not found" in low or not low.startswith("v=dmarc1"):
+        return "no DMARC — spoofing NOT blocked; recipients have no policy to enforce"
+    m = _re.search(r"(?:^|;)\s*p\s*=\s*(none|quarantine|reject)", low)
+    p = m.group(1) if m else ""
+    if p == "reject":
+        return "DMARC p=reject — strict enforcement, spoofing actively blocked"
+    if p == "quarantine":
+        return "DMARC p=quarantine — spoofed mail sent to spam, not outright rejected"
+    if p == "none":
+        return "DMARC p=none — monitoring only, spoofing NOT blocked"
+    return "DMARC present — policy unclear from the record"
+
+
 def mail_hygiene_table(records: list) -> Table | None:
-    """Show SPF/DMARC/DNS-security posture + spoofability verdict as a compact table."""
-    kinds = ("spf", "dmarc", "caa", "bimi", "mta_sts", "tls_rpt", "dkim", "spoofable")
-    interesting = [r for r in records if r["kind"] in kinds]
-    if not interesting:
+    """Show the full email/DNS security posture: SPF, DMARC, DKIM, CAA, MTA-STS, TLS-RPT, BIMI
+    (every type ALWAYS present — its value, or an explicit dim "not found"), then the SPOOFABLE
+    verdict with a one-line plain-English interpretation."""
+    by_kind: dict[str, list] = {}
+    for r in records:
+        by_kind.setdefault(r["kind"], []).append(r)
+    if not any(k in by_kind for k in _MAIL_ROW_ORDER) and "spoofable" not in by_kind:
         return None
+
     table = Table(title="Email / DNS Security Posture", box=ROUNDED,
                   border_style=ACCENT_DIM, title_style=f"bold {ACCENT}",
                   header_style="bold white")
-    table.add_column("Record", style="cyan")
+    table.add_column("Record", style="cyan", no_wrap=True)
     table.add_column("Value", style="white", overflow="fold")
-    # Put the spoofable verdict last (it's the summary of the rest).
-    interesting.sort(key=lambda r: r["kind"] == "spoofable")
-    for r in interesting:
-        label = r["kind"].upper().replace("_", "-")
-        if r["kind"] == "spoofable":
-            spoofable = str(r["value"]).lower() == "yes"
-            verdict = Text(
-                f"YES — {r['detail']}" if spoofable else f"no — {r['detail']}",
-                style="bold red" if spoofable else "green",
-            )
-            table.add_row(Text("SPOOFABLE", style="bold"), verdict)
-        else:
-            table.add_row(label, r["value"])
+
+    for kind in _MAIL_ROW_ORDER:
+        label = kind.upper().replace("_", "-")
+        rows = by_kind.get(kind)
+        if not rows:
+            # Type wasn't emitted at all — still show it so the table is complete.
+            table.add_row(label, Text("not found", style=MUTED))
+            continue
+        for r in rows:
+            val = str(r["value"])
+            if val.lower().startswith("not found"):
+                table.add_row(label, Text(val, style=MUTED))
+            else:
+                table.add_row(label, val)
+
+    # SPOOFABLE verdict + plain-English interpretation of the DMARC enforcement.
+    spoof = (by_kind.get("spoofable") or [None])[0]
+    if spoof is not None:
+        spoofable = str(spoof["value"]).lower() == "yes"
+        dmarc_val = (by_kind.get("dmarc") or [{"value": "not found"}])[0]["value"]
+        verdict = Text(
+            f"YES — {spoof['detail']}" if spoofable else f"no — {spoof['detail']}",
+            style="bold red" if spoofable else "green",
+        )
+        table.add_row(Text("SPOOFABLE", style="bold"), verdict)
+        table.add_row("", Text(_dmarc_interpretation(dmarc_val),
+                               style="red" if spoofable else "green"))
     return table
 
 

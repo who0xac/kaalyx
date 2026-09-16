@@ -71,6 +71,136 @@ class _QuietTerminal:
         return False
 
 
+class _FdCapture:
+    """Capture EVERYTHING written to the real stdout/stderr file descriptors (1 and 2) for the
+    duration, so no write from ANY source can corrupt an in-place ``rich.Live`` board.
+
+    This is the general, root-cause defence against the "board prints itself twice" bug. rich's
+    own ``redirect_stdout``/``redirect_stderr`` only wrap the Python-level ``sys.stdout`` /
+    ``sys.stderr`` objects — they do NOT catch writes that reach the terminal by other routes:
+    a C extension writing to fd 1, a subprocess that inherited the fd, an ``os.write(2, …)``, a
+    late ``ResourceWarning``/asyncio "unclosed"/"Task exception" message emitted at the C level,
+    or anything a third-party library prints straight to the descriptor. Any such byte lands on
+    the terminal between Live's cursor-up and its redraw, so Live miscounts the previous frame's
+    height and paints a fresh board below the old one.
+
+    We redirect fds 1 and 2 to an OS pipe and drain it on a daemon thread, forwarding captured
+    bytes to the rotating FILE log (never the terminal) so nothing is lost but nothing reaches
+    the screen except Live's frames. rich's Live keeps its OWN saved handle to the real terminal
+    (``console.file``), so the board itself still renders. A no-op when stdout isn't a real
+    terminal (pipes/CI/redirected output) or on platforms without ``os.dup2`` semantics we can
+    rely on (Windows) — there the existing Python-level redirects remain the defence.
+    """
+
+    def __init__(self) -> None:
+        self._active = False
+        self._saved_fds: dict[int, int] = {}
+        self._pipe_r = None
+        self._pipe_w = None
+        self._thread = None
+        #: A writable text stream on the REAL terminal (a dup of fd 1 taken before redirection),
+        #: for the Live board to render through while fds 1/2 point at the capture pipe. ``None``
+        #: when capture is inactive (caller then keeps using the normal console file).
+        self.terminal_stream = None
+
+    def __enter__(self):
+        # Only meaningful on a POSIX tty; Windows lacks the fd-dup semantics we depend on.
+        try:
+            if sys.platform == "win32" or not sys.stdout.isatty():
+                return self
+            import os
+            # Take a dup of the real terminal (fd 1) FIRST and wrap it as a text stream — the
+            # board renders through this so it still reaches the screen after we redirect fd 1.
+            real_term_fd = os.dup(1)
+            self.terminal_stream = os.fdopen(real_term_fd, "w", encoding="utf-8", closefd=True)
+            self._pipe_r, self._pipe_w = os.pipe()
+            for fd in (1, 2):
+                try:
+                    self._saved_fds[fd] = os.dup(fd)     # remember the real terminal fd
+                    os.dup2(self._pipe_w, fd)            # point 1/2 at the pipe's write end
+                except OSError:
+                    self._saved_fds.pop(fd, None)
+            if not self._saved_fds:
+                self.terminal_stream = None
+                self._teardown_pipe()
+                return self
+            import threading
+            self._thread = threading.Thread(target=self._drain, daemon=True)
+            self._thread.start()
+            self._active = True
+        except Exception:
+            self._restore_fds()
+            self._teardown_pipe()
+            self.terminal_stream = None
+        return self
+
+    def _drain(self) -> None:
+        """Read captured bytes off the pipe and log them to the file logger, off the screen."""
+        import os
+        from ..core.logging import get_logger
+        log = get_logger("captured")
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(self._pipe_r, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, _, buf = buf.partition(b"\n")
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    log.debug("stray terminal write during board: %s", text)
+
+    def _restore_fds(self) -> None:
+        import os
+        for fd, saved in self._saved_fds.items():
+            try:
+                os.dup2(saved, fd)   # restore the real terminal onto 1/2
+                os.close(saved)
+            except OSError:
+                pass
+        self._saved_fds.clear()
+
+    def _teardown_pipe(self) -> None:
+        import os
+        for p in (self._pipe_w, self._pipe_r):
+            if p is not None:
+                try:
+                    os.close(p)
+                except OSError:
+                    pass
+        self._pipe_w = self._pipe_r = None
+
+    def __exit__(self, *exc):
+        if not self._active:
+            self._restore_fds()
+            self._teardown_pipe()
+            return False
+        import os
+        # Restore the real fds FIRST so later output goes to the terminal again, then close the
+        # write end so the drain thread sees EOF and exits, then clean up.
+        self._restore_fds()
+        try:
+            if self._pipe_w is not None:
+                os.close(self._pipe_w)
+                self._pipe_w = None
+        except OSError:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        try:
+            if self._pipe_r is not None:
+                os.close(self._pipe_r)
+                self._pipe_r = None
+        except OSError:
+            pass
+        self._active = False
+        return False
+
+
 class _LiveWithQuietTerminal:
     """Wrap a ``rich.Live`` context manager so entering/exiting it also (a) enters/exits a
     :class:`_QuietTerminal` for keypress-robustness and (b) installs a terminal-resize handler
@@ -85,7 +215,9 @@ class _LiveWithQuietTerminal:
     def __init__(self, live) -> None:
         self._live = live
         self._quiet = _QuietTerminal()
+        self._fdcap = _FdCapture()
         self._prev_winch = None
+        self._orig_console_file = None
 
     def _on_resize(self, *_):
         try:
@@ -98,9 +230,22 @@ class _LiveWithQuietTerminal:
 
     def __enter__(self):
         self._quiet.__enter__()
+        # Capture the real stdout/stderr fds so NOTHING but the board reaches the terminal, then
+        # point the Live console at the preserved real-terminal stream so the board still renders.
+        self._fdcap.__enter__()
+        if self._fdcap.terminal_stream is not None:
+            try:
+                self._orig_console_file = self._live.console.file
+                self._live.console.file = self._fdcap.terminal_stream
+            except Exception:
+                self._orig_console_file = None
         try:
             result = self._live.__enter__()
         except Exception:
+            if self._orig_console_file is not None:
+                self._live.console.file = self._orig_console_file
+                self._orig_console_file = None
+            self._fdcap.__exit__(None, None, None)
             self._quiet.__exit__(None, None, None)
             raise
         try:
@@ -122,6 +267,15 @@ class _LiveWithQuietTerminal:
                     pass
             return self._live.__exit__(*exc)
         finally:
+            # Restore the console file, then release the fd capture (terminal back to normal),
+            # then the tty mode. Order matters: Live must be torn down before we drop capture.
+            if self._orig_console_file is not None:
+                try:
+                    self._live.console.file = self._orig_console_file
+                except Exception:
+                    pass
+                self._orig_console_file = None
+            self._fdcap.__exit__(*exc)
             self._quiet.__exit__(*exc)
 from . import ACCENT, ACCENT_DIM, MUTED, severity_style
 

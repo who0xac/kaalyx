@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from .core.exceptions import ConfigError
 
@@ -414,17 +414,34 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
     """Load secrets from a ``config.env`` file (if present) plus the process environment.
 
     If *env_path* is ``None``, resolution follows :func:`resolve_env_path` (``./config.env`` >
-    standard config dir). Values already in the environment take precedence over the file
-    (conventional ``python-dotenv`` behaviour; lets shell exports / CI override).
+    standard config dir). A NON-EMPTY environment variable still takes precedence over the file
+    (lets a real shell export / CI value override), but an environment variable that is *absent
+    or empty* falls back to the file. This matters because the generated ``config.env`` template
+    ships every key blank (``SHODAN_API_KEY=`` etc.); with plain ``python-dotenv`` semantics
+    (``override=False``) a blank ``SHODAN_API_KEY`` already sitting in the environment — e.g.
+    from sourcing the template, a wrapper, or a previously-loaded empty config file — would
+    permanently mask a real key set in ``config.env`` and make the source look keyless. Reading
+    the file layer explicitly and treating an empty env var as absent fixes that.
     """
+    file_values: dict[str, str] = {}
     if env_path is None:
         env_path = resolve_env_path()
     if env_path is not None:
-        load_dotenv(dotenv_path=str(env_path), override=False)
+        # dotenv_values reads the file WITHOUT touching os.environ, so we control precedence.
+        file_values = {k: v for k, v in dotenv_values(str(env_path)).items() if v is not None}
+        # Also populate os.environ for any downstream code that reads it directly, but never let
+        # a blank env var block the file — override only where the env var is missing/empty.
+        for k, v in file_values.items():
+            if v.strip() and not (os.environ.get(k) or "").strip():
+                os.environ[k] = v
 
     def _get(name: str) -> str | None:
+        # A non-empty environment value wins; otherwise fall back to the file. Empty == absent.
         value = os.environ.get(name)
-        return value.strip() if value and value.strip() else None
+        if value and value.strip():
+            return value.strip()
+        file_val = file_values.get(name)
+        return file_val.strip() if file_val and file_val.strip() else None
 
     return Secrets(
         shodan_api_key=_get("SHODAN_API_KEY"),

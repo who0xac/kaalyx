@@ -23,9 +23,12 @@ emails are the input, and the lookup is skipped cleanly when no breach API key i
 
 from __future__ import annotations
 
+import asyncio
 import re
+import ssl
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 
@@ -699,6 +702,58 @@ async def check_exposed_git(host: str) -> Finding | None:
     return None
 
 
+async def download_exposed_git(host: str) -> Finding | None:
+    """Confirm an exposed ``/.git/`` is actually *downloadable* (not just that config is
+    readable), by fetching a small, bounded set of internal git files — ``HEAD``, ``index``,
+    ``logs/HEAD`` and ``info/refs`` — and checking they return real git data, not soft-404s.
+
+    This does NOT reconstruct the repository or dump source: it fetches at most four small files
+    to evidence that the objects are retrievable, upgrading the finding to CRITICAL/CONFIRMED
+    (an attacker could clone the full history). Returns a Finding only when at least ``HEAD``
+    plus one more artefact are confirmed retrievable; otherwise ``None``. Never raises."""
+    probes = ["HEAD", "index", "logs/HEAD", "info/refs"]
+    html_re = re.compile(r"<html|<body", re.IGNORECASE)
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for scheme in ("https", "http"):
+            base = f"{scheme}://{host}/.git"
+            retrieved: list[str] = []
+            head_ok = False
+            for name in probes:
+                try:
+                    resp = await client.get(f"{base}/{name}")
+                except httpx.HTTPError as exc:
+                    logger.debug("git download probe %s/%s: %s", base, name, exc)
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.content[:512]
+                text = body.decode("latin-1", "replace")
+                if html_re.search(text):
+                    continue  # soft-404 page
+                # HEAD is a tiny text file starting "ref: refs/"; index/pack are binary blobs.
+                if name == "HEAD":
+                    if text.strip().startswith("ref:") or re.fullmatch(r"[0-9a-f]{40}\s*", text.strip()):
+                        head_ok = True
+                        retrieved.append(name)
+                elif name == "index":
+                    if body[:4] == b"DIRC":  # git index magic
+                        retrieved.append(name)
+                elif body:
+                    retrieved.append(name)
+            if head_ok and len(retrieved) >= 2:
+                return Finding(
+                    title="Downloadable .git repository",
+                    category="exposed-git", severity=Severity.CRITICAL,
+                    confidence=Confidence.CONFIRMED, target=f"{base}/", tool="exposed_git",
+                    description=("The exposed /.git/ is fully retrievable — internal git objects "
+                                 "download successfully, so the complete source history can be "
+                                 "cloned. No reconstruction was performed by Kaalyx."),
+                    evidence="retrievable git artefacts: " + ", ".join(retrieved),
+                    reference=f"{base}/HEAD")
+    return None
+
+
 # Firebase Realtime Database exposure ------------------------------------------------------
 # A Firebase RTDB is reachable over a plain REST endpoint at the database root + ``.json``.
 # Two host families exist: the classic ``<id>.firebaseio.com`` and the newer regional
@@ -841,6 +896,312 @@ async def check_firebase_exposure(candidates: list[str]) -> tuple[list[OsintReco
                 # across the other regional domains for the same candidate id.
                 break
     return records, findings
+
+
+# Shodan InternetDB -------------------------------------------------------------------------
+# The FREE, keyless companion to the paid /shodan/host lookup: https://internetdb.shodan.io/<ip>
+# returns ports, hostnames, CPEs, tags and known CVE ids from Shodan's cache with no API key
+# and no packets to the target. A 404 means Shodan has never seen the IP (not an error).
+async def internetdb_lookup(ips: list[str]) -> tuple[list[OsintRecord], list[Finding]]:
+    """Keyless passive host data + CVE tags per resolved IP via Shodan InternetDB.
+
+    Returns ``(records, findings)``. Each IP Shodan knows yields an ``internetdb`` record
+    (ports/hostnames/CPEs) and, when it lists ``vulns``, a ``cve`` finding (TENTATIVE — passive,
+    unverified). Never raises; a per-IP failure/404 is skipped."""
+    records: list[OsintRecord] = []
+    findings: list[Finding] = []
+    async with httpx.AsyncClient(timeout=12,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for ip in ips:
+            try:
+                resp = await client.get(f"https://internetdb.shodan.io/{ip}")
+            except httpx.HTTPError as exc:
+                logger.debug("internetdb %s: %s", ip, exc)
+                continue
+            if resp.status_code == 404:
+                continue  # Shodan has never indexed this IP
+            if resp.status_code != 200:
+                continue
+            try:
+                d = resp.json()
+            except ValueError:
+                continue
+            ports = d.get("ports") or []
+            hostnames = d.get("hostnames") or []
+            cpes = d.get("cpes") or []
+            vulns = sorted(d.get("vulns") or [])
+            bits = [f"ports={','.join(str(p) for p in sorted(set(ports))) or 'none'}"]
+            if hostnames:
+                bits.append("hostnames=" + ",".join(hostnames))
+            if cpes:
+                bits.append(f"cpes={len(cpes)}")
+            if vulns:
+                bits.append(f"vulns={len(vulns)}")
+            records.append(OsintRecord(kind="internetdb", value=ip,
+                                       detail=" · ".join(bits), source="internetdb"))
+            if vulns:
+                sev = Severity.HIGH if len(vulns) >= 5 else Severity.MEDIUM
+                findings.append(Finding(
+                    title=f"InternetDB CVE tags on {ip} ({len(vulns)})",
+                    category="cve", severity=sev, confidence=Confidence.TENTATIVE,
+                    target=ip, tool="internetdb",
+                    description=(f"Shodan InternetDB (free, passive) lists {len(vulns)} known-CVE "
+                                 f"tag(s) for {ip}. Verify against the live service before acting."),
+                    evidence=", ".join(vulns), reference=vulns[0], raw=", ".join(vulns)))
+    return records, findings
+
+
+# TLS certificate extraction ----------------------------------------------------------------
+async def extract_tls_cert(domain: str) -> tuple[list[OsintRecord], list[str]]:
+    """Fetch the target's live TLS leaf certificate and extract intelligence from it (keyless).
+
+    Returns ``(records, san_hostnames)``. Records cover the subject CN, issuer, validity window
+    and the Subject Alternative Names; the SAN hostnames on the target's registrable domain are
+    also returned separately so the caller can feed them into subdomain discovery. Uses a blocking
+    ``ssl`` handshake off the event loop. Never raises — a handshake failure yields empty."""
+    records: list[OsintRecord] = []
+    sans: list[str] = []
+
+    def _fetch() -> dict | None:
+        ctx = ssl.create_default_context()
+        try:
+            with ctx.wrap_socket(__import__("socket").socket(), server_hostname=domain) as s:
+                s.settimeout(10)
+                s.connect((domain, 443))
+                return s.getpeercert()
+        except Exception as exc:  # noqa: BLE001 — no cert / handshake failure is not an error
+            logger.debug("TLS cert fetch failed for %s: %s", domain, exc)
+            return None
+
+    cert = await asyncio.to_thread(_fetch)
+    if not cert:
+        return records, sans
+
+    def _name(seq) -> str:
+        return ", ".join("=".join(x) for rdn in (seq or ()) for x in rdn)
+
+    subject = _name(cert.get("subject"))
+    issuer = _name(cert.get("issuer"))
+    if subject:
+        records.append(OsintRecord(kind="tls_cert", value=subject,
+                                   detail="subject", source="tls_cert"))
+    if issuer:
+        records.append(OsintRecord(kind="tls_cert", value=issuer,
+                                   detail="issuer", source="tls_cert"))
+    if cert.get("notBefore") or cert.get("notAfter"):
+        records.append(OsintRecord(
+            kind="tls_cert", value=f"{cert.get('notBefore','?')} → {cert.get('notAfter','?')}",
+            detail="validity", source="tls_cert"))
+    reg = domain.split(".", 1)[-1] if domain.count(".") > 1 else domain
+    for typ, val in cert.get("subjectAltName", ()):
+        if typ.lower() == "dns":
+            records.append(OsintRecord(kind="tls_cert", value=val, detail="san",
+                                       source="tls_cert"))
+            host = val.lstrip("*.").lower()
+            if host.endswith(domain) or host.endswith(reg):
+                sans.append(host)
+    return records, sorted(set(sans))
+
+
+# GitLab group / namespace discovery --------------------------------------------------------
+async def discover_gitlab(company_slugs: list[str]) -> list[OsintRecord]:
+    """Look up a public GitLab.com group or user matching the company (keyless public API).
+
+    Returns ``gitlab`` records for each confirmed group/user namespace — a hint that public
+    repositories (and their CI config) may exist. Never raises."""
+    records: list[OsintRecord] = []
+    seen: set[str] = set()
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for slug in company_slugs:
+            for kind, path in (("group", f"https://gitlab.com/api/v4/groups/{urllib.parse.quote(slug)}"),
+                               ("user", f"https://gitlab.com/api/v4/users?username={urllib.parse.quote(slug)}")):
+                try:
+                    resp = await client.get(path)
+                except httpx.HTTPError as exc:
+                    logger.debug("gitlab %s %s: %s", kind, slug, exc)
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                items = data if isinstance(data, list) else [data]
+                for it in items:
+                    web = it.get("web_url") or f"https://gitlab.com/{slug}"
+                    if web in seen:
+                        continue
+                    seen.add(web)
+                    records.append(OsintRecord(
+                        kind="gitlab", value=web,
+                        detail=f"{kind}: {it.get('name') or it.get('username') or slug}",
+                        source="gitlab"))
+    return records
+
+
+# Docker Hub org / user repositories --------------------------------------------------------
+async def discover_dockerhub(company_slugs: list[str]) -> list[OsintRecord]:
+    """List public Docker Hub repositories under a namespace matching the company (keyless).
+
+    Image/repo names frequently leak internal service names. Returns ``dockerhub`` records for
+    each public repo found. Never raises."""
+    records: list[OsintRecord] = []
+    async with httpx.AsyncClient(timeout=12,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for slug in company_slugs:
+            url = f"https://hub.docker.com/v2/repositories/{urllib.parse.quote(slug)}/"
+            try:
+                resp = await client.get(url, params={"page_size": 100})
+            except httpx.HTTPError as exc:
+                logger.debug("dockerhub %s: %s", slug, exc)
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            for repo in data.get("results", []) or []:
+                name = repo.get("name", "")
+                full = f"{slug}/{name}"
+                desc = (repo.get("description") or "").strip()[:80]
+                records.append(OsintRecord(
+                    kind="dockerhub", value=full,
+                    detail=(f"pulls={repo.get('pull_count', 0)}"
+                            + (f" · {desc}" if desc else "")),
+                    source="dockerhub"))
+    return records
+
+
+# A brand label that is also a common English/tech word matches unrelated results on the
+# name-seeded sources (mobile apps, affiliate certs). We don't drop these sources for such
+# targets, but we require a STRICTER match (the brand as a distinct token in a seller/org name)
+# so a generic label like "example"/"cloud"/"data" doesn't flood the output with noise.
+_GENERIC_LABELS = {
+    "example", "test", "demo", "cloud", "data", "app", "apps", "api", "dev", "web", "mail",
+    "shop", "store", "pay", "info", "online", "digital", "tech", "group", "global", "world",
+    "home", "my", "get", "go", "the", "smart", "money", "finance", "health", "learn", "play",
+}
+
+
+def _brand_token_match(brand: str, text: str) -> bool:
+    """True if *brand* appears as a distinct word/token in *text* (case-insensitive), e.g. brand
+    'acme' matches 'ACME, Inc.' or 'acme-labs' but not 'acmecorp-unrelated'. Used to keep only
+    plausibly-owned results from name-seeded sources."""
+    if not brand or not text:
+        return False
+    return re.search(rf"(?:^|[^a-z0-9]){re.escape(brand.lower())}(?:[^a-z0-9]|$)",
+                     text.lower()) is not None
+
+
+# Mobile app discovery (Apple App Store + Google Play) --------------------------------------
+async def discover_mobile_apps(company_name: str) -> list[OsintRecord]:
+    """Find the organisation's published mobile apps (keyless).
+
+    Uses Apple's public iTunes Search API (keyless JSON) and a Google Play store query. Returns
+    ``mobile_app`` records naming each app + its store URL — a pivot to bundle ids / privacy
+    contacts / package names. Never raises."""
+    records: list[OsintRecord] = []
+    brand = company_name.strip().lower()
+    # For a generic-word brand, a substring/track-name match is meaningless (every "example"
+    # app matches), so require the brand as a distinct token in the SELLER/developer name —
+    # apps a same-named developer actually published.
+    generic = brand in _GENERIC_LABELS
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        # Apple iTunes Search API — reliable keyless JSON.
+        try:
+            resp = await client.get("https://itunes.apple.com/search",
+                                    params={"term": company_name, "entity": "software", "limit": 25})
+            if resp.status_code == 200:
+                for app in resp.json().get("results", []) or []:
+                    seller = app.get("sellerName") or app.get("artistName") or ""
+                    track = app.get("trackName") or ""
+                    seller_hit = _brand_token_match(brand, seller)
+                    # Generic brand: seller must match. Distinctive brand: seller OR track title.
+                    if generic:
+                        keep = seller_hit
+                    else:
+                        keep = seller_hit or _brand_token_match(brand, track)
+                    if not keep:
+                        continue
+                    records.append(OsintRecord(
+                        kind="mobile_app", value=track,
+                        detail=f"iOS · {app.get('bundleId','')} · seller={seller} · "
+                               f"{app.get('trackViewUrl','')}", source="mobile_app"))
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("itunes search failed: %s", exc)
+        # Google Play — HTML search; extract package ids (id=<pkg>) referencing the company.
+        # A package id is reverse-DNS (com.<vendor>.<app>); require the brand to be a distinct
+        # segment of it (so com.acme.app matches, com.x.acmeexamples does not). Skip a generic
+        # brand entirely — a substring like "example" hits countless unrelated packages.
+        if not generic:
+            try:
+                resp = await client.get("https://play.google.com/store/search",
+                                        params={"q": company_name, "c": "apps"})
+                if resp.status_code == 200:
+                    pkgs = sorted(set(re.findall(r"/store/apps/details\?id=([a-zA-Z0-9._]+)", resp.text)))
+                    for pkg in pkgs[:25]:
+                        if brand in pkg.lower().split("."):
+                            records.append(OsintRecord(
+                                kind="mobile_app", value=pkg, detail="Android · "
+                                f"https://play.google.com/store/apps/details?id={pkg}",
+                                source="mobile_app"))
+            except httpx.HTTPError as exc:
+                logger.debug("play search failed: %s", exc)
+    return records
+
+
+# Affiliate / related domains via crt.sh organisation certs ---------------------------------
+async def discover_affiliate_domains(company_slugs: list[str], apex: str) -> list[OsintRecord]:
+    """Find affiliate/related domains sharing the org's TLS certificates (keyless, crt.sh).
+
+    Queries crt.sh for certificates whose subject/organisation matches the company, then reports
+    registrable domains OTHER than the apex — a signal of sibling/affiliate properties. Returns
+    ``affiliate_domain`` records. Never raises."""
+    records: list[OsintRecord] = []
+    seen: set[str] = set()
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        for slug in company_slugs:
+            # A generic-word slug (e.g. "example") matches thousands of unrelated domains on a
+            # name search — too noisy to be a useful affiliate signal, so skip it entirely.
+            if slug in _GENERIC_LABELS:
+                logger.debug("affiliate: skipping generic slug %r", slug)
+                continue
+            try:
+                resp = await client.get("https://crt.sh/",
+                                        params={"q": f"%.{slug}%", "output": "json"})
+            except httpx.HTTPError as exc:
+                logger.debug("crt.sh %s: %s", slug, exc)
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                rows = resp.json()
+            except ValueError:
+                continue
+            for row in rows:
+                for name in str(row.get("name_value", "")).splitlines():
+                    host = name.strip().lstrip("*.").lower()
+                    if not host or "@" in host:
+                        continue
+                    labels = host.split(".")
+                    if len(labels) < 2:
+                        continue
+                    reg = ".".join(labels[-2:])
+                    # Report registrable domains other than the apex whose OWN base label is the
+                    # brand as a distinct token — so "acme.io"/"acme-labs.com" qualify but
+                    # "acmecorp-unrelated.com" (brand as a mere substring) does not.
+                    base_label = reg.split(".")[0]
+                    if reg == apex or reg in seen or not _brand_token_match(slug, base_label):
+                        continue
+                    seen.add(reg)
+                    records.append(OsintRecord(kind="affiliate_domain", value=reg,
+                                               detail=f"cert name shares brand '{slug}' (hint)",
+                                               source="affiliate"))
+    return records
 
 
 async def harvest_emails(domain: str) -> list[Email]:
@@ -1133,6 +1494,82 @@ async def _verify_account(client, login: str) -> str | None:
         return None
     t = str(data.get("type", "")).lower()
     return "org" if t == "organization" else ("user" if t == "user" else None)
+
+
+# GitHub Actions workflow-log secret scanning -----------------------------------------------
+# Secrets are routinely leaked by being echoed into CI output. GitHub retains run logs; with a
+# token we can download recent runs' logs (a zip of text) and scan them for credential patterns.
+_WORKFLOW_LOG_PATTERNS = {
+    "aws_key": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "github_pat": re.compile(r"ghp_[A-Za-z0-9]{36}"),
+    "slack_token": re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    "generic_bearer": re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"),
+    "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+}
+
+
+async def scan_workflow_logs(
+    org: str, token: str, max_repos: int = 10, max_runs: int = 5,
+) -> tuple[list[OsintRecord], list[Finding]]:
+    """Download recent GitHub Actions run logs for *org*'s repos and scan them for leaked
+    secrets (needs a token). Returns ``(records, findings)``.
+
+    For each of the org's most-recently-pushed repos, the most recent workflow runs' logs are
+    fetched (a zip of plain-text logs) and matched against known credential patterns. A hit is a
+    HIGH/FIRM ``secret`` finding — the FULL matched value is shown (per the no-mask rule).
+    Bounded by *max_repos* / *max_runs* so a big org can't run away. Never raises."""
+    import io
+    import zipfile
+
+    records: list[OsintRecord] = []
+    findings: list[Finding] = []
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                 headers=_github_headers(token)) as client:
+        repos = await _gh_get(client, f"/orgs/{urllib.parse.quote(org)}/repos",
+                              {"sort": "pushed", "per_page": max_repos})
+        if not isinstance(repos, list):
+            # Might be a user account rather than an org.
+            repos = await _gh_get(client, f"/users/{urllib.parse.quote(org)}/repos",
+                                  {"sort": "pushed", "per_page": max_repos}) or []
+        for repo in repos:
+            full = repo.get("full_name")
+            if not full:
+                continue
+            runs = await _gh_get(client, f"/repos/{full}/actions/runs", {"per_page": max_runs})
+            for run in (runs or {}).get("workflow_runs", [])[:max_runs]:
+                run_id = run.get("id")
+                if not run_id:
+                    continue
+                try:
+                    lr = await client.get(f"{_GH_API}/repos/{full}/actions/runs/{run_id}/logs")
+                except httpx.HTTPError as exc:
+                    logger.debug("workflow logs %s#%s: %s", full, run_id, exc)
+                    continue
+                if lr.status_code != 200:
+                    continue
+                records.append(OsintRecord(kind="workflow_log", value=f"{full}#{run_id}",
+                                           detail="log downloaded", source="workflow_logs"))
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(lr.content))
+                except zipfile.BadZipFile:
+                    continue
+                for member in zf.namelist():
+                    try:
+                        text = zf.read(member).decode("utf-8", "replace")
+                    except KeyError:
+                        continue
+                    for label, pat in _WORKFLOW_LOG_PATTERNS.items():
+                        for m in set(pat.findall(text)):
+                            findings.append(Finding(
+                                title=f"Secret leaked in CI log ({label})",
+                                category="secret", severity=Severity.HIGH,
+                                confidence=Confidence.FIRM, target=f"{full} run {run_id}",
+                                tool="workflow_logs",
+                                description=f"A {label} pattern was found in a GitHub Actions run "
+                                            f"log for {full} ({member}).",
+                                evidence=f"{label}: {m}",  # full value, per the no-mask rule
+                                reference=run.get("html_url", ""), raw=m))
+    return records, findings
 
 
 async def _owners_mentioning_domain(client, domain: str, token_owner: str | None) -> dict[str, list[str]]:

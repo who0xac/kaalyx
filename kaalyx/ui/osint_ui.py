@@ -227,6 +227,14 @@ _DISPLAY_NAMES: dict[str, str] = {
     "shodan_favicon": "SHODAN_FAVICON[pivot]",
     "shodan_vulns": "SHODAN_CVE[tags]",
     "shodan_host": "SHODAN_HOST[deep]",
+    "internetdb": "INTERNETDB[free]",
+    "tls_cert": "TLS_CERT[san/issuer]",
+    "gitlab": "GITLAB[groups]",
+    "dockerhub": "DOCKERHUB[repos]",
+    "mobile_apps": "MOBILE_APPS[ios/android]",
+    "affiliate_domains": "AFFILIATE_DOMAINS[crt.sh]",
+    "dnstwist": "DNSTWIST[typosquat]",
+    "workflow_logs": "WORKFLOW_LOGS[ci-secrets]",
 }
 
 
@@ -715,7 +723,9 @@ _CATEGORY_TITLES = [
     ("tenant-mapping", "Tenant Mapping"),
     ("attack-surface", "Attack Surface (Shodan org/ASN)"),
     ("related-infra", "Related Infrastructure (favicon pivot)"),
-    ("cve", "Known CVE Tags (Shodan, passive)"),
+    ("cve", "Known CVE Tags (passive)"),
+    ("exposed-git", "Exposed / Downloadable .git"),
+    ("typosquatting", "Typosquatting / Look-alike Domains"),
 ]
 _SEV_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 

@@ -93,6 +93,7 @@ _SPECS: list[ToolSpec] = [
              executable="swaggerspy"),
     ToolSpec("gato", Part.OSINT, "GitHub Actions security audit",
              requires_secret="GITHUB_TOKEN"),
+    ToolSpec("dnstwist", Part.OSINT, "Typosquatting / look-alike domain discovery"),
     # --- Part 2: Subdomains (passive) ---
     ToolSpec("subfinder", Part.SUBDOMAINS, "Passive subdomain enumeration"),
     ToolSpec("findomain", Part.SUBDOMAINS, "Passive subdomain enumeration"),

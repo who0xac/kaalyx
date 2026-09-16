@@ -39,7 +39,7 @@ from __future__ import annotations
 import httpx
 
 from ..core.stage import Stage, StageResult
-from ..data.models import Confidence, Email, Finding, OsintRecord, Severity
+from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain
 from ..monitor.flags import flag_all
 from ..ui import osint_ui
 from . import osint_inproc
@@ -75,6 +75,14 @@ SOURCE_LABELS: dict[str, str] = {
     "shodan_favicon": "Shodan favicon pivot",
     "shodan_vulns": "Shodan CVE tags",
     "shodan_host": "Shodan host deep-lookup",
+    "internetdb": "Shodan InternetDB (free)",
+    "tls_cert": "TLS cert extraction",
+    "gitlab": "GitLab discovery",
+    "dockerhub": "Docker Hub repos",
+    "mobile_apps": "Mobile app discovery",
+    "affiliate_domains": "Affiliate domains",
+    "dnstwist": "Typosquatting (dnstwist)",
+    "workflow_logs": "CI log secret scan",
 }
 
 
@@ -113,6 +121,14 @@ class OsintStage(Stage):
             "shodan_favicon": (osint_cfg.shodan_favicon, self._src_shodan_favicon),
             "shodan_vulns": (osint_cfg.shodan_vulns, self._src_shodan_vulns),
             "shodan_host": (osint_cfg.shodan_host, self._src_shodan_host),
+            "internetdb": (osint_cfg.internetdb, self._src_internetdb),
+            "tls_cert": (osint_cfg.tls_cert, self._src_tls_cert),
+            "gitlab": (osint_cfg.gitlab, self._src_gitlab),
+            "dockerhub": (osint_cfg.dockerhub, self._src_dockerhub),
+            "mobile_apps": (osint_cfg.mobile_apps, self._src_mobile_apps),
+            "affiliate_domains": (osint_cfg.affiliate_domains, self._src_affiliate_domains),
+            "dnstwist": (osint_cfg.dnstwist, self._src_dnstwist),
+            "workflow_logs": (osint_cfg.workflow_logs, self._src_workflow_logs),
         }
         sources = {name: fn for name, (enabled, fn) in candidates.items() if enabled}
         disabled = [name for name, (enabled, _) in candidates.items() if not enabled]
@@ -125,7 +141,8 @@ class OsintStage(Stage):
         # (trufflehog, gato) scan the target — never the token owner's account. Runs as a
         # pre-step because those sources need its result and the fan-out is concurrent. If no
         # org is confidently identified, both sources skip cleanly (see their methods).
-        if (osint_cfg.trufflehog or osint_cfg.github_actions) and ctx.secrets.has_github:
+        if (osint_cfg.trufflehog or osint_cfg.github_actions or osint_cfg.workflow_logs) \
+                and ctx.secrets.has_github:
             await self._discover_github_org()
 
         # Live progress board that updates in place. EVERYTHING — the concurrent fan-out AND
@@ -807,6 +824,9 @@ class OsintStage(Stage):
         `osint_inproc.check_exposed_git`. No download/reconstruction. Probes the apex host and
         its ``www.`` (broader per-host probing across all discovered subdomains belongs to the
         Hosts/Web stages). Keyless — never skips for a missing tool.
+        When /.git/config is exposed, we then confirm it is actually *downloadable* (a bounded
+        fetch of HEAD/index/logs — no repo reconstruction). If confirmed, the CRITICAL
+        download-confirmed finding supersedes the plain-detection HIGH one for that host.
         """
         res = SourceResult(name="exposed_git")
         candidates = {self.ctx.domain}
@@ -814,10 +834,16 @@ class OsintStage(Stage):
             candidates.add(f"www.{self.ctx.domain}")
         for host in sorted(candidates):
             finding = await osint_inproc.check_exposed_git(host)
-            if finding is not None:
-                res.findings.append(finding)
+            if finding is None:
+                continue
+            # Exposed — now confirm downloadability. Prefer the upgraded finding if confirmed.
+            downloadable = await osint_inproc.download_exposed_git(host)
+            res.findings.append(downloadable or finding)
         if not res.findings:
             res.note = "no exposed .git found"
+        else:
+            dl = sum(1 for f in res.findings if f.severity.value == "critical")
+            res.note = f"{len(res.findings)} exposed .git" + (f", {dl} downloadable" if dl else "")
         return res
 
     async def _src_firebase(self) -> SourceResult:
@@ -847,6 +873,120 @@ class OsintStage(Stage):
         else:
             hi = sum(1 for f in findings if f.severity.value == "high")
             res.note = f"{len(findings)} exposed DB(s)" + (f", {hi} writable" if hi else "")
+        return res
+
+    # -- Reference-parity OSINT sources (mostly keyless in-process) ---------------------------
+
+    async def _src_internetdb(self) -> SourceResult:
+        """Shodan InternetDB — free/keyless per-IP ports, CPEs and CVE tags (no packets to
+        target). Companion to the paid shodan_host; needs no key."""
+        res = SourceResult(name="internetdb", raw_ext="txt")
+        ips = await self._resolved_ips()
+        if not ips:
+            res.skipped, res.note = True, "skipped: no resolvable IP"
+            res.raw = "# skipped: no resolvable IP"
+            return res
+        records, findings = await osint_inproc.internetdb_lookup(ips)
+        res.osint, res.findings = records, findings
+        res.raw = "\n".join([f"# InternetDB probed {len(ips)} IP(s)"] +
+                            [f"{r.value}: {r.detail}" for r in records] or ["# no data"])
+        res.note = f"{len(ips)} IP(s), {len(records)} known, {len(findings)} with CVE tags"
+        return res
+
+    async def _src_tls_cert(self) -> SourceResult:
+        """Extract the live TLS leaf certificate (SANs → subdomains, issuer, validity). Keyless."""
+        res = SourceResult(name="tls_cert", raw_ext="txt")
+        records, sans = await osint_inproc.extract_tls_cert(self.ctx.domain)
+        res.osint = records
+        # SANs on the target domain are also subdomain hints.
+        for host in sans:
+            res.subdomains.append(Subdomain(hostname=host, source="tls_cert"))
+        res.raw = "\n".join([f"# TLS certificate for {self.ctx.domain}"] +
+                            [f"{r.detail}: {r.value}" for r in records] or ["# no certificate"])
+        if not records:
+            res.note = "no TLS certificate retrieved"
+        else:
+            res.note = f"{len(records)} cert field(s), {len(sans)} SAN subdomain(s)"
+        return res
+
+    async def _src_gitlab(self) -> SourceResult:
+        """Discover a public GitLab.com group/user matching the company (keyless)."""
+        res = SourceResult(name="gitlab", raw_ext="txt")
+        slugs = osint_inproc._company_slugs(self.ctx.target)
+        records = await osint_inproc.discover_gitlab(slugs)
+        res.osint = records
+        res.raw = "\n".join([f"# GitLab slugs probed: {', '.join(slugs)}"] +
+                            [f"{r.value}  ({r.detail})" for r in records] or ["# no match"])
+        res.note = f"{len(records)} GitLab namespace(s)" if records else "no GitLab namespace found"
+        return res
+
+    async def _src_dockerhub(self) -> SourceResult:
+        """List public Docker Hub repositories under a company-matching namespace (keyless)."""
+        res = SourceResult(name="dockerhub", raw_ext="txt")
+        slugs = osint_inproc._company_slugs(self.ctx.target)
+        records = await osint_inproc.discover_dockerhub(slugs)
+        res.osint = records
+        res.raw = "\n".join([f"# Docker Hub namespaces probed: {', '.join(slugs)}"] +
+                            [f"{r.value}  ({r.detail})" for r in records] or ["# no repos"])
+        res.note = f"{len(records)} Docker Hub repo(s)" if records else "no Docker Hub repos found"
+        return res
+
+    async def _src_mobile_apps(self) -> SourceResult:
+        """Discover the org's published mobile apps (Apple + Google Play). Keyless."""
+        res = SourceResult(name="mobile_apps", raw_ext="txt")
+        base = self.ctx.target.registrable.split(".")[0]
+        records = await osint_inproc.discover_mobile_apps(base)
+        res.osint = records
+        res.raw = "\n".join([f"# mobile app search: {base}"] +
+                            [f"{r.value}  ({r.detail})" for r in records] or ["# no apps"])
+        res.note = f"{len(records)} mobile app(s)" if records else "no mobile apps found"
+        return res
+
+    async def _src_affiliate_domains(self) -> SourceResult:
+        """Find affiliate/related domains sharing the org's TLS certs via crt.sh (keyless)."""
+        res = SourceResult(name="affiliate_domains", raw_ext="txt")
+        slugs = osint_inproc._company_slugs(self.ctx.target)
+        records = await osint_inproc.discover_affiliate_domains(slugs, self.ctx.target.registrable)
+        res.osint = records
+        res.raw = "\n".join([f"# affiliate-domain search (crt.sh) slugs: {', '.join(slugs)}"] +
+                            [f"{r.value}  ({r.detail})" for r in records] or ["# no affiliates"])
+        res.note = f"{len(records)} affiliate domain(s)" if records else "no affiliate domains found"
+        return res
+
+    async def _src_dnstwist(self) -> SourceResult:
+        """Typosquatting / look-alike domain discovery via the dnstwist external tool."""
+        res = SourceResult(name="dnstwist", raw_ext="json")
+        cmd = ["dnstwist", "--format", "json", "--registered", self.ctx.target.registrable]
+        out = await self.ctx.runner.run(cmd, timeout=600, label="dnstwist")
+        if not out.started:
+            res.skipped, res.note = True, "skipped: dnstwist not on PATH"
+            res.raw = "# skipped: dnstwist not on PATH"
+            return res
+        res.raw = out.stdout
+        records, findings = P.parse_dnstwist(out.stdout, self.ctx.target.registrable)
+        res.osint, res.findings = records, findings
+        res.note = f"{len(records)} registered look-alike domain(s)"
+        return res
+
+    async def _src_workflow_logs(self) -> SourceResult:
+        """Scan the org's GitHub Actions run logs for leaked secrets (needs GITHUB_TOKEN)."""
+        res = SourceResult(name="workflow_logs", raw_ext="txt")
+        if not self.ctx.secrets.has_github:
+            res.skipped, res.note = True, "skipped: GITHUB_TOKEN not set"
+            res.raw = "# skipped: GITHUB_TOKEN not set"
+            return res
+        org = self.ctx.get_shared("github_org")
+        if not org:
+            res.skipped, res.note = True, "skipped: no target GitHub org identified"
+            res.raw = "# skipped: no target GitHub org identified"
+            return res
+        token = self.ctx.secrets.next_github_token() or ""
+        records, findings = await osint_inproc.scan_workflow_logs(org, token)
+        res.osint, res.findings = records, findings
+        res.raw = "\n".join([f"# workflow-log scan for org: {org}"] +
+                            [f"{r.value}: {r.detail}" for r in records] or ["# no logs scanned"])
+        res.note = (f"{len(records)} run log(s), {len(findings)} secret(s)"
+                    if records else "no accessible run logs")
         return res
 
     async def _src_github_actions(self) -> SourceResult:

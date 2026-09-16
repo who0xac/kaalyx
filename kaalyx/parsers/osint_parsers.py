@@ -125,6 +125,58 @@ def parse_dnsx(stdout: str, source: str = "dnsx") -> list[OsintRecord]:
     return records
 
 
+def parse_dnstwist(stdout: str, target: str,
+                   source: str = "dnstwist") -> tuple[list[OsintRecord], list[Finding]]:
+    """Parse ``dnstwist --format json`` output into look-alike/typosquat OSINT.
+
+    dnstwist emits a JSON array of permutation objects, e.g.::
+
+        [{"domain":"kycald.com","fuzzer":"omission","dns_a":["1.2.3.4"],
+          "dns_mx":["mail.kycald.com"]}, ...]
+
+    With ``--registered`` only resolving permutations appear. We record each as a
+    ``kind='typosquat'`` OSINT row, and raise a LOW ``typosquatting`` finding for a look-alike
+    that resolves (``dns_a``) or has mail records (``dns_mx``) — an active look-alike domain that
+    could be used for phishing. The original/target row dnstwist echoes is skipped.
+
+    Returns ``(records, findings)``.
+    """
+    reg, _ = _target_labels(target)
+    records: list[OsintRecord] = []
+    findings: list[Finding] = []
+    data = try_load_json(stdout)
+    if not isinstance(data, list):
+        return records, findings
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        dom = str(obj.get("domain", "")).strip().lower()
+        if not dom or dom == reg:
+            continue  # skip the original domain dnstwist echoes back
+        fuzzer = obj.get("fuzzer", "")
+        a = obj.get("dns_a") or []
+        mx = obj.get("dns_mx") or []
+        ns = obj.get("dns_ns") or []
+        bits = [f"fuzzer={fuzzer}"] if fuzzer else []
+        if a:
+            bits.append("a=" + ",".join(a if isinstance(a, list) else [str(a)]))
+        if mx:
+            bits.append("mx=" + ",".join(mx if isinstance(mx, list) else [str(mx)]))
+        records.append(OsintRecord(kind="typosquat", value=dom,
+                                   detail=" · ".join(bits), source=source))
+        # A resolving or mail-capable look-alike is an active phishing vector.
+        if a or mx:
+            findings.append(Finding(
+                title=f"Active look-alike domain: {dom}",
+                category="typosquatting", severity=Severity.LOW,
+                confidence=Confidence.TENTATIVE, target=dom, tool=source,
+                description=(f"The look-alike domain {dom} (dnstwist fuzzer '{fuzzer}') is "
+                             "registered and resolves — a candidate phishing/impersonation "
+                             "domain targeting the brand."),
+                evidence=" · ".join(bits) or "registered", raw=dom))
+    return records, findings
+
+
 def parse_subdomain_lines(stdout: str, source: str) -> list[Subdomain]:
     """Parse plain host-per-line output (github-subdomains, subfinder-style)."""
     subs: list[Subdomain] = []

@@ -195,8 +195,16 @@ class OsintConfig:
     theharvester: bool = True        # emails/employees/hosts (external tool)
     third_party_misconfig: bool = True  # misconfig-mapper (external tool)
     api_leaks: bool = True           # porch-pirate (Postman) + SwaggerSpy (external tools)
-    exposed_git: bool = True         # in-process /.git/config detection (keyless)
+    exposed_git: bool = True         # in-process /.git/config detection + download confirm (keyless)
     firebase: bool = True            # Firebase Realtime DB exposure check (keyless)
+    internetdb: bool = True          # Shodan InternetDB — free/keyless per-IP ports+CVE tags
+    tls_cert: bool = True            # live TLS leaf-cert extraction (SANs/issuer/validity, keyless)
+    gitlab: bool = True              # GitLab.com public group/user discovery (keyless)
+    dockerhub: bool = True           # Docker Hub public repositories (keyless)
+    mobile_apps: bool = True         # Apple App Store + Google Play app discovery (keyless)
+    affiliate_domains: bool = True   # related/affiliate domains via crt.sh org certs (keyless)
+    dnstwist: bool = True            # typosquatting/lookalike domain discovery (external tool)
+    workflow_logs: bool = True       # GitHub Actions run-log secret scan (needs GITHUB_TOKEN)
     github_actions: bool = True      # gato — GitHub Actions audit (external tool, needs token)
     google_dorks: bool = True        # dork URL generation (no scraping)
     # Shodan-backed OSINT (needs SHODAN_API_KEY; each skips cleanly without it or when the

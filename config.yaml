@@ -81,8 +81,16 @@ osint:
   theharvester: true           # emails/employees/hosts (external tool)
   third_party_misconfig: true  # misconfig-mapper (external tool)
   api_leaks: true              # porch-pirate (Postman) + SwaggerSpy (external tools)
-  exposed_git: true            # in-process /.git/config detection (keyless)
+  exposed_git: true            # in-process /.git/config detection + download confirm (keyless)
   firebase: true               # Firebase Realtime DB exposure check (keyless)
+  internetdb: true             # Shodan InternetDB — free/keyless per-IP ports+CVE tags
+  tls_cert: true               # live TLS leaf-cert extraction (SANs/issuer/validity, keyless)
+  gitlab: true                 # GitLab.com public group/user discovery (keyless)
+  dockerhub: true              # Docker Hub public repositories (keyless)
+  mobile_apps: true            # Apple App Store + Google Play app discovery (keyless)
+  affiliate_domains: true      # related/affiliate domains via crt.sh org certs (keyless)
+  dnstwist: true               # typosquatting/lookalike domain discovery (external tool)
+  workflow_logs: true          # GitHub Actions run-log secret scan (needs GITHUB_TOKEN)
   github_actions: true         # gato — GitHub Actions audit (needs GITHUB_TOKEN)
   google_dorks: true           # dork URL generation (no scraping)
   # Shodan-backed OSINT (needs SHODAN_API_KEY; skips cleanly without it or on tier limits).

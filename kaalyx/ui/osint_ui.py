@@ -589,49 +589,13 @@ class OsintProgress:
         bar_line.append(self._mmss(elapsed), style="white")
         lines.append(bar_line)
         lines.append(Text(""))
-        # 3) Source rows — but never let the board exceed the terminal height (rich would clip
-        #    the overflow with an ellipsis and the tail of the board becomes invisible, which is
-        #    the "34 sources taller than the terminal" problem). When the rows don't all fit, we
-        #    show a SCROLLING WINDOW: any still-running rows (you always want those visible), a
-        #    collapsed "N done above" marker for finished sources that scrolled off the top, and
-        #    the most-recent rows filling the remaining space. Every source's full row is still
-        #    printed to scrollback in the final result render, so nothing is lost.
-        rows = list(self._states.items())
-        header_lines = len(lines)            # lines already used (header + bar + spacers)
-        try:
-            term_h = self._console.size.height
-        except Exception:
-            term_h = 24
-        # Leave a little breathing room so the board never touches the very bottom edge.
-        budget = max(6, term_h - header_lines - 2)
-
-        if len(rows) <= budget:
-            for name, st in rows:
-                lines.append(self._row(st, _display_name(name, st.label), now, frame))
-            return Group(*lines)
-
-        # Overflow: prioritise running rows + a recent tail, collapse the rest into a counter.
-        running_idx = [i for i, (_, st) in enumerate(rows) if st.state == "running"]
-        # Reserve one line for the "collapsed" marker.
-        window = max(3, budget - 1)
-        # Anchor the window on the last running row (work in progress), else on the last row.
-        anchor = running_idx[-1] if running_idx else len(rows) - 1
-        start = max(0, min(anchor - window + 1, len(rows) - window))
-        end = start + window
-        visible = rows[start:end]
-
-        if start > 0:
-            done_above = sum(1 for _, st in rows[:start]
-                             if st.state not in ("queued", "running"))
-            lines.append(Text(f"    ▲ {start} source(s) above "
-                              f"({done_above} finished) — full detail below when complete",
-                              style=MUTED))
-        for name, st in visible:
+        # 3) One row per source, in insertion (pipeline) order — ALWAYS every source, including
+        #    queued ones (shown as "queued"). Rows are never hidden or collapsed behind a summary;
+        #    if the board is taller than the terminal, the Live uses vertical_overflow="visible"
+        #    (see live()) so the content scrolls through normal terminal history instead of being
+        #    clipped with an ellipsis.
+        for name, st in self._states.items():
             lines.append(self._row(st, _display_name(name, st.label), now, frame))
-        if end < len(rows):
-            queued_below = sum(1 for _, st in rows[end:] if st.state == "queued")
-            lines.append(Text(f"    ▼ {len(rows) - end} source(s) below "
-                              f"({queued_below} queued)", style=MUTED))
         return Group(*lines)
 
     def _refresh(self) -> None:
@@ -668,6 +632,10 @@ class OsintProgress:
             transient=False,
             redirect_stdout=True,
             redirect_stderr=True,
+            # Show EVERY source row always; when the board is taller than the terminal, let it
+            # scroll through normal terminal history rather than clipping the tail with an
+            # ellipsis (rich's default "ellipsis"). Never hide/collapse rows.
+            vertical_overflow="visible",
         )
         self._live = live
         return _LiveWithQuietTerminal(live)

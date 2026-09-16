@@ -772,10 +772,104 @@ def web(
     raise typer.Exit(code=1)
 
 
+# Friendly secret-name -> env var mapping for `kaalyx config --check-key <name>`.
+_CHECK_KEY_ALIASES = {
+    "shodan": "SHODAN_API_KEY",
+    "github": "GITHUB_TOKEN",
+    "ipinfo": "IPINFO_TOKEN",
+    "censys": "CENSYS_API_ID",
+    "chaos": "CHAOS_API_KEY",
+    "telegram": "TELEGRAM_BOT_TOKEN",
+}
+
+
+def _mask(value: str) -> str:
+    """Mask a secret for display: keep first/last 3 chars, hide the middle."""
+    v = value.strip()
+    if len(v) <= 8:
+        return "•" * len(v)
+    return f"{v[:3]}…{v[-3:]} (len={len(v)})"
+
+
+def _check_key(name: str) -> None:
+    """Standalone diagnostic for one secret: trace EXACTLY where the key is looked for and what
+    is found, independent of running a scan. Prints the resolved config.env path, whether the
+    file exists, whether the key line is present in the file (masked), the os.environ state, and
+    the FINAL value load_secrets() resolves — so a stale/empty/wrong-dir config.env is obvious."""
+    import os
+    from .config import resolve_env_path, load_secrets
+    from dotenv import dotenv_values
+
+    env_name = _CHECK_KEY_ALIASES.get(name.strip().lower(), name.strip().upper())
+    console.print(f"[bold]Secret check:[/] {env_name}\n")
+
+    # 1) Which file does resolution pick (CWD ./config.env wins over the config dir)?
+    resolved = resolve_env_path()
+    console.print(f"  cwd                 : {Path.cwd()}")
+    console.print(f"  resolved config.env : "
+                  + (f"{resolved}" if resolved else "[yellow]none found (environment only)[/]"))
+    if resolved is not None:
+        console.print(f"  file exists         : "
+                      + ("[green]yes[/]" if Path(resolved).is_file() else "[red]no[/]"))
+        # 2) Is the key line present IN THAT FILE, and what's its value (masked)?
+        try:
+            fv = dotenv_values(str(resolved)).get(env_name)
+        except Exception as exc:  # noqa: BLE001
+            fv = None
+            console.print(f"  [red]file parse error[/] : {exc}")
+        if fv is None:
+            console.print(f"  key line in file    : [yellow]absent[/]")
+        elif not fv.strip():
+            console.print(f"  key line in file    : [yellow]present but BLANK[/]")
+        else:
+            console.print(f"  key line in file    : [green]present[/] → {_mask(fv)}")
+
+    # 3) os.environ state (a non-empty export overrides the file; an empty one is ignored).
+    env_val = os.environ.get(env_name)
+    if env_val is None:
+        console.print(f"  {env_name} in env : [dim]unset[/]")
+    elif not env_val.strip():
+        console.print(f"  {env_name} in env : [yellow]set but EMPTY (ignored — file wins)[/]")
+    else:
+        console.print(f"  {env_name} in env : [green]set[/] → {_mask(env_val)}")
+
+    # 4) The FINAL resolved value load_secrets() produces (what a scan actually uses).
+    secrets = load_secrets()
+    if env_name == "GITHUB_TOKEN":
+        final = secrets.github_tokens[0] if secrets.github_tokens else None
+    else:
+        attr = _ENV_TO_ATTR.get(env_name)
+        final = getattr(secrets, attr, None) if attr else None
+    console.print()
+    if final:
+        console.print(f"  [green]✔ RESOLVED[/] — the scan WILL use this key ({_mask(final)}).")
+    else:
+        console.print(f"  [red]✘ NOT RESOLVED[/] — the scan sees NO key; the source will skip.")
+        console.print("  [dim]Most common cause: a stale/blank ./config.env in the current "
+                      "directory shadowing the real one in the config dir. Run from a dir "
+                      "without a local config.env, or fix that file.[/]")
+
+
+# Map an env-var name to the Secrets attribute holding its resolved value (for --check-key).
+_ENV_TO_ATTR = {
+    "SHODAN_API_KEY": "shodan_api_key",
+    "GITHUB_TOKEN": None,  # token list — handled specially below
+    "IPINFO_TOKEN": "ipinfo_token",
+    "CENSYS_API_ID": "censys_api_id",
+    "CHAOS_API_KEY": "chaos_api_key",
+    "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+}
+
+
 @app.command(context_settings=_HELP_CTX, short_help="Show where config.yaml and config.env live.")
 def config(
     path: bool = typer.Option(
         False, "--path", help="Print the exact config.yaml and config.env paths and exit.",
+    ),
+    check_key: str = typer.Option(
+        None, "--check-key",
+        help="Diagnose a single secret (e.g. 'shodan', 'github', 'ipinfo'): which config.env "
+             "is read, whether the key line is present, and the masked value. Exits after.",
     ),
 ) -> None:
     """Show (and create) Kaalyx's config directory, config.yaml and config.env locations.
@@ -784,6 +878,10 @@ def config(
     don't exist yet, so a fresh pipx install can be configured without guessing paths.
     """
     from .config import config_file, env_file, ensure_config_dir
+
+    if check_key is not None:
+        _check_key(check_key)
+        raise typer.Exit(0)
 
     directory, created = ensure_config_dir()
     cfg, env = config_file(), env_file()
@@ -949,13 +1047,12 @@ def _do_update(verbose: bool = False) -> None:
             console.print(f"[green]✔ Already up to date[/] (v{current}, {remote_sha})")
             return
 
-        # --- Step 2/3: prepare + reinstall via pipx (bar fills during the real reinstall). ---
-        # One-line note so a full reinstall doesn't read as a bug: pipx installs from a git ref,
-        # which has no in-place patch — every update replaces the whole venv. This is expected.
-        # progress.console.print renders cleanly ABOVE the live bar (no stop/start needed).
+        # --- Step 2/3: upgrade in place (bar fills during the real work). ---
+        # Lightweight-first: the new code is upgraded inside the EXISTING pipx venv, reinstalling
+        # only what changed — a full teardown+rebuild happens only as a fallback if that fails.
         progress.console.print(
-            "[dim]Note: Kaalyx installs from GitHub via pipx, so each update is a full "
-            "reinstall of the package — normal for git-based installs, not a bug.[/]")
+            "[dim]Upgrading in place inside the existing environment (only changed files are "
+            "reinstalled; a full rebuild happens only if that fails).[/]")
         # Pin the install to the exact remote commit so pip cannot serve a cached build.
         progress.update(task, description="Update found, preparing", completed=40)
         progress.update(task, description="Pulling latest changes", completed=45)

@@ -306,37 +306,53 @@ def reinstall_from_repo(ref: str | None = None, capture: bool = True) -> tuple[i
         except OSError as exc:  # pragma: no cover
             return 4, f"Failed to launch pipx ({' '.join(cmd)}): {exc}"
 
-    # PRIMARY path: uninstall THEN install — no `--force` at all. This is the surest fix for the
-    # uv backend, whose `pipx install --force` refuses to replace a venv it did not create in
-    # the current session ("Not removing existing venv ... because it was not created in this
-    # session" / "A virtual environment already exists"). Uninstalling first removes the venv
-    # outright, so the install afterwards creates a brand-new one with nothing to overwrite and
-    # no session-ownership check to trip. `pipx uninstall` on a package that is somehow already
-    # gone is harmless. Then a plain `pipx install <spec>` (pinned to the exact commit) does the
-    # genuine reinstall. --pip-args carries the no-cache/force-reinstall belt-and-braces.
     output_parts: list[str] = []
 
+    # PRIMARY (lightweight) path: upgrade IN PLACE inside the existing pipx venv via
+    # `pipx runpip kaalyx install --upgrade <spec>`. This reuses the venv and lets pip reinstall
+    # ONLY what actually changed (kaalyx itself, plus any dependency whose pin moved) — no full
+    # teardown, no rebuilding every unchanged dependency from scratch. `--force-reinstall` is
+    # scoped so pip always replaces kaalyx's own files (never serving a stale build for the same
+    # version string), while `--upgrade` leaves satisfied dependencies untouched. `--no-deps` is
+    # deliberately NOT used, so a genuinely new/changed dependency is still pulled in.
+    light_cmd = [
+        "pipx", "runpip", "kaalyx", "install",
+        "--upgrade", "--force-reinstall", "--no-cache-dir", "--no-deps",
+        spec,
+    ]
+    code, out = _run(light_cmd)
+    output_parts.append(f"[step: in-place upgrade via pipx runpip (--no-deps)]\n{out}")
+    if code == 0:
+        # A code-only change is done. Follow with a deps-only pass so a moved/added dependency
+        # pin is still satisfied without reinstalling the ones that didn't change.
+        code_deps, out_deps = _run(
+            ["pipx", "runpip", "kaalyx", "install", "--upgrade", "--no-cache-dir", spec])
+        output_parts.append(f"[step: dependency top-up (--upgrade)]\n{out_deps}")
+        # The in-place code upgrade already succeeded; a deps top-up failure (e.g. offline) does
+        # not undo it, so report success on the code upgrade.
+        return 0, "\n".join(output_parts)
+
+    if is_network_error(out):
+        return code, "\n".join(output_parts)  # a retry won't fix a network problem
+
+    # FALLBACK (full reinstall): if the in-place upgrade path isn't available (older pipx without
+    # `runpip`, a corrupted venv, or a metadata mismatch), fall back to the robust
+    # uninstall-then-install. No `--force`: on pipx's uv backend `pipx install --force` refuses
+    # to replace a venv it didn't create this session, so we uninstall first (removes the venv
+    # outright) then install fresh, pinned to the exact commit.
+    output_parts.append("[note: in-place upgrade unavailable — falling back to full reinstall]")
     _, unout = _run(["pipx", "uninstall", "kaalyx"])
     output_parts.append(f"[step: pipx uninstall kaalyx]\n{unout}")
 
-    install_cmd = [
-        "pipx", "install",
-        "--pip-args=--no-cache-dir --force-reinstall",
-        spec,
-    ]
-    code, out = _run(install_cmd)
-    output_parts.append(f"[step: pipx install (pinned)]\n{out}")
-    if code == 0:
+    code, out2 = _run(["pipx", "install",
+                       "--pip-args=--no-cache-dir --force-reinstall", spec])
+    output_parts.append(f"[step: pipx install (pinned)]\n{out2}")
+    if code == 0 or is_network_error(out2):
         return code, "\n".join(output_parts)
 
-    if is_network_error(out):
-        # A retry won't fix a network/DNS problem — stop and report it.
-        return code, "\n".join(output_parts)
-
-    # FALLBACK: some older pipx builds mishandle the multi-flag --pip-args string. Retry the
-    # install without it (still uninstalled first above, so still a fresh venv, still pinned).
-    code, out2 = _run(["pipx", "install", spec])
-    output_parts.append(f"[step: retry pipx install without --pip-args]\n{out2}")
+    # Some older pipx builds mishandle the multi-flag --pip-args string; retry without it.
+    code, out3 = _run(["pipx", "install", spec])
+    output_parts.append(f"[step: retry pipx install without --pip-args]\n{out3}")
     return code, "\n".join(output_parts)
 
 

@@ -111,61 +111,151 @@ async def resolve_ips(domain: str) -> list[str]:
     return ips
 
 
-async def _geo_ip(client: "httpx.AsyncClient", ip: str) -> dict | None:
-    """Geolocation + ASN + ISP/org + reverse-DNS for one IP, keyless.
+# Geo/ASN lookup sources, tried in order. Each is keyless except ipinfo.io, which is only
+# attempted when an IPINFO_TOKEN is configured (its free tier still needs a token). The order
+# is: ip-api.com (richest keyless single-call response) → ipapi.co (keyless) → ipinfo.io
+# (token, most reliable but rate-limited without one). We fall through to the next source
+# whenever one errors OR returns no usable data, and only report failure if ALL of them fail.
+def _classify_geo_error(exc: Exception) -> str:
+    """Turn a fetch exception/status into a short human reason: timeout / rate-limited / etc."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection refused"
+    if isinstance(exc, httpx.HTTPError):
+        return "network error"
+    return f"{type(exc).__name__}"
 
-    Primary: ip-api.com (free, no key, one call returns country/asn/isp/org/reverse). Fallback:
-    ipapi.co. Returns a normalised dict or ``None`` on total failure.
+
+async def _geo_via_ipapi_com(client: "httpx.AsyncClient", ip: str) -> dict:
+    """ip-api.com — one keyless call returns country/asn/isp/org/reverse. May raise; may return
+    ``{}`` (source reachable but no data / rate-limited via its own status field)."""
+    resp = await client.get(
+        f"http://ip-api.com/json/{ip}",
+        params={"fields": "status,message,country,countryCode,isp,org,as,asname,reverse,query"},
+        timeout=8,
+    )
+    if resp.status_code == 429:
+        raise httpx.HTTPStatusError("rate-limited", request=resp.request, response=resp)
+    resp.raise_for_status()
+    d = resp.json()
+    if d.get("status") != "success":
+        return {}  # e.g. {"status":"fail","message":"reserved range"} — no usable data
+    return {
+        "ip": ip, "via": "ip-api.com",
+        "country": d.get("country") or "", "cc": d.get("countryCode") or "",
+        "asn": d.get("as") or "", "asname": d.get("asname") or "",
+        "isp": d.get("isp") or "", "org": d.get("org") or "",
+        "reverse": d.get("reverse") or "",
+    }
+
+
+async def _geo_via_ipapi_co(client: "httpx.AsyncClient", ip: str) -> dict:
+    """ipapi.co — keyless JSON. Returns ``{}`` when it signals an error (rate-limit/reserved)."""
+    resp = await client.get(f"https://ipapi.co/{ip}/json/", timeout=8)
+    if resp.status_code == 429:
+        raise httpx.HTTPStatusError("rate-limited", request=resp.request, response=resp)
+    resp.raise_for_status()
+    d = resp.json()
+    if d.get("error"):
+        return {}
+    asn = (f"AS{d['asn']}" if d.get("asn") else "").replace("ASAS", "AS")
+    return {
+        "ip": ip, "via": "ipapi.co",
+        "country": d.get("country_name") or "", "cc": d.get("country") or "",
+        "asn": asn, "asname": d.get("org") or "",
+        "isp": d.get("org") or "", "org": d.get("org") or "",
+        "reverse": "",
+    }
+
+
+async def _geo_via_ipinfo_io(client: "httpx.AsyncClient", ip: str, token: str) -> dict:
+    """ipinfo.io free tier (requires IPINFO_TOKEN). ``org`` is like ``AS16509 Amazon.com, Inc.``."""
+    resp = await client.get(f"https://ipinfo.io/{ip}/json",
+                            params={"token": token}, timeout=8)
+    if resp.status_code == 429:
+        raise httpx.HTTPStatusError("rate-limited", request=resp.request, response=resp)
+    resp.raise_for_status()
+    d = resp.json()
+    org = d.get("org") or ""            # "AS16509 Amazon.com, Inc."
+    m = re.match(r"(AS\d+)\s+(.*)", org)
+    asn = m.group(1) if m else ""
+    orgname = m.group(2) if m else org
+    return {
+        "ip": ip, "via": "ipinfo.io",
+        "country": d.get("country") or "", "cc": d.get("country") or "",
+        "asn": (f"{asn} {orgname}".strip() if asn else ""), "asname": orgname,
+        "isp": orgname, "org": orgname,
+        "reverse": d.get("hostname") or "",
+    }
+
+
+async def _geo_ip(client: "httpx.AsyncClient", ip: str, ipinfo_token: str | None = None) -> dict:
+    """Geolocation + ASN + ISP/org + reverse-DNS for one IP, with automatic source fallback.
+
+    Tries ip-api.com → ipapi.co → ipinfo.io (the last only if *ipinfo_token* is set), moving on
+    whenever a source errors or returns no usable data. On success returns the normalised dict
+    from the first source that worked (including a ``via`` key naming that source). On total
+    failure returns ``{"ip": ip, "failed": True, "tried": [(source, reason), ...]}`` so the
+    caller can report exactly which sources were attempted and why each failed — never a silent
+    blank.
     """
-    # ip-api.com — select exactly the fields we need. `reverse` is the PTR (reverse-IP) name.
-    try:
-        resp = await client.get(
-            f"http://ip-api.com/json/{ip}",
-            params={"fields": "status,country,countryCode,regionName,city,isp,org,as,asname,reverse,query"},
-        )
-        if resp.status_code == 200:
-            d = resp.json()
-            if d.get("status") == "success":
-                return {
-                    "ip": ip,
-                    "country": d.get("country") or "",
-                    "cc": d.get("countryCode") or "",
-                    "asn": d.get("as") or "",           # e.g. "AS15169 Google LLC"
-                    "asname": d.get("asname") or "",
-                    "isp": d.get("isp") or "",
-                    "org": d.get("org") or "",
-                    "reverse": d.get("reverse") or "",  # reverse-IP / PTR
-                }
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        logger.debug("ip-api.com failed for %s: %s", ip, exc)
-    # Fallback: ipapi.co (keyless).
-    try:
-        resp = await client.get(f"https://ipapi.co/{ip}/json/")
-        if resp.status_code == 200:
-            d = resp.json()
-            if not d.get("error"):
-                return {
-                    "ip": ip,
-                    "country": d.get("country_name") or "",
-                    "cc": d.get("country") or "",
-                    "asn": (f"AS{d.get('asn')}" if d.get("asn") else "").replace("ASAS", "AS"),
-                    "asname": d.get("org") or "",
-                    "isp": d.get("org") or "",
-                    "org": d.get("org") or "",
-                    "reverse": "",
-                }
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        logger.debug("ipapi.co failed for %s: %s", ip, exc)
-    return None
+    attempts = [
+        ("ip-api.com", lambda: _geo_via_ipapi_com(client, ip)),
+        ("ipapi.co", lambda: _geo_via_ipapi_co(client, ip)),
+    ]
+    if ipinfo_token:
+        attempts.append(("ipinfo.io", lambda: _geo_via_ipinfo_io(client, ip, ipinfo_token)))
+
+    tried: list[tuple[str, str]] = []
+    for name, call in attempts:
+        try:
+            info = await call()
+        except Exception as exc:  # noqa: BLE001 — any failure just falls through to next source
+            reason = _classify_geo_error(exc)
+            logger.debug("geo source %s failed for %s: %s (%s)", name, ip, exc, reason)
+            tried.append((name, reason))
+            continue
+        if info:
+            if tried:
+                logger.debug("geo for %s recovered via %s after %s", ip, name, tried)
+            return info
+        tried.append((name, "no data returned"))
+    return {"ip": ip, "failed": True, "tried": tried}
 
 
-async def ip_info(domain: str) -> list[OsintRecord]:
+def _encode_ip_detail(info: dict) -> str:
+    """Encode a geo result into a stable ``key=value|key=value`` detail string the UI parses.
+
+    On success: ``country=..|cc=..|asn=..|org=..|isp=..|reverse=..|via=<source>``.
+    On total failure: ``failed=1|tried=ip-api.com:timeout,ipapi.co:rate-limited,..``.
+    Missing individual fields are simply absent (the UI renders them ``[unavailable]``).
+    """
+    if info.get("failed"):
+        trail = ",".join(f"{name}:{reason}" for name, reason in info.get("tried", []))
+        return f"failed=1|tried={trail}"
+    fields = [
+        ("country", info.get("country", "")),
+        ("cc", info.get("cc", "")),
+        ("asn", info.get("asn", "")),
+        ("org", (info.get("org") or info.get("isp") or "")),
+        ("isp", info.get("isp", "")),
+        ("reverse", info.get("reverse", "")),
+        ("via", info.get("via", "")),
+    ]
+    # `|` and `=` never appear in these provider values; keep only populated fields.
+    return "|".join(f"{k}={v}" for k, v in fields if v)
+
+
+async def ip_info(domain: str, ipinfo_token: str | None = None) -> list[OsintRecord]:
     """Reverse-IP / geolocation / ASN / whois-org intelligence for the domain's resolved IP(s).
 
-    Resolves the domain to its A/AAAA addresses, then fetches keyless geo+ASN+ISP+reverse-DNS
-    for each and returns them as ``kind="ip_info"`` OsintRecords (rendered in the Host/IP
-    Intelligence table). ``value`` is the IP; ``detail`` a one-line country · ASN · org · rev
-    summary. Empty on total failure — never raises.
+    Resolves the domain to its A/AAAA addresses, then fetches geo+ASN+ISP+reverse-DNS for each
+    with automatic source fallback (ip-api.com → ipapi.co → ipinfo.io when a token is set) and
+    returns them as ``kind="ip_info"`` OsintRecords (rendered in the tree-style IP intel view).
+    ``value`` is the IP; ``detail`` is a parseable ``key=value|..`` string carrying every field
+    plus the source used — or, when all sources fail, the list of sources tried and why each
+    failed. Empty only when the domain has no resolvable IP. Never raises.
     """
     ips = await resolve_ips(domain)
     if not ips:
@@ -174,23 +264,9 @@ async def ip_info(domain: str) -> list[OsintRecord]:
     async with httpx.AsyncClient(timeout=15, follow_redirects=True,
                                  headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
         for ip in ips:
-            info = await _geo_ip(client, ip)
-            if info is None:
-                records.append(OsintRecord(kind="ip_info", value=ip,
-                                           detail="(geo/ASN lookup failed)", source="ip_info"))
-                continue
-            parts = []
-            if info["country"]:
-                parts.append(f"{info['country']}" + (f" ({info['cc']})" if info["cc"] else ""))
-            if info["asn"]:
-                parts.append(info["asn"])
-            org = info["org"] or info["isp"]
-            if org and org not in (info["asn"], ""):
-                parts.append(org)
-            if info["reverse"]:
-                parts.append(f"rev={info['reverse']}")
-            records.append(OsintRecord(
-                kind="ip_info", value=ip, detail=" · ".join(parts), source="ip_info"))
+            info = await _geo_ip(client, ip, ipinfo_token)
+            records.append(OsintRecord(kind="ip_info", value=ip,
+                                        detail=_encode_ip_detail(info), source="ip_info"))
     return records
 
 

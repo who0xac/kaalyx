@@ -890,12 +890,22 @@ class OsintStage(Stage):
 
     async def _src_ip_info(self) -> SourceResult:
         res = SourceResult(name="ip_info")
-        # Resolve the target's IP(s) and fetch keyless geo/ASN/ISP-org/reverse-IP per IP.
-        res.osint = await osint_inproc.ip_info(self.ctx.target.registrable)
+        # Resolve the target's IP(s) and fetch geo/ASN/ISP-org/reverse-IP per IP, with automatic
+        # fallback across ip-api.com → ipapi.co → ipinfo.io (last only if IPINFO_TOKEN is set).
+        res.osint = await osint_inproc.ip_info(
+            self.ctx.target.registrable, self.ctx.secrets.ipinfo_token)
         if not res.osint:
-            res.note = "no resolvable IP / geo lookup unavailable"
+            res.note = "no resolvable IP"
         else:
-            res.note = f"{len(res.osint)} IP(s)"
+            # Surface whether every IP's lookup exhausted all sources, so a genuine failure is
+            # never a silent gap in the live board.
+            failed = [r for r in res.osint if r.detail.startswith("failed=1")]
+            if failed and len(failed) == len(res.osint):
+                res.note = f"{len(res.osint)} IP(s) — geo lookup failed (all sources)"
+            elif failed:
+                res.note = f"{len(res.osint)} IP(s), {len(failed)} geo lookup failed"
+            else:
+                res.note = f"{len(res.osint)} IP(s)"
         return res
 
     async def _src_m365(self) -> SourceResult:

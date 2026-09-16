@@ -590,19 +590,112 @@ def social_table(records: list) -> Table | None:
     return table
 
 
-def host_intel_table(records: list) -> Table | None:
-    """Show resolved-IP geolocation / ASN / ISP-org / reverse-IP (the ip_info source), so this
-    intelligence is visible by default rather than buried in the raw files."""
+def _parse_ip_detail(detail: str) -> dict:
+    """Parse the ``key=value|..`` detail string emitted by ip_info back into a dict. Recognises
+    the total-failure form ``failed=1|tried=src:reason,src:reason``."""
+    out: dict = {}
+    for part in (detail or "").split("|"):
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        out[k.strip()] = v.strip()
+    if out.get("failed") == "1":
+        trail = out.get("tried", "")
+        pairs = []
+        for item in trail.split(","):
+            if ":" in item:
+                src, _, reason = item.partition(":")
+                pairs.append((src.strip(), reason.strip()))
+            elif item.strip():
+                pairs.append((item.strip(), "failed"))
+        out["_tried"] = pairs
+    return out
+
+
+# Dotted-leader helper so every field label lines up like the OSINT board rows.
+def _leader(label: str, width: int = 12) -> str:
+    dots = "." * max(4, width - len(label) + 4)
+    return f"{label} {dots}"
+
+
+def host_intel_table(records: list):
+    """Tree-style IP intelligence view (the ip_info source): resolved-IP geolocation / ASN /
+    ISP-org / reverse-IP, shown by default rather than buried in the raw files.
+
+    Renders in the project's hacker/cybersec idiom — an ``[◆] IP_INTEL :: geo/asn lookup``
+    header, each IP as a branch with ``├─``/``└─`` connectors for COUNTRY/ASN/ORG/ISP/REVERSE.
+    A field the lookup couldn't fill (even after all fallbacks) shows ``[unavailable]`` rather
+    than being dropped. When every geo source failed for an IP, a clear failure block lists
+    which sources were tried and why each failed (timeout / rate-limited / …)."""
     rows = [r for r in records if r["kind"] == "ip_info"]
     if not rows:
         return None
-    table = Table(title="Host / IP Intelligence", box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white")
-    table.add_column("IP", style="cyan", no_wrap=True)
-    table.add_column("Country · ASN · Org · Reverse", style="white", overflow="fold")
+
+    lines: list = []
+    lines.append(Text.assemble(("[◆] ", "bold orange1"), ("IP_INTEL", "bold orange1"),
+                                (" :: ", MUTED), ("geo/asn lookup", "orange1")))
+    lines.append(Text(""))
+
+    UNAVAIL = Text("[unavailable]", style="yellow")
+
     for r in rows:
-        table.add_row(r["value"], r["detail"] or "—")
-    return table
+        ip = r["value"]
+        info = _parse_ip_detail(r["detail"])
+        # TARGET_IP header row for this address.
+        lines.append(Text.assemble(("    ", ""),
+                                    (_leader("TARGET_IP", 12), "bold white"),
+                                    (" ", ""), (ip, "bold cyan")))
+
+        if info.get("failed") == "1":
+            # Total failure: every source exhausted. List each source tried and why.
+            tried = info.get("_tried", [])
+            lines.append(Text.assemble(("    └─ ", "red"),
+                                       ("GEO LOOKUP FAILED — all sources exhausted", "bold red")))
+            for i, (src, reason) in enumerate(tried):
+                conn = "       └─ " if i == len(tried) - 1 else "       ├─ "
+                lines.append(Text.assemble((conn, MUTED), (f"{src} ", "white"),
+                                           (f"→ {reason}", "yellow")))
+            lines.append(Text(""))
+            continue
+
+        # Success (possibly partial). Build the field branches; missing → [unavailable].
+        country = info.get("country", "")
+        cc = info.get("cc", "")
+        country_disp = (f"{country} ({cc})" if country and cc else (country or cc))
+        asn = info.get("asn", "")
+        org = info.get("org", "")
+        isp = info.get("isp", "")
+        reverse = info.get("reverse", "")
+        via = info.get("via", "")
+
+        branches = [
+            ("COUNTRY", country_disp, "white"),
+            ("ASN", asn, "green"),
+            ("ORG", org, "white"),
+            ("ISP", isp, "white"),
+        ]
+        if reverse:
+            branches.append(("REVERSE", reverse, "cyan"))
+
+        for i, (label, val, style) in enumerate(branches):
+            conn = "    └─ " if i == len(branches) - 1 else "    ├─ "
+            val_txt = Text(val, style=style) if val else UNAVAIL
+            lines.append(Text.assemble((conn, ACCENT_DIM),
+                                       (_leader(label, 10), "bold white"),
+                                       (" ", ""), *_as_assemble(val_txt)))
+        if via:
+            lines.append(Text.assemble(("       via ", MUTED), (via, MUTED)))
+        lines.append(Text(""))
+
+    # Drop the trailing blank line for a tight block.
+    while lines and isinstance(lines[-1], Text) and str(lines[-1]) == "":
+        lines.pop()
+    return Group(*lines)
+
+
+def _as_assemble(txt: Text):
+    """Yield a single (text, style) tuple from a Text so it can be spread into Text.assemble."""
+    return [(txt.plain, txt.style or "")]
 
 
 # Category → human section title, in the order we present them.

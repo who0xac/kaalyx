@@ -833,6 +833,29 @@ def _check_key(name: str) -> None:
     else:
         console.print(f"  {env_name} in env : [green]set[/] → {_mask(env_val)}")
 
+    # GitHub supports MULTIPLE tokens for rotation (GITHUB_TOKEN, GITHUB_TOKEN_2, _3, …). Show
+    # every numbered slot found in the file / env, not just the first, so a rotation setup is
+    # verifiable — the single-key trace above only covered GITHUB_TOKEN.
+    if env_name == "GITHUB_TOKEN":
+        console.print("\n  [bold]GitHub token slots (rotation):[/]")
+        file_vals = {}
+        if resolved is not None:
+            try:
+                file_vals = dotenv_values(str(resolved))
+            except Exception:  # noqa: BLE001
+                file_vals = {}
+        for i in range(1, 6):
+            slot = "GITHUB_TOKEN" if i == 1 else f"GITHUB_TOKEN_{i}"
+            env_v = (os.environ.get(slot) or "").strip()
+            file_v = (file_vals.get(slot) or "").strip()
+            resolved_v = env_v or file_v
+            src = "env" if env_v else ("config.env" if file_v else "")
+            if resolved_v:
+                console.print(f"    {slot:<16} [green]set[/] → {_mask(resolved_v)}  [dim]({src})[/]")
+            elif slot in os.environ or slot in file_vals:
+                console.print(f"    {slot:<16} [yellow]present but BLANK[/]")
+        # (slots with nothing at all are omitted to keep the list short)
+
     # 4) The FINAL resolved value load_secrets() produces (what a scan actually uses).
     secrets = load_secrets()
     if env_name == "GITHUB_TOKEN":
@@ -842,7 +865,12 @@ def _check_key(name: str) -> None:
         final = getattr(secrets, attr, None) if attr else None
     console.print()
     if final:
-        console.print(f"  [green]✔ RESOLVED[/] — the scan WILL use this key ({_mask(final)}).")
+        if env_name == "GITHUB_TOKEN":
+            n = len(secrets.github_tokens)
+            console.print(f"  [green]✔ RESOLVED[/] — {n} GitHub token(s) will be used "
+                          f"(rotated across requests).")
+        else:
+            console.print(f"  [green]✔ RESOLVED[/] — the scan WILL use this key ({_mask(final)}).")
     else:
         console.print(f"  [red]✘ NOT RESOLVED[/] — the scan sees NO key; the source will skip.")
         console.print("  [dim]Most common cause: a stale/blank ./config.env in the current "

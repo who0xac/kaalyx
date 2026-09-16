@@ -470,7 +470,7 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
         censys_api_id=_get("CENSYS_API_ID"),
         censys_api_secret=_get("CENSYS_API_SECRET"),
         chaos_api_key=_get("CHAOS_API_KEY"),
-        github_tokens=_collect_github_tokens(),
+        github_tokens=_collect_github_tokens(file_values),
         ipinfo_token=_get("IPINFO_TOKEN"),
         telegram_bot_token=_get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_get("TELEGRAM_CHAT_ID"),
@@ -481,27 +481,45 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
     )
 
 
-def _collect_github_tokens() -> list[str]:
-    """Gather all configured GitHub tokens for rotation.
+def _collect_github_tokens(file_values: dict[str, str] | None = None) -> list[str]:
+    """Gather all configured GitHub tokens for rotation, from BOTH the environment and the
+    config.env file layer.
 
-    Uses the numbered form only: ``GITHUB_TOKEN``, then ``GITHUB_TOKEN_2``,
-    ``GITHUB_TOKEN_3`` … (contiguous). One token behaves exactly as a single-token setup.
-    (The earlier comma-separated ``GITHUB_TOKENS`` form was removed — one clear format.)
+    Uses the numbered form: ``GITHUB_TOKEN``, then ``GITHUB_TOKEN_2``, ``GITHUB_TOKEN_3`` …
+    One token behaves exactly as a single-token setup. For EACH slot the value is resolved with
+    the same precedence as every other secret — a non-empty environment value wins, otherwise the
+    config.env file value (an empty env var is treated as absent, so a blank ``GITHUB_TOKEN=`` in
+    the shell can't mask a real token in config.env; this is the same footgun that hid the Shodan
+    key). Reading *file_values* directly means numbered tokens set ONLY in config.env are found
+    even if they were never exported to the environment. Dedupes; skips gaps so a missing
+    ``GITHUB_TOKEN_2`` doesn't stop us finding ``GITHUB_TOKEN_3`` (scans a few slots past a gap).
     """
+    file_values = file_values or {}
     tokens: list[str] = []
 
+    def _resolve(name: str) -> str | None:
+        env = os.environ.get(name)
+        if env and env.strip():
+            return env.strip()
+        fv = file_values.get(name)
+        return fv.strip() if fv and fv.strip() else None
+
     def _add(value: str | None) -> None:
-        value = (value or "").strip()
         if value and value not in tokens:
             tokens.append(value)
 
-    _add(os.environ.get("GITHUB_TOKEN"))
+    _add(_resolve("GITHUB_TOKEN"))
+    # Scan numbered slots; tolerate small gaps (stop after a few consecutive empties) so a user
+    # who leaves GITHUB_TOKEN_2 blank but fills _3 still gets _3.
+    misses = 0
     i = 2
-    while True:
-        val = os.environ.get(f"GITHUB_TOKEN_{i}")
+    while misses < 3 and i < 50:
+        val = _resolve(f"GITHUB_TOKEN_{i}")
         if val is None:
-            break
-        _add(val)
+            misses += 1
+        else:
+            misses = 0
+            _add(val)
         i += 1
     return tokens
 

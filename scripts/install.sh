@@ -16,8 +16,11 @@ BIN_DIR="${HOME}/bin"
 SRC_DIR="${HOME}/src"
 GOBIN_DIR="${HOME}/go/bin"
 CARGO_BIN="${HOME}/.cargo/bin"
+# Per-tool install logs live here so a failed step can show its REAL error (pip/clone stderr)
+# instead of a bare "failed". The tail is printed inline on failure; the full log is kept.
+LOG_DIR="${SRC_DIR}/.install-logs"
 
-mkdir -p "${BIN_DIR}" "${SRC_DIR}" "${GOBIN_DIR}"
+mkdir -p "${BIN_DIR}" "${SRC_DIR}" "${GOBIN_DIR}" "${LOG_DIR}"
 
 export GOPATH="${HOME}/go"
 export GOBIN="${GOBIN_DIR}"
@@ -96,18 +99,27 @@ run_tool() {
         printf '  [%d/%d] %s %s(clone)%s\n' "$((_STEP_i + 1))" "${_STEP_total}" "${name}" "${C_DIM}" "${C_NC}"
     fi
     # The install function returns non-zero on a broken/failed install (deps failed / not
-    # runnable). Verify runnability after it runs, not just that a wrapper exists.
-    if "$@" >/dev/null 2>&1; then
+    # runnable). Capture its stdout+stderr to a per-tool log so a failure shows the REAL error
+    # (pip/clone output) rather than a bare "failed". Verify runnability after it runs.
+    local logf="${LOG_DIR}/${name}.log" rc=0
+    "$@" >"${logf}" 2>&1 || rc=$?
+    local ok=1
+    if [[ ${rc} -eq 0 ]]; then
         if [[ "${_CAT_LABEL}" == "Repositories" ]]; then
-            wrapper_runnable "${name}" && tool_step "${name}" ok "${ok_verb}" \
-                                       || tool_step "${name}" failed
-        elif command -v "${name}" >/dev/null 2>&1; then
-            tool_step "${name}" ok "${ok_verb}"
-        else
-            tool_step "${name}" failed
+            wrapper_runnable "${name}" || ok=0
+        elif ! command -v "${name}" >/dev/null 2>&1; then
+            ok=0
         fi
     else
+        ok=0
+    fi
+    if [[ ${ok} -eq 1 ]]; then
+        tool_step "${name}" ok "${ok_verb}"
+    else
         tool_step "${name}" failed
+        # Surface the actual error: the last lines of the captured log, indented.
+        printf '        %s— error (last lines of %s):%s\n' "${C_DIM}" "${logf}" "${C_NC}"
+        tail -n 12 "${logf}" 2>/dev/null | sed 's/^/          /'
     fi
 }
 
@@ -298,7 +310,7 @@ parse_args "$@"
 OSINT_TOOLS=(
     whois dnsx github-subdomains trufflehog cloud_enum s3scanner badsecrets
     retire theHarvester misconfig-mapper h8mail porch-pirate swaggerspy gato
-    git-dumper msftrecon spoofy
+    git-dumper msftrecon spoofy dnstwist
 )
 # Part 2 — Subdomains.
 SUBDOMAIN_TOOLS=(
@@ -725,8 +737,18 @@ git_venv_tool() {
 
     # Install dependencies — do NOT swallow failure; capture it so we can report a broken tool.
     local dep_rc=0
-    if [[ "${req}" == "req" && -f "${dir}/requirements.txt" ]]; then
-        "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt" || dep_rc=$?
+    if [[ "${req}" == "req" ]]; then
+        # Prefer requirements.txt when present; otherwise fall back to installing the package
+        # itself so pyproject.toml / setup.py-only repos (e.g. cloud_enum, which dropped its
+        # requirements.txt for a pyproject) still get their declared dependencies. A repo with
+        # neither has no deps to install (dep_rc stays 0).
+        if [[ -f "${dir}/requirements.txt" ]]; then
+            "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt" || dep_rc=$?
+        elif [[ -f "${dir}/pyproject.toml" || -f "${dir}/setup.py" ]]; then
+            "${dir}/.venv/bin/pip" install "${dir}" || dep_rc=$?
+        else
+            warn "${name}: no requirements.txt / pyproject.toml / setup.py — installing with no deps."
+        fi
     elif [[ "${req}" == "self" ]]; then
         "${dir}/.venv/bin/pip" install "${dir}" || dep_rc=$?
     elif [[ -n "${req}" ]]; then
@@ -1045,6 +1067,9 @@ EOF
 
 install_h8mail()      { pipx_install h8mail h8mail; }
 install_porch_pirate() { pipx_install porch-pirate porch-pirate; }
+# dnstwist: typosquatting / look-alike domain discovery. Published on PyPI with a `dnstwist`
+# console entry point, so pipx (isolated, on PATH) matches our other Python CLI tools.
+install_dnstwist()    { pipx_install dnstwist dnstwist; }
 
 # LeakSearch (JoelGMSec): git clone + venv + wrapper. Kaalyx invokes it as `LeakSearch`
 # (capital L — matches the entry script name), querying the keyless ProxyNova/COMB dump.
@@ -1263,6 +1288,7 @@ MANIFEST=(
   "osint|py|porch-pirate|install_porch_pirate"
   "osint|py|theHarvester|install_theharvester"
   "osint|py|retire|install_retirejs"
+  "osint|py|dnstwist|install_dnstwist"
   "subdomains|py|shodan|install_shodan"
   "subdomains|py|subdominator|install_subdominator"
   "subdomains|py|censys|install_censys"

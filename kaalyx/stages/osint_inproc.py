@@ -1095,61 +1095,220 @@ def _brand_token_match(brand: str, text: str) -> bool:
                      text.lower()) is not None
 
 
-# Mobile app discovery (Apple App Store + Google Play) --------------------------------------
-async def discover_mobile_apps(company_name: str) -> list[OsintRecord]:
-    """Find the organisation's published mobile apps (keyless).
+# Company-identity resolution --------------------------------------------------------------
+# The hard part of matching a domain to its mobile apps (and other name-seeded searches) is
+# that a company's real, published name is often NOT the bare domain label (e.g. polycab.com's
+# apps are published under "Polycab India Limited", not "polycab"). We resolve a set of RANKED
+# candidate identities from several independent signals and search on all of them — mirroring
+# our own discover_github_org multi-signal, confidence-ranked pattern rather than trusting one.
 
-    Uses Apple's public iTunes Search API (keyless JSON) and a Google Play store query. Returns
-    ``mobile_app`` records naming each app + its store URL — a pivot to bundle ids / privacy
-    contacts / package names. Never raises."""
+@dataclass
+class CompanyIdentity:
+    name: str
+    confidence: str   # "high" | "medium" | "low"
+    signal: str       # which source produced it (rdap_org / m365_brand / social_handle / domain_label)
+
+
+async def _rdap_org_name(domain: str) -> str | None:
+    """Keyless registrant-organisation name for *domain* via RDAP (rdap.org bootstrap → the
+    registry's structured JSON). Returns the org/registrant name string, or ``None``.
+
+    RDAP is the successor to WHOIS and returns machine-readable vCard entities, so unlike
+    scraping free-text WHOIS we can pull the ``org``/registrant ``fn`` reliably and keylessly."""
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)",
+                                          "accept": "application/rdap+json"}) as client:
+        try:
+            resp = await client.get(f"https://rdap.org/domain/{domain}")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("rdap %s: %s", domain, exc)
+            return None
+        # Entities carry vCard arrays; the registrant's "fn" or "org" is the company name.
+        for ent in data.get("entities", []) or []:
+            roles = ent.get("roles") or []
+            if "registrant" not in roles and "administrative" not in roles:
+                continue
+            vcard = (ent.get("vcardArray") or [None, []])[1]
+            org = fn = None
+            for field in vcard:
+                if not isinstance(field, list) or len(field) < 4:
+                    continue
+                if field[0] == "org":
+                    org = field[3] if isinstance(field[3], str) else (field[3][0] if field[3] else None)
+                elif field[0] == "fn":
+                    fn = field[3]
+            name = org or fn
+            if name and name.lower() not in ("redacted for privacy", "not disclosed", "redacted"):
+                return name.strip()
+    return None
+
+
+def _clean_org_name(name: str) -> str:
+    """Strip common corporate suffixes so 'Polycab India Limited' → a tighter brand token set.
+    Keeps the full name too; this just yields an extra, shorter candidate."""
+    n = re.sub(r"[.,]", " ", name)
+    n = re.sub(r"\b(inc|llc|ltd|limited|corp|corporation|gmbh|pvt|private|plc|co|company|"
+               r"holdings|group|india|international|technologies|technology|labs|software|"
+               r"solutions|services|systems)\b", " ", n, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+async def resolve_company_identities(
+    target, m365_records: list[OsintRecord] | None = None,
+    social_handles: list[str] | None = None, whois_records: list[OsintRecord] | None = None,
+) -> list[CompanyIdentity]:
+    """Resolve ranked candidate company identities for *target* from several signals.
+
+    Signals, strongest first — combine independent signals, rank by confidence, prefer
+    agreement (the same multi-signal pattern used by discover_github_org):
+      * **RDAP/WHOIS registrant org** (HIGH) — the registered legal name; the most authoritative
+        machine-readable mapping of a domain to a company. Often redacted for .com registrants.
+      * **M365 tenant brand** (HIGH) — the Microsoft tenant's FederationBrandName; a strong,
+        target-controlled display name.
+      * **Social-profile handle** (MEDIUM) — the org's handle on a third-party social platform,
+        harvested from the homepage.
+      * **Domain label** (MEDIUM, or LOW when it is a generic word) — the bare registrable label.
+        Always included as a fallback, but never trusted alone for generic labels.
+
+    All signals are fetched HERE (RDAP, plus M365 tenant brand and social handles when not passed
+    in by the caller) so the resolver is self-contained and deterministic regardless of source
+    ordering. A cleaned/suffix-stripped variant of each org name is added as an extra candidate.
+    Duplicates merge keeping the highest confidence. Keyless."""
+    order = {"high": 3, "medium": 2, "low": 1}
+    found: dict[str, CompanyIdentity] = {}
+
+    def _add(name: str, confidence: str, signal: str) -> None:
+        key = (name or "").strip().lower()
+        if not key or len(key) < 2:
+            return
+        if key not in found or order[confidence] > order[found[key].confidence]:
+            found[key] = CompanyIdentity(name=name.strip(), confidence=confidence, signal=signal)
+
+    # (1) RDAP registrant org — most authoritative.
+    rdap = await _rdap_org_name(target.registrable)
+    if rdap:
+        _add(rdap, "high", "rdap_org")
+        cleaned = _clean_org_name(rdap)
+        if cleaned and cleaned.lower() != rdap.lower():
+            _add(cleaned, "high", "rdap_org")
+    # WHOIS registrant-org lines (from the external whois tool, if present) as a backup signal.
+    for rec in (whois_records or []):
+        m = re.search(r"(?:registrant organization|org(?:anization)?)\s*:\s*(.+)", rec.value, re.I)
+        if m:
+            org = m.group(1).strip()
+            if org and "redacted" not in org.lower():
+                _add(org, "high", "whois_org")
+
+    # (2) M365 tenant brand — use passed-in records, else fetch the tenant map now.
+    if m365_records is None:
+        try:
+            m365_records, _ = await map_m365_tenant(target.registrable)
+        except Exception as exc:  # noqa: BLE001 — identity resolution must never raise
+            logger.debug("m365 for identity failed: %s", exc)
+            m365_records = []
+    for rec in (m365_records or []):
+        m = re.search(r"brand[=:]\s*([^;|]+)", rec.detail or "", re.I) or \
+            re.search(r"federated via\s+(.+)", rec.value or "", re.I)
+        if m:
+            brand = m.group(1).strip()
+            if brand and brand.lower() not in ("", "none"):
+                _add(brand, "high", "m365_brand")
+
+    # (3) social handles — a company's real profile handle on a THIRD-PARTY platform
+    # (linkedin/twitter/facebook/instagram/youtube) is a good brand candidate. We deliberately
+    # do NOT use github/gitlab "handles": on a dev-centric target those match the site's own nav
+    # paths (github.com/pricing, /security, …) and flood the resolver with junk. We also drop the
+    # platform's own chrome words and anything that is a generic label.
+    if social_handles is None:
+        social_handles = []
+        try:
+            social_recs, _gh_handles, _blocked = await discover_social_profiles(target.registrable)
+            _brand_platforms = {"linkedin", "twitter", "facebook", "instagram", "youtube"}
+            for rec in social_recs:
+                platform = (rec.detail or "").lower()
+                handle = rec.value.split(":", 1)[-1].strip().lstrip("@").lower()
+                if platform in _brand_platforms and handle and handle not in _GENERIC_LABELS \
+                        and handle not in _SOCIAL_IGNORE and len(handle) >= 3:
+                    social_handles.append(handle)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("social for identity failed: %s", exc)
+    for h in social_handles:
+        _add(h, "medium", "social_handle")
+
+    # (4) domain label — always, but low confidence for a generic word.
+    base = target.registrable.split(".")[0]
+    _add(base, "low" if base.lower() in _GENERIC_LABELS else "medium", "domain_label")
+
+    return sorted(found.values(), key=lambda c: order[c.confidence], reverse=True)
+
+
+# Mobile app discovery (Apple App Store + Google Play) --------------------------------------
+async def discover_mobile_apps(identities: list[CompanyIdentity]) -> list[OsintRecord]:
+    """Find the organisation's published mobile apps from a set of ranked company identities.
+
+    Searches Apple's iTunes Search API (keyless JSON) and Google Play for each candidate name,
+    keeping apps whose SELLER/developer (or package id / track title) matches that candidate as a
+    distinct token. Each record notes WHICH identity signal matched it (e.g. ``via rdap_org``),
+    so the operator can see why an app was attributed to the target. Never raises."""
     records: list[OsintRecord] = []
-    brand = company_name.strip().lower()
-    # For a generic-word brand, a substring/track-name match is meaningless (every "example"
-    # app matches), so require the brand as a distinct token in the SELLER/developer name —
-    # apps a same-named developer actually published.
-    generic = brand in _GENERIC_LABELS
+    if not identities:
+        return records
+    seen: set[str] = set()  # dedupe apps across identity candidates (bundleId / package)
     async with httpx.AsyncClient(timeout=12, follow_redirects=True,
                                  headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
-        # Apple iTunes Search API — reliable keyless JSON.
-        try:
-            resp = await client.get("https://itunes.apple.com/search",
-                                    params={"term": company_name, "entity": "software", "limit": 25})
-            if resp.status_code == 200:
-                for app in resp.json().get("results", []) or []:
-                    seller = app.get("sellerName") or app.get("artistName") or ""
-                    track = app.get("trackName") or ""
-                    seller_hit = _brand_token_match(brand, seller)
-                    # Generic brand: seller must match. Distinctive brand: seller OR track title.
-                    if generic:
-                        keep = seller_hit
-                    else:
-                        keep = seller_hit or _brand_token_match(brand, track)
-                    if not keep:
-                        continue
-                    records.append(OsintRecord(
-                        kind="mobile_app", value=track,
-                        detail=f"iOS · {app.get('bundleId','')} · seller={seller} · "
-                               f"{app.get('trackViewUrl','')}", source="mobile_app"))
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.debug("itunes search failed: %s", exc)
-        # Google Play — HTML search; extract package ids (id=<pkg>) referencing the company.
-        # A package id is reverse-DNS (com.<vendor>.<app>); require the brand to be a distinct
-        # segment of it (so com.acme.app matches, com.x.acmeexamples does not). Skip a generic
-        # brand entirely — a substring like "example" hits countless unrelated packages.
-        if not generic:
+        for ident in identities:
+            term = ident.name
+            brand = term.strip().lower()
+            # A generic-word identity (e.g. the bare "cloud" label) matches everything, so for it
+            # we require the brand as a distinct token in the SELLER/developer name only. A
+            # distinctive identity (an RDAP org, a real brand) may also match the track title.
+            generic = brand in _GENERIC_LABELS or ident.confidence == "low"
+            # Apple iTunes Search API — reliable keyless JSON.
             try:
-                resp = await client.get("https://play.google.com/store/search",
-                                        params={"q": company_name, "c": "apps"})
+                resp = await client.get("https://itunes.apple.com/search",
+                                        params={"term": term, "entity": "software", "limit": 25})
                 if resp.status_code == 200:
-                    pkgs = sorted(set(re.findall(r"/store/apps/details\?id=([a-zA-Z0-9._]+)", resp.text)))
-                    for pkg in pkgs[:25]:
-                        if brand in pkg.lower().split("."):
-                            records.append(OsintRecord(
-                                kind="mobile_app", value=pkg, detail="Android · "
-                                f"https://play.google.com/store/apps/details?id={pkg}",
-                                source="mobile_app"))
-            except httpx.HTTPError as exc:
-                logger.debug("play search failed: %s", exc)
+                    for app in resp.json().get("results", []) or []:
+                        seller = app.get("sellerName") or app.get("artistName") or ""
+                        track = app.get("trackName") or ""
+                        bundle = app.get("bundleId", "")
+                        seller_hit = _brand_token_match(brand, seller)
+                        keep = seller_hit if generic else (seller_hit or _brand_token_match(brand, track))
+                        if not keep or bundle in seen:
+                            continue
+                        seen.add(bundle)
+                        records.append(OsintRecord(
+                            kind="mobile_app", value=track,
+                            detail=f"iOS · {bundle} · seller={seller} · "
+                                   f"{app.get('trackViewUrl','')} · via {ident.signal}"
+                                   f" ({ident.confidence})", source="mobile_app"))
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.debug("itunes search %r failed: %s", term, exc)
+            # Google Play — HTML search; package id is reverse-DNS (com.<vendor>.<app>). Require
+            # the brand as a distinct segment; skip generic identities (a substring hits countless
+            # unrelated packages).
+            if not generic:
+                try:
+                    resp = await client.get("https://play.google.com/store/search",
+                                            params={"q": term, "c": "apps"})
+                    if resp.status_code == 200:
+                        pkgs = sorted(set(re.findall(r"/store/apps/details\?id=([a-zA-Z0-9._]+)", resp.text)))
+                        # brand may be multi-word (an org name); match if ANY word is a pkg segment.
+                        brand_words = {w for w in re.split(r"[^a-z0-9]+", brand) if len(w) >= 3}
+                        for pkg in pkgs[:25]:
+                            segs = set(pkg.lower().split("."))
+                            if pkg not in seen and brand_words & segs:
+                                seen.add(pkg)
+                                records.append(OsintRecord(
+                                    kind="mobile_app", value=pkg, detail="Android · "
+                                    f"https://play.google.com/store/apps/details?id={pkg}"
+                                    f" · via {ident.signal} ({ident.confidence})",
+                                    source="mobile_app"))
+                except httpx.HTTPError as exc:
+                    logger.debug("play search %r failed: %s", term, exc)
     return records
 
 

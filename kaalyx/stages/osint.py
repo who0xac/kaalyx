@@ -932,14 +932,23 @@ class OsintStage(Stage):
         return res
 
     async def _src_mobile_apps(self) -> SourceResult:
-        """Discover the org's published mobile apps (Apple + Google Play). Keyless."""
+        """Discover the org's published mobile apps (Apple + Google Play). Keyless.
+
+        A company's apps are usually published under its real legal/brand name, not the bare
+        domain label — so we first resolve RANKED company identities (RDAP registrant org, M365
+        tenant brand, social handles, domain label) and search on all of them, tagging each hit
+        with the signal that matched it."""
         res = SourceResult(name="mobile_apps", raw_ext="txt")
-        base = self.ctx.target.registrable.split(".")[0]
-        records = await osint_inproc.discover_mobile_apps(base)
+        # The resolver fetches its own signals (RDAP org, M365 tenant brand, social handles,
+        # domain label) so it is self-contained regardless of concurrent source ordering.
+        identities = await osint_inproc.resolve_company_identities(self.ctx.target)
+        records = await osint_inproc.discover_mobile_apps(identities)
         res.osint = records
-        res.raw = "\n".join([f"# mobile app search: {base}"] +
+        ident_summary = ", ".join(f"{i.name}[{i.signal}:{i.confidence}]" for i in identities)
+        res.raw = "\n".join([f"# company identities resolved: {ident_summary}"] +
                             [f"{r.value}  ({r.detail})" for r in records] or ["# no apps"])
-        res.note = f"{len(records)} mobile app(s)" if records else "no mobile apps found"
+        res.note = (f"{len(records)} mobile app(s) via {len(identities)} identity signal(s)"
+                    if records else f"no mobile apps ({len(identities)} identities tried)")
         return res
 
     async def _src_affiliate_domains(self) -> SourceResult:

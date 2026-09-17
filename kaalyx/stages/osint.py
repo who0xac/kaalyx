@@ -586,21 +586,31 @@ class OsintStage(Stage):
         return res
 
     async def _src_github_subdomains(self) -> SourceResult:
-        res = SourceResult(name="github_subdomains")
+        res = SourceResult(name="github_subdomains", raw_ext="txt")
         if not self.ctx.secrets.has_github:
             res.skipped, res.note = True, "skipped: GITHUB_TOKEN not set"
+            res.raw = "# skipped: GITHUB_TOKEN not set"
             return res
-        # Pass the token via env, not argv, so it never appears in the process list.
-        # next_github_token() rotates across configured tokens to spread rate-limit usage.
-        cmd = ["github-subdomains", "-d", self.ctx.target.registrable]
+        # github-subdomains searches GitHub CODE for the domain string and extracts subdomains
+        # (this is DIFFERENT from trufflehog: it's a global code search for the domain, not an
+        # org scan). Token via env (never argv, so it isn't in the process list); the same
+        # GITHUB_TOKEN the tool documents reading. `-e` = extended search (more code queries →
+        # more thorough), consistent with the project's thoroughness-over-speed principle.
+        cmd = ["github-subdomains", "-d", self.ctx.target.registrable, "-e"]
         out = await self.ctx.runner.run(
             cmd, env={"GITHUB_TOKEN": self.ctx.secrets.next_github_token() or ""},
             timeout=300, label="github-subdomains",
         )
         if not out.started:
             res.skipped, res.note = True, "skipped: github-subdomains not on PATH"
+            res.raw = "# skipped: github-subdomains not on PATH"
             return res
+        # Capture the tool's raw stdout so a 0-result run is inspectable on disk (why it found
+        # nothing — an empty search vs. a rate-limit/error message from the tool).
+        res.raw = out.stdout
         res.subdomains = P.parse_subdomain_lines(out.stdout, "github-subdomains")
+        res.note = (f"{len(res.subdomains)} subdomain(s) from GitHub code search"
+                    if res.subdomains else "no subdomains found in GitHub code")
         return res
 
     async def _discover_github_org(self) -> None:

@@ -73,6 +73,7 @@ osint:
   breach_lookup: true          # h8mail enrichment (needs key; else skips)
   leak_search: true            # LeakSearch — actual leaked creds from ProxyNova/COMB dump
   github_subdomains: true
+  grep_app: true                # grep.app public-code search for the domain (keyless)
   trufflehog: true             # GitHub org secret scan (needs GITHUB_TOKEN)
   cloud_enum: true
   s3scanner: true

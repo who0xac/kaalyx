@@ -363,6 +363,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "email_harvest": "EMAIL_HARVEST",
     "social": "SOCIAL_PROFILES",
     "github_subdomains": "GITHUB_SUBDOMAINS",
+    "grep_app": "GREP_APP[code]",
     "trufflehog": "TRUFFLEHOG[org]",
     "cloud_enum": "CLOUD_ENUM",
     "s3scanner": "S3_SCANNER",
@@ -546,15 +547,15 @@ class OsintProgress:
             note = "run: kaalyx tools --install"
             show_time = False
         elif st.state == "no_key":
-            icon = Text(" ", style=MUTED)
+            icon = Text("○", style="yellow")          # skipped (missing key) — distinct from queued
             name_style = "yellow"
             result = Text("no key", style="yellow")
             note = _skip_note(st.note)
             show_time = False
         elif st.state == "skipped":
-            icon = Text(" ", style=MUTED)
+            icon = Text("○", style="yellow")          # ran the check, nothing to do — NOT queued
             name_style = MUTED
-            result = Text("skipped", style=MUTED)
+            result = Text("skipped", style="yellow")
             note = _skip_note(st.note)
             show_time = False
         elif st.state == "failed":
@@ -621,12 +622,19 @@ class OsintProgress:
             # Name the active source(s); the spinner frame animates so a long-running one shows life.
             names = ", ".join(_display_name(n, self._states[n].label)
                               for n in self._states if self._states[n].state == "running")
-            if len(names) > 46:
-                names = names[:45] + "…"
             line.append(f"  {frame} ", style="bold cyan")
             line.append(names, style="cyan")
         elif done >= total:
             line.append("  done", style="bold green")
+        # CRITICAL: hard-truncate to the terminal width so the status line is ALWAYS exactly one
+        # physical line. If it wrapped to 2 lines, rich.Live's cursor-up count (based on 1 line)
+        # would be wrong and it would leave the previous frame behind — the "status line prints
+        # multiple times with different timestamps" bug. One line = one in-place update, always.
+        try:
+            width = self._console.size.width
+        except Exception:
+            width = 80
+        line.truncate(max(10, width - 1), overflow="ellipsis")
         return line
 
     def _refresh(self) -> None:

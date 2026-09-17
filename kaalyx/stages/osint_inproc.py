@@ -1003,6 +1003,71 @@ async def extract_tls_cert(domain: str) -> tuple[list[OsintRecord], list[str]]:
     return records, sorted(set(sans))
 
 
+# grep.app public code search --------------------------------------------------------------
+# grep.app indexes a large set of public GitHub repos and exposes a keyless JSON search API its
+# own frontend uses: GET https://grep.app/api/search?q=<query> → {"hits":{"total":N,"hits":[
+#   {"repo","path","branch","content":{"snippet": <HTML>}}]}}. A fast, complementary index to
+# GitHub's own rate-limited code-search API (same purpose as github_subdomains, different source).
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SUBDOMAIN_RE = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61})\b",
+                           re.IGNORECASE)
+
+
+def _strip_html(s: str) -> str:
+    """Turn a grep.app HTML snippet into a plain one-line code excerpt."""
+    import html as _html
+    text = _HTML_TAG_RE.sub("", s or "")
+    text = _html.unescape(text)
+    return " ".join(text.split())[:160]
+
+
+async def search_grep_app(domain: str) -> tuple[list[OsintRecord], list["Subdomain"]]:
+    """Search grep.app's public-code index for *domain* (keyless JSON API).
+
+    Returns ``(records, subdomains)``: a ``grep_app`` OsintRecord per matching repo/path (with a
+    plain-text code excerpt), plus any subdomains of *domain* extracted from the matched snippets
+    (fed into subdomain discovery, like github_subdomains). Never raises — any HTTP/parse failure
+    yields empty (the caller reports a clean skip)."""
+    from ..data.models import Subdomain
+
+    records: list[OsintRecord] = []
+    subs: dict[str, Subdomain] = {}
+    seen: set[str] = set()
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
+        try:
+            resp = await client.get("https://grep.app/api/search", params={"q": domain})
+        except httpx.HTTPError as exc:
+            logger.debug("grep.app search failed for %s: %s", domain, exc)
+            return records, []
+        if resp.status_code != 200:
+            logger.debug("grep.app returned HTTP %s for %s", resp.status_code, domain)
+            return records, []
+        try:
+            hits = (resp.json().get("hits") or {}).get("hits") or []
+        except ValueError:
+            return records, []
+        for h in hits:
+            repo = h.get("repo", "")
+            path = h.get("path", "")
+            if not repo:
+                continue
+            key = f"{repo}/{path}"
+            snippet = _strip_html(((h.get("content") or {}).get("snippet") or ""))
+            if key not in seen:
+                seen.add(key)
+                records.append(OsintRecord(
+                    kind="grep_app", value=key,
+                    detail=(f"{h.get('branch','')}: {snippet}" if snippet else h.get("branch", "")),
+                    source="grep_app"))
+            # Extract subdomains of the target from the matched code snippet.
+            for m in _SUBDOMAIN_RE.findall(snippet):
+                host = m.lower().rstrip(".")
+                if (host.endswith("." + domain) or host == domain) and host not in subs:
+                    subs[host] = Subdomain(hostname=host, source="grep.app")
+    return records, list(subs.values())
+
+
 # GitLab group / namespace discovery --------------------------------------------------------
 async def discover_gitlab(company_slugs: list[str]) -> list[OsintRecord]:
     """Look up a public GitLab.com group or user matching the company (keyless public API).

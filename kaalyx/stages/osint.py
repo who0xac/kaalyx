@@ -59,6 +59,7 @@ SOURCE_LABELS: dict[str, str] = {
     "breach_lookup": "Breach lookup",
     "leak_search": "Leak search (creds)",
     "github_subdomains": "GitHub subdomains",
+    "grep_app": "grep.app code search",
     "trufflehog": "TruffleHog (org)",
     "cloud_enum": "Cloud enum",
     "s3scanner": "S3 scanner",
@@ -111,6 +112,7 @@ class OsintStage(Stage):
             "email_harvest": (osint_cfg.email_harvest, self._src_email_harvest),
             "social": (osint_cfg.social, self._src_social),
             "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
+            "grep_app": (osint_cfg.grep_app, self._src_grep_app),
             "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
             "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
             "s3scanner": (osint_cfg.s3scanner, self._src_s3scanner),
@@ -611,6 +613,22 @@ class OsintStage(Stage):
         res.subdomains = P.parse_subdomain_lines(out.stdout, "github-subdomains")
         res.note = (f"{len(res.subdomains)} subdomain(s) from GitHub code search"
                     if res.subdomains else "no subdomains found in GitHub code")
+        return res
+
+    async def _src_grep_app(self) -> SourceResult:
+        """Search grep.app's public-code index for the domain (keyless JSON API). A fast,
+        complementary alternative to GitHub's rate-limited code search — no token needed."""
+        res = SourceResult(name="grep_app", raw_ext="txt")
+        domain = self.ctx.target.registrable
+        records, subs = await osint_inproc.search_grep_app(domain)
+        res.osint, res.subdomains = records, subs
+        res.raw = "\n".join([f"# grep.app code search for {domain}"] +
+                            [f"{r.value}  {r.detail}" for r in records] or ["# no matches"])
+        if records:
+            res.note = (f"{len(records)} repo match(es)"
+                        + (f", {len(subs)} subdomain(s)" if subs else ""))
+        else:
+            res.note = "no public code mentions the domain (grep.app)"
         return res
 
     async def _discover_github_org(self) -> None:

@@ -70,17 +70,22 @@ def resolve_config_path(explicit: str | Path | None) -> Path | None:
     return None
 
 
-def resolve_env_path() -> Path | None:
-    """Resolve which secrets file to load: ``./config.env`` in the CWD if present, else the
-    standard ``~/.config/kaalyx/config.env``. A legacy ``./.env`` / ``~/.config/kaalyx/.env``
-    is still honoured as a fallback so an existing install keeps working after the rename.
-    Returns ``None`` if none exists (env-only secrets then)."""
-    for candidate in (
-        Path("config.env"),          # CWD, new name
+def _env_candidates() -> list[Path]:
+    """The config.env files to consider, in PRECEDENCE order (highest first). A CWD-local file
+    overrides the standard one; the legacy ``.env`` names are still honoured."""
+    return [
+        Path("config.env"),          # CWD, new name  (highest precedence)
         Path(".env"),                # CWD, legacy fallback
         env_file(),                  # standard dir, new name
         config_dir() / ".env",       # standard dir, legacy fallback
-    ):
+    ]
+
+
+def resolve_env_path() -> Path | None:
+    """The single highest-precedence config.env that exists (or ``None``). Used for display/
+    diagnostics; the ACTUAL secret loading merges across all candidates — see
+    :func:`load_secrets` — so a key blank in the top file but set in a lower one is still found."""
+    for candidate in _env_candidates():
         if candidate.is_file():
             return candidate
     return None
@@ -446,11 +451,26 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
     the file layer explicitly and treating an empty env var as absent fixes that.
     """
     file_values: dict[str, str] = {}
-    if env_path is None:
-        env_path = resolve_env_path()
     if env_path is not None:
-        # dotenv_values reads the file WITHOUT touching os.environ, so we control precedence.
-        file_values = {k: v for k, v in dotenv_values(str(env_path)).items() if v is not None}
+        # An explicit path was given (tests / --env): read just that file.
+        file_values = {k: v for k, v in dotenv_values(str(env_path)).items()
+                       if v is not None and v.strip()}
+    else:
+        # MERGE across every candidate config.env in precedence order. A higher-precedence file's
+        # NON-BLANK value wins, but a key left BLANK in that file falls through to the next file
+        # that actually has it. This is the fix for the real footgun: a blank ``SHODAN_API_KEY=``
+        # in a CWD ./config.env (or the shipped template) used to shadow a real key set in
+        # ~/.config/kaalyx/config.env, because resolution stopped at the first existing file.
+        # Now a key set in ANY candidate is found regardless of which file is "first".
+        env_path = resolve_env_path()  # highest-precedence existing file (for env_path/display)
+        for candidate in _env_candidates():
+            if not candidate.is_file():
+                continue
+            for k, v in dotenv_values(str(candidate)).items():
+                # Only fill a key we don't already have a NON-BLANK value for (precedence order).
+                if v is not None and v.strip() and k not in file_values:
+                    file_values[k] = v
+    if file_values:
         # Also populate os.environ for any downstream code that reads it directly, but never let
         # a blank env var block the file — override only where the env var is missing/empty.
         for k, v in file_values.items():

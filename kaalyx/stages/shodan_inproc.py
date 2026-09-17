@@ -25,6 +25,7 @@ skip, never a crash, and never takes down the other Shodan sources or the wider 
 from __future__ import annotations
 
 import base64
+import ipaddress
 from dataclasses import dataclass, field
 
 import httpx
@@ -47,12 +48,19 @@ class ShodanTierError(Exception):
     """The API refused a request because the account's plan/tier/rate-limit doesn't allow it.
 
     Carries the reason Shodan itself gave (from the JSON ``error`` field or HTTP status), so the
-    source can skip cleanly with an honest note instead of guessing about entitlements.
+    source can skip cleanly with an honest note instead of guessing about entitlements. This is
+    FATAL to a source (all IPs) — it means the account can't make the query at all.
     """
 
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class ShodanNotFound(Exception):
+    """Shodan has no data for THIS specific IP (HTTP 404 / "No information available for that
+    IP"). This is a per-IP, EXPECTED outcome — the IP simply isn't indexed — NOT a plan/tier
+    problem, so it must be caught per-IP and must never abort the whole source."""
 
 
 class ShodanClient:
@@ -91,6 +99,11 @@ class ShodanClient:
                 api_error or "plan/tier does not permit this query (HTTP 403)")
         if resp.status_code == 429:
             raise ShodanTierError(api_error or "rate limit reached (HTTP 429)")
+        # 404 on a host lookup = "No information available for that IP" — the IP simply isn't
+        # indexed. That's a per-IP expected miss, NOT a plan/tier refusal, so it gets its own
+        # non-fatal exception (callers catch it per-IP and keep going).
+        if resp.status_code == 404:
+            raise ShodanNotFound(api_error or "no information available for that IP")
         if resp.status_code >= 400:
             raise ShodanTierError(api_error or f"HTTP {resp.status_code}")
         if data is None:
@@ -143,6 +156,42 @@ def _vuln_severity(cve_count: int) -> Severity:
     if cve_count >= 1:
         return Severity.MEDIUM
     return Severity.INFO
+
+
+# Public CDN / reverse-proxy IP ranges. A domain fronted by one of these resolves to SHARED edge
+# IPs, not the target's origin — so a per-IP Shodan lookup describes the CDN, not the target, and
+# "no data" for such an IP is an EXPECTED outcome, not a failure. (Not exhaustive; the big ones
+# that dominate real targets. Cloudflare is by far the most common.)
+_CDN_RANGES: dict[str, list[str]] = {
+    "Cloudflare": [
+        "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "173.245.48.0/20",
+        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+        "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+        "198.41.128.0/17", "162.158.0.0/15", "131.0.72.0/22", "2606:4700::/32",
+    ],
+    "Fastly": ["151.101.0.0/16", "199.232.0.0/16", "2a04:4e42::/32"],
+    "Akamai": ["23.32.0.0/11", "23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"],
+    "Amazon CloudFront": ["120.52.22.96/27", "205.251.192.0/19", "13.32.0.0/15",
+                          "13.224.0.0/14", "143.204.0.0/16", "144.220.0.0/16"],
+}
+
+
+def cdn_for_ip(ip: str) -> str | None:
+    """Return the CDN provider name if *ip* falls in a known CDN/edge range, else ``None``.
+    Used so a per-IP Shodan lookup can report 'behind <CDN> (shared edge, not the origin)'
+    instead of a misleading 'no information' — the IP genuinely isn't the target's own host."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    for provider, cidrs in _CDN_RANGES.items():
+        for cidr in cidrs:
+            try:
+                if addr in ipaddress.ip_network(cidr):
+                    return provider
+            except ValueError:
+                continue
+    return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -295,22 +344,41 @@ async def host_deep_lookup(
     * ``want_deep`` records ports/banners/hostnames (with ``history`` for past scans);
     * ``want_vulns`` records Shodan's ``vulns`` CVE tags as passive findings.
 
-    A per-IP failure (e.g. Shodan has never seen the IP → 404) is logged and skipped; only a
+    A CDN/edge IP is recognised and NOT queried as an origin (shared infra); an IP Shodan hasn't
+    indexed (404 / "No information available") is an EXPECTED miss, not an error. Only a
     tier/plan/rate refusal (raised by the client) stops the source. Returns
-    ``(records, findings, raw_text)``.
+    ``(records, findings, raw_text, summary)`` where *summary* has ``total_ips``, ``cdn_ips``
+    ({ip: provider}), ``not_indexed`` ([ip, …]) and ``indexed`` counts so the caller can report
+    an accurate, non-misleading outcome.
     """
     records: list[OsintRecord] = []
     findings: list[Finding] = []
     raw_lines: list[str] = []
+    cdn_ips: dict[str, str] = {}      # ip -> CDN provider (looked up but not the origin)
+    not_indexed: list[str] = []      # ip -> Shodan genuinely has no data
 
     for ip in ips:
+        cdn = cdn_for_ip(ip)
+        if cdn:
+            # This is a shared CDN/edge IP, not the target's origin — Shodan data for it (if any)
+            # describes the CDN. Record that fact and don't treat a miss as a failure.
+            cdn_ips[ip] = cdn
+            raw_lines.append(f"# {ip}: {cdn} CDN/edge IP (shared — not the target's origin)")
+            records.append(OsintRecord(kind="shodan_host", value=ip,
+                                       detail=f"behind {cdn} CDN — shared edge IP, not the origin",
+                                       source="shodan_host"))
+            continue
         try:
             data = await client.host(ip, history=history)
         except ShodanTierError:
-            raise  # plan/rate issue → let the source skip cleanly for all IPs
-        except Exception as exc:  # noqa: BLE001 — a single IP Shodan has never indexed, etc.
+            raise  # plan/rate issue → FATAL: let the source skip cleanly for ALL IPs
+        except (ShodanNotFound, Exception) as exc:  # noqa: BLE001 — per-IP miss, never fatal
+            # A 404 "No information available for that IP" (ShodanNotFound) means Shodan hasn't
+            # indexed this IP — an EXPECTED result, not an error, and it must NOT abort the other
+            # IPs. Any other per-IP hiccup is treated the same way.
             logger.debug("shodan host %s: %s", ip, exc)
-            raw_lines.append(f"# {ip}: not in Shodan cache ({type(exc).__name__})")
+            not_indexed.append(ip)
+            raw_lines.append(f"# {ip}: not indexed by Shodan (no cached scan data)")
             continue
 
         ports = data.get("ports") or []
@@ -355,4 +423,10 @@ async def host_deep_lookup(
 
     if not raw_lines:
         raw_lines.append("# no IPs looked up")
-    return records, findings, "\n".join(raw_lines)
+    summary = {
+        "total_ips": len(ips),
+        "cdn_ips": cdn_ips,                     # {ip: provider}
+        "not_indexed": not_indexed,             # [ip, ...]
+        "indexed": len(ips) - len(cdn_ips) - len(not_indexed),
+    }
+    return records, findings, "\n".join(raw_lines), summary

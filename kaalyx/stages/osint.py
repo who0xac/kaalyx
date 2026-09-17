@@ -1288,7 +1288,7 @@ class OsintStage(Stage):
             return res
         async with httpx.AsyncClient() as http:
             try:
-                records, findings, raw = await shodan_inproc.host_deep_lookup(
+                records, findings, raw, summary = await shodan_inproc.host_deep_lookup(
                     self._shodan_client(http), ips, history=history,
                     want_vulns=want_vulns, want_deep=want_deep)
             except shodan_inproc.ShodanTierError as exc:
@@ -1296,5 +1296,19 @@ class OsintStage(Stage):
                 res.raw = f"# skipped: {exc.reason}"
                 return res
         res.osint, res.findings, res.raw = records, findings, raw
-        res.note = f"{len(ips)} IP(s) looked up, {len(records)} record(s), {len(findings)} finding(s)"
+        # Build an accurate, non-misleading note. All-CDN or all-not-indexed is an EXPECTED
+        # outcome (the apex is fronted by a CDN, or Shodan simply hasn't scanned the origin),
+        # not a failure — say which, rather than echoing the raw API "no information" text.
+        cdn_ips, not_indexed = summary["cdn_ips"], summary["not_indexed"]
+        if summary["indexed"] == 0 and cdn_ips and not not_indexed:
+            providers = ", ".join(sorted(set(cdn_ips.values())))
+            res.note = f"{len(ips)} IP(s) all behind {providers} CDN — no origin host to index"
+        elif summary["indexed"] == 0 and not_indexed:
+            res.note = (f"{len(ips)} IP(s), none indexed by Shodan"
+                        + (f" ({len(cdn_ips)} are CDN edge)" if cdn_ips else ""))
+        else:
+            note = f"{len(ips)} IP(s), {summary['indexed']} indexed, {len(findings)} finding(s)"
+            if cdn_ips:
+                note += f", {len(cdn_ips)} CDN edge"
+            res.note = note
         return res

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -76,13 +77,40 @@ def short_sha(sha: str | None) -> str | None:
     return sha.strip()[:7] or None
 
 
-def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str, str] | None:
-    """Return ``(short_sha, full_sha, iso_date)`` of the latest commit on the repo's branch.
+@dataclass
+class RemoteCheck:
+    """Result of the update check. Exactly one of ``commit`` (success) or ``error`` (a specific,
+    accurate failure reason) is set — so the CLI never has to fall back to a generic 'network'
+    message when the real cause (rate limit, HTTP status, TLS, timeout) is known."""
+    commit: tuple[str, str, str] | None = None   # (short_sha, full_sha, iso_date)
+    error_kind: str = ""    # "rate_limit" | "timeout" | "tls" | "network" | "http" | "parse"
+    error_msg: str = ""     # human-readable, specific reason
+    retry_after_s: int | None = None  # for rate_limit: seconds until the limit resets
 
-    The *full* SHA matters: we pin the pipx install to it (``@<full_sha>``) so the install
-    URL changes per commit — which is what actually defeats pip's URL-keyed clone/wheel
-    cache — and we record it verbatim as install state. ``None`` on any network/parse
-    failure (the caller reports it and exits cleanly).
+
+def _rate_limit_retry_seconds(resp: "httpx.Response") -> int | None:
+    """Seconds until the GitHub rate limit resets, from the response headers (or ``None``)."""
+    import time as _time
+    reset = resp.headers.get("X-RateLimit-Reset")
+    if reset and reset.isdigit():
+        return max(0, int(reset) - int(_time.time()))
+    ra = resp.headers.get("Retry-After")
+    if ra and ra.isdigit():
+        return int(ra)
+    return None
+
+
+def latest_remote_commit(timeout: float = 15.0) -> RemoteCheck:
+    """Check the latest commit on the repo's branch, returning a :class:`RemoteCheck`.
+
+    On success ``.commit`` is ``(short_sha, full_sha, iso_date)`` (the full SHA is what we pin
+    the pipx install to, defeating pip's URL-keyed cache). On failure ``.error_kind`` /
+    ``.error_msg`` carry the SPECIFIC, accurate reason — GitHub's unauthenticated API is capped
+    at 60 requests/hour, so the common failure after several `update` runs is a 403/429 rate
+    limit (NOT a network problem), which we detect from the status + ``X-RateLimit-Remaining``
+    header and report with the reset time. Timeouts, TLS errors and other HTTP statuses each get
+    their own accurate message; a genuine connect/DNS failure is the ONLY thing reported as a
+    network issue.
     """
     try:
         resp = httpx.get(
@@ -91,21 +119,52 @@ def latest_remote_commit(timeout: float = 15.0) -> tuple[str, str, str] | None:
             timeout=timeout,
             follow_redirects=True,
         )
-        if resp.status_code != 200:
-            logger.debug("GitHub API returned HTTP %s", resp.status_code)
-            return None
+    except httpx.TimeoutException as exc:
+        logger.debug("update check timed out: %s", exc)
+        return RemoteCheck(error_kind="timeout",
+                           error_msg=f"GitHub did not respond within {timeout:.0f}s")
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        logger.debug("update check connect failed: %s", exc)
+        return RemoteCheck(error_kind="network",
+                           error_msg="could not connect to api.github.com (network/DNS)")
+    except httpx.HTTPError as exc:
+        # TLS/proxy/protocol errors surface here — a cert problem is NOT a 'no network' issue.
+        name = type(exc).__name__
+        kind = "tls" if "ssl" in name.lower() or "certificate" in str(exc).lower() else "network"
+        logger.debug("update check HTTP error (%s): %s", name, exc)
+        return RemoteCheck(error_kind=kind, error_msg=f"{name}: {exc}")
+
+    # Rate limit: GitHub returns 403 (sometimes 429) with X-RateLimit-Remaining: 0. This is the
+    # most common real cause after several unauthenticated checks — report it as SUCH, with the
+    # reset time, never as a network problem.
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    if resp.status_code in (403, 429) and remaining == "0":
+        secs = _rate_limit_retry_seconds(resp)
+        mins = f" (resets in ~{secs // 60 + 1} min)" if secs is not None else ""
+        return RemoteCheck(error_kind="rate_limit", retry_after_s=secs,
+                           error_msg=f"GitHub API rate limit reached — unauthenticated requests "
+                                     f"are capped at 60/hour{mins}")
+    if resp.status_code != 200:
+        # A different status (5xx, 404, an abuse-detection 403 without the header) — report the
+        # actual code, not a network guess.
+        api_msg = ""
+        try:
+            api_msg = str(resp.json().get("message", ""))
+        except ValueError:
+            pass
+        return RemoteCheck(error_kind="http",
+                           error_msg=f"GitHub API returned HTTP {resp.status_code}"
+                                     + (f": {api_msg}" if api_msg else ""))
+    try:
         data = resp.json()
         full = str(data.get("sha", "")).strip()
-        date = (
-            data.get("commit", {}).get("committer", {}).get("date", "")
-            if isinstance(data.get("commit"), dict)
-            else ""
-        )
-        return (full[:7], full, date) if full else None
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        # The caller reports this cleanly to the user; keep it at debug to avoid double noise.
-        logger.debug("Could not reach GitHub to check for updates: %s", exc)
-        return None
+        date = (data.get("commit", {}).get("committer", {}).get("date", "")
+                if isinstance(data.get("commit"), dict) else "")
+    except (ValueError, KeyError) as exc:
+        return RemoteCheck(error_kind="parse", error_msg=f"couldn't parse GitHub's response: {exc}")
+    if not full:
+        return RemoteCheck(error_kind="parse", error_msg="GitHub response had no commit SHA")
+    return RemoteCheck(commit=(full[:7], full, date))
 
 
 def commits_between(base: str | None, head: str, timeout: float = 15.0) -> list[tuple[str, str]]:

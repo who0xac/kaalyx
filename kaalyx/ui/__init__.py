@@ -182,20 +182,19 @@ def print_main_banner(show_commit: bool = False) -> None:
     get_console().print(main_banner(show_commit=show_commit))
 
 
-# --- Dot progress bar (used by `kaalyx update`) -----------------------------------------
-
-# Number of dots in the bar. 20 gives clean 5%-per-dot resolution.
-_DOT_BAR_WIDTH = 20
-_DOT_FILLED = "●"
-_DOT_EMPTY = "○"
+# --- Progress bar (used by `kaalyx update`) ---------------------------------------------
+# Same "[===>....]" arrow-fill style as the OSINT source board, for one consistent bar across
+# the whole tool: '=' fill, a '>' arrowhead at the leading edge, '.' unfilled, accent-coloured
+# brackets — rendered '[bar] NN%  <description>'.
+_UPDATE_BAR_WIDTH = 34
 
 
 def dot_progress():
-    """Build a :class:`rich.progress.Progress` with a dot-style bar: ``●●●●○○○○  62%``.
+    """Build a :class:`rich.progress.Progress` whose bar matches the OSINT board's arrow style::
 
-    rich's built-in :class:`BarColumn` draws a block bar and can't be given custom fill
-    glyphs, so we render the bar as a small custom column: filled dots in the accent colour,
-    empty dots muted, followed by the percentage. Use it as::
+        [===============>..................]  45%  Checking for updates...
+
+    Use it as::
 
         with dot_progress() as progress:
             task = progress.add_task("Updating Kaalyx", total=100)
@@ -206,19 +205,23 @@ def dot_progress():
 
     from ..core.logging import get_console
 
-    class _DotBarColumn(ProgressColumn):
+    class _ArrowBarColumn(ProgressColumn):
         def render(self, task) -> Text:
             fraction = 0.0 if not task.total else max(0.0, min(1.0, task.completed / task.total))
-            filled = round(fraction * _DOT_BAR_WIDTH)
-            bar = Text()
-            bar.append(_DOT_FILLED * filled, style=ACCENT)
-            bar.append(_DOT_EMPTY * (_DOT_BAR_WIDTH - filled), style=MUTED)
-            return bar
+            filled = round(fraction * _UPDATE_BAR_WIDTH)
+            filled = min(filled, _UPDATE_BAR_WIDTH)
+            if filled <= 0:
+                inner = "." * _UPDATE_BAR_WIDTH
+            elif filled >= _UPDATE_BAR_WIDTH:
+                inner = "=" * _UPDATE_BAR_WIDTH
+            else:
+                inner = ("=" * (filled - 1)) + ">" + ("." * (_UPDATE_BAR_WIDTH - filled))
+            return Text.assemble(("[", ACCENT_DIM), (inner, ACCENT), ("]", ACCENT_DIM))
 
     return Progress(
-        TextColumn("[bold white]{task.description}[/]"),
-        _DotBarColumn(),
+        _ArrowBarColumn(),
         TextColumn(f"[{ACCENT_DIM}]{{task.percentage:>3.0f}}%[/]"),
+        TextColumn("[bold white]{task.description}[/]"),
         console=get_console(),
         transient=False,  # keep the completed bar visible; the final status prints below it
     )

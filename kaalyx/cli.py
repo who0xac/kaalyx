@@ -1057,36 +1057,51 @@ def _do_update(verbose: bool = False) -> None:
     `kaalyx update` and the root `-u/--update` flag.
     """
     from .core import updater
-    from .ui import dot_progress
+    from .ui import dot_progress, print_main_banner
+
+    # The main Kaalyx banner (ASCII art, locked colours, NO commit hash) heads the update, like
+    # a scan. --verbose appends the installed commit SHA to the banner for stale-install debugging.
+    print_main_banner(show_commit=verbose)
 
     current = updater.current_version()
 
-    def _network_message() -> None:
-        console.print(
-            "[yellow]⚠ Couldn't reach GitHub to check for updates[/] (no network or DNS "
-            "issue). Try again when you have a connection."
-        )
+    def _check_error_message(check) -> None:
+        """Report the SPECIFIC, accurate reason the update check failed — never a generic
+        'network' message when the real cause (rate limit, TLS, HTTP status, timeout) is known."""
+        kind = check.error_kind
+        if kind == "rate_limit":
+            console.print(f"[yellow]⚠ {check.error_msg}[/]")
+            console.print("[dim]This is GitHub throttling anonymous update checks, not a "
+                          "connectivity problem — your network is fine. Wait for the reset, "
+                          "or set GITHUB_TOKEN in config.env to raise the limit to 5000/hour.[/]")
+        elif kind == "timeout":
+            console.print(f"[yellow]⚠ Update check timed out[/] — {check.error_msg}.")
+        elif kind == "tls":
+            console.print(f"[yellow]⚠ TLS error talking to GitHub[/] — {check.error_msg}.")
+        elif kind == "network":
+            console.print(f"[yellow]⚠ Couldn't connect to GitHub[/] — {check.error_msg}.")
+        else:  # http / parse
+            console.print(f"[yellow]⚠ Update check failed[/] — {check.error_msg}.")
 
     # --- Step 1: check reachability + latest commit (bar fills while the API call runs). ---
     with dot_progress() as progress:
         task = progress.add_task("Checking for updates", total=100)
 
-        latest = _run_while_advancing(
+        check = _run_while_advancing(
             progress, task, updater.latest_remote_commit, 0, 20
         )
         local_sha = updater.installed_commit()
 
-        # No response from GitHub's API => network/DNS problem. Clear message, by default.
-        # (Leave the bar where it stopped — do not fill it.)
-        if latest is None:
+        # Report the SPECIFIC failure reason (rate limit / timeout / TLS / HTTP / network).
+        if check.commit is None:
             progress.stop()
             if verbose:
-                console.print("[dim]GitHub commits API returned no result (see logs).[/]")
-            _network_message()
+                console.print(f"[dim]update check error: {check.error_kind} — {check.error_msg}[/]")
+            _check_error_message(check)
             raise typer.Exit(code=1)
 
         progress.update(task, completed=20)  # check succeeded
-        remote_sha, remote_full, remote_date = latest
+        remote_sha, remote_full, remote_date = check.commit
 
         # Already up to date (provable only when we know the installed commit) => skip the
         # reinstall entirely. local_sha comes from what is *genuinely* installed (package
@@ -1127,7 +1142,10 @@ def _do_update(verbose: bool = False) -> None:
     # --- Failure handling: distinguish a network problem from a genuine failure. ---
     if code != 0:
         if updater.is_network_error(output):
-            _network_message()
+            console.print(
+                "[yellow]⚠ Reinstall couldn't reach GitHub[/] — the pipx step reported a "
+                "connection error. Check your network/proxy and retry."
+            )
         else:
             console.print(
                 f"[yellow]⚠ Update failed[/] (exit {code})."

@@ -1006,27 +1006,31 @@ def _tag_for_commit(subject: str) -> tuple[str, str, str]:
 
 
 def _render_update_changelog(old_ref: str, new_ref: str, commits: list[tuple[str, str]]) -> None:
-    """Print the update summary.
+    """Print the update summary in the locked nuclei-style tagged format — SAME layout whether
+    the update carried one commit or many, so the result is consistent every time::
 
-    A single-commit update (or when the commit list couldn't be fetched) gets the SIMPLE
-    one-line form — no per-commit breakdown, no footer — since a changelog of one line is
-    just noise. Only a MULTI-commit update (2+) prints the nuclei-style tagged bullet list
-    with the header count and the "run kaalyx changelog" footer.
+        [INF] kaalyx updated  <old> → <new> · N commit(s)
+
+          [FIX] <message>        (fix=yellow, feat/new=green, chore/refactor/docs=dim cyan)
+          ...
+
+        [INF] run 'kaalyx changelog' anytime · full history: github.com/who0xac/kaalyx/commits/main
+
+    Each commit becomes one tagged line via _tag_for_commit (conventional-commit prefix stripped
+    and mapped to [FIX]/[NEW]/[CHG], or [INF] for an unprefixed subject). When the commit list
+    couldn't be fetched, the header still prints with the ref range.
     """
     n = len(commits)
-    if n <= 1:
-        console.print(
-            f"[green]✔ Kaalyx updated:[/] [bold]{old_ref}[/] → [bold]{new_ref}[/]"
-        )
-        return
-
+    plural = "commit" if n == 1 else "commits"
     console.print(
-        f"[cyan]\\[INF][/] kaalyx updated [bold]{old_ref}[/] → [bold]{new_ref}[/] ({n} commits)"
+        f"[cyan]\\[INF][/] kaalyx updated  [bold]{old_ref}[/] → [bold]{new_ref}[/] "
+        f"· [bold]{n}[/] {plural}"
     )
-    console.print()
-    for _sha, subject in commits:
-        tag, style, msg = _tag_for_commit(subject)
-        console.print(f"[{style}]\\[{tag}][/] {msg}")
+    if commits:
+        console.print()
+        for _sha, subject in commits:
+            tag, style, msg = _tag_for_commit(subject)
+            console.print(f"  [{style}]\\[{tag}][/] {msg}")
     console.print()
     console.print(
         "[cyan]\\[INF][/] run [bold]kaalyx changelog[/] anytime · "
@@ -1085,11 +1089,9 @@ def _do_update(verbose: bool = False) -> None:
             return
 
         # --- Step 2/3: upgrade in place (bar fills during the real work). ---
-        # Lightweight-first: the new code is upgraded inside the EXISTING pipx venv, reinstalling
-        # only what changed — a full teardown+rebuild happens only as a fallback if that fails.
-        progress.console.print(
-            "[dim]Upgrading in place inside the existing environment (only changed files are "
-            "reinstalled; a full rebuild happens only if that fails).[/]")
+        # Lightweight-first internally (upgrade inside the existing pipx venv, full rebuild only
+        # as a fallback) — but this mechanism detail is NOT shown to the user; the update simply
+        # works or reports failure.
         # Pin the install to the exact remote commit so pip cannot serve a cached build.
         progress.update(task, description="Update found, preparing", completed=40)
         progress.update(task, description="Pulling latest changes", completed=45)

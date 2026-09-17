@@ -85,6 +85,74 @@ def _relevance_note(relevance: str, target: str) -> str:
             f"reference to {reg} — verify it is target-owned]")
 
 
+# WHOIS field → (category, clean label). Categories group the messy multi-block whois dump into
+# a small, readable set. Matched case-insensitively on the field name before the first ':'.
+_WHOIS_FIELDS: list[tuple[str, str, str]] = [
+    # (substring to match in the field name, category, display label)
+    ("registrar whois", "registrar", "Registrar WHOIS"),
+    ("registrar url", "registrar", "Registrar URL"),
+    ("registrar iana", "registrar", "Registrar IANA ID"),
+    ("registrar abuse contact email", "registrar", "Abuse Email"),
+    ("registrar abuse contact phone", "registrar", "Abuse Phone"),
+    ("registrar", "registrar", "Registrar"),
+    ("registrant organization", "registrant", "Organization"),
+    ("registrant name", "registrant", "Name"),
+    ("registrant country", "registrant", "Country"),
+    ("registrant state", "registrant", "State/Province"),
+    ("registrant email", "registrant", "Email"),
+    ("org", "registrant", "Organization"),
+    ("creation date", "dates", "Created"),
+    ("created", "dates", "Created"),
+    ("registered on", "dates", "Created"),
+    ("updated date", "dates", "Updated"),
+    ("last updated", "dates", "Updated"),
+    ("registry expiry date", "dates", "Expires"),
+    ("expiry date", "dates", "Expires"),
+    ("expiration date", "dates", "Expires"),
+    ("name server", "nameservers", "Nameserver"),
+    ("nserver", "nameservers", "Nameserver"),
+    ("domain status", "status", "Status"),
+    ("dnssec", "status", "DNSSEC"),
+]
+# Presentation order of the categories.
+WHOIS_CATEGORY_ORDER = ["registrar", "registrant", "dates", "nameservers", "status"]
+
+
+def parse_whois(stdout: str, source: str = "whois") -> list[OsintRecord]:
+    """Parse raw ``whois`` output into GROUPED, deduplicated OSINT records.
+
+    Registrar WHOIS responses are notoriously messy — repeated blocks, thin registrar echoes of
+    the registry data, mixed casing. We pull only the fields that matter, map each to a category
+    (registrar / registrant / dates / nameservers / status) and a clean label, dedupe by
+    (category, label, value), and store the category in ``detail`` so the UI can group them under
+    clear headings instead of dumping raw lines. ``value`` is the field value only (not the whole
+    ``Key: Value`` line); nameservers are lower-cased so duplicate-cased echoes collapse.
+    """
+    records: list[OsintRecord] = []
+    seen: set[tuple[str, str, str]] = set()
+    for line in stdout.splitlines():
+        if ":" not in line:
+            continue
+        field, _, value = line.partition(":")
+        field_l = field.strip().lower()
+        value = value.strip()
+        if not value or value.lower() in ("redacted for privacy", "not disclosed",
+                                          "data protected", "redacted"):
+            continue
+        # First matching field spec wins (specific patterns are listed before general ones).
+        for needle, category, label in _WHOIS_FIELDS:
+            if field_l.startswith(needle):
+                v = value.lower() if category == "nameservers" else value
+                key = (category, label, v.lower())
+                if key in seen:
+                    break
+                seen.add(key)
+                records.append(OsintRecord(kind="whois", value=v, detail=f"{category}|{label}",
+                                           source=source))
+                break
+    return records
+
+
 def parse_dnsx(stdout: str, source: str = "dnsx") -> list[OsintRecord]:
     """Parse ``dnsx -json`` output into DNS OSINT records.
 

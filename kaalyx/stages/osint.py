@@ -272,6 +272,7 @@ class OsintStage(Stage):
 
         # One blank line before each result table so the blocks don't run together.
         for table in (
+            osint_ui.whois_table(osint_rows),
             osint_ui.host_intel_table(osint_rows),
             osint_ui.mail_hygiene_table(osint_rows),
             osint_ui.social_table(osint_rows),
@@ -569,14 +570,7 @@ class OsintStage(Stage):
         text = out.stdout.strip()
         if text:
             res.raw, res.raw_ext = text, "txt"
-            for line in text.splitlines():
-                low = line.lower().strip()
-                for key in ("registrar:", "creation date:", "registrant", "name server:",
-                            "registry expiry", "org:"):
-                    if low.startswith(key):
-                        res.osint.append(OsintRecord(kind="whois", value=line.strip(),
-                                                     source="whois"))
-                        break
+            res.osint = P.parse_whois(text)
         return res
 
     async def _src_dnsx(self) -> SourceResult:

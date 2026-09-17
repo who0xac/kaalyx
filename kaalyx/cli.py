@@ -832,6 +832,21 @@ def _check_key(name: str) -> None:
             console.print(f"  key line in file    : [yellow]present but BLANK[/]")
         else:
             console.print(f"  key line in file    : [green]present[/] → {_mask(fv)}")
+        # RAW line(s) as they literally appear in the file, with the value masked — this exposes
+        # a content difference between one key's line and another's (inline comment, stray
+        # character, wrong separator) that parsing might silently mishandle.
+        try:
+            raw_lines = Path(resolved).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            raw_lines = []
+        hits = [ln for ln in raw_lines if ln.strip().lstrip("export").strip().startswith(env_name)]
+        if hits:
+            console.print("  raw file line(s)    :")
+            for ln in hits:
+                # Mask everything after the first '=' so the secret isn't printed verbatim.
+                head, sep, val = ln.partition("=")
+                shown = f"{head}{sep}{_mask(val) if val.strip() else '[blank]'}" if sep else ln
+                console.print(f"    [dim]{shown}[/]")
 
     # 3) os.environ state (a non-empty export overrides the file; an empty one is ignored).
     env_val = os.environ.get(env_name)

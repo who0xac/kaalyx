@@ -496,8 +496,12 @@ class OsintProgress:
             inner = ("=" * (filled - 1)) + ">" + ("." * (self._BAR_W - filled))
         return Text.assemble(("[", ACCENT_DIM), (inner, ACCENT), ("]", ACCENT_DIM))
 
-    def _row(self, st: "_SourceState", name: str, now: float, frame: str) -> "Text":
-        """One source row: '[icon] NAME ......... RESULT :: TIME' (name = display name)."""
+    def _row(self, st: "_SourceState", name: str, now: float, frame: str,
+             pos: int = 0, total: int = 0) -> "Text":
+        """One source row: '[N/T] [icon] NAME ......... RESULT :: TIME' (name = display name).
+
+        *pos*/*total* prepend a right-aligned '[N/TOTAL]' position tag so the operator sees both
+        which source this is and where it sits in the overall run."""
         # --- status icon + name/result/time by state ---
         note = ""
         show_time = True
@@ -549,6 +553,10 @@ class OsintProgress:
         result_len = len(result.plain)
         pad = max(1, self._NAME_W + self._RESULT_W - len(name) - result_len)
         line = Text("    ")                         # 4-space indent
+        if total:
+            # Right-align N within the width of TOTAL so the [N/T] column stays aligned.
+            w = len(str(total))
+            line.append(f"[{pos:>{w}}/{total}] ", style=MUTED)
         line.append("[", style=MUTED)
         line.append_text(icon)
         line.append("] ", style=MUTED)
@@ -593,8 +601,9 @@ class OsintProgress:
         #    if the board is taller than the terminal, the Live uses vertical_overflow="visible"
         #    (see live()) so the content scrolls through normal terminal history instead of being
         #    clipped with an ellipsis.
-        for name, st in self._states.items():
-            lines.append(self._row(st, _display_name(name, st.label), now, frame))
+        for i, (name, st) in enumerate(self._states.items(), start=1):
+            lines.append(self._row(st, _display_name(name, st.label), now, frame,
+                                    pos=i, total=total))
         return Group(*lines)
 
     def _refresh(self) -> None:
@@ -745,6 +754,52 @@ def mail_hygiene_table(records: list) -> Table | None:
         table.add_row("", Text(_dmarc_interpretation(dmarc_val),
                                style="red" if spoofable else "green"))
     return table
+
+
+_WHOIS_SECTION_TITLES = {
+    "registrar": "Registrar",
+    "registrant": "Registrant",
+    "dates": "Dates",
+    "nameservers": "Nameservers",
+    "status": "Status",
+}
+
+
+def whois_table(records: list):
+    """Show WHOIS data as a clean, grouped list (the whois source) instead of a raw dump.
+
+    Records carry ``detail = "<category>|<label>"`` (from parse_whois). We group them under
+    clear section headings — Registrar, Registrant, Dates, Nameservers, Status — in a fixed
+    order, each field on its own aligned 'Label : value' row. Returns a Group renderable, or
+    ``None`` when there are no whois records."""
+    rows = [r for r in records if r["kind"] == "whois"]
+    if not rows:
+        return None
+
+    # Bucket rows by category, preserving encounter order within each.
+    buckets: dict[str, list[tuple[str, str]]] = {}
+    for r in rows:
+        detail = r["detail"] or "other|"
+        category, _, label = detail.partition("|")
+        buckets.setdefault(category, []).append((label or "", r["value"]))
+
+    order = ["registrar", "registrant", "dates", "nameservers", "status"]
+    ordered = [c for c in order if c in buckets] + [c for c in buckets if c not in order]
+
+    lines: list = [Text.assemble(("[◆] ", "bold orange1"), ("WHOIS", "bold orange1"),
+                                 (" :: registration & ownership", MUTED)), Text("")]
+    for ci, category in enumerate(ordered):
+        title = _WHOIS_SECTION_TITLES.get(category, category.title())
+        lines.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+        fields = buckets[category]
+        lbl_w = max((len(l) for l, _ in fields), default=0)
+        for label, value in fields:
+            lines.append(Text.assemble(("    ", ""),
+                                       (f"{label:<{lbl_w}}", "cyan"),
+                                       ("  ", ""), (value, "white")))
+        if ci != len(ordered) - 1:
+            lines.append(Text(""))
+    return Group(*lines)
 
 
 def social_table(records: list) -> Table | None:

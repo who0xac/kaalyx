@@ -53,16 +53,11 @@ _HELP_CTX = {"help_option_names": ["-h", "--help"]}
 
 def _version_callback(value: bool) -> None:
     if value:
-        # Include the installed commit SHA: the version string is static (1.0.0 for every
-        # commit), so the SHA is the ONLY way to tell which build is actually running — the
-        # quickest check for a stale install without running a full scan.
-        from .core.updater import installed_commit
-        sha = None
-        try:
-            sha = installed_commit(timeout=2.0)
-        except Exception:
-            sha = None
-        console.print(f"Kaalyx {__version__}" + (f" ({sha})" if sha else ""))
+        # LOCKED two-line format — exactly these two [INF] lines, nothing else (no results
+        # directory, no build/commit hash).
+        from .config import config_dir
+        console.print(f"[cyan]\\[INF][/] Kaalyx Engine Version: [bold]v{__version__}[/]")
+        console.print(f"[cyan]\\[INF][/] Kaalyx Config Directory: [bold]{config_dir()}[/]")
         raise typer.Exit()
 
 

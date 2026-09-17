@@ -433,10 +433,12 @@ class OsintProgress:
         }
         self._live = None
         self._start = time.monotonic()
+        self._total = len(self._states)
+        self._finished = 0          # how many sources have completed (drives [N/total])
 
     def set_progress(self, name: str, done: int, total: int) -> None:
-        """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Redraws
-        the SAME row in place — never prints a new line."""
+        """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Only the
+        single live status line reflects it — no per-source row is reprinted."""
         st = self._states.get(name)
         if st is None:
             return
@@ -444,7 +446,14 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``."""
+        """The progress hook passed to ``run_sources``.
+
+        DESIGN: every source's row is printed EXACTLY ONCE, as a static line, the moment it
+        finishes (in completion order) — plain console output that scrolls through terminal
+        history and is never redrawn. The ONLY thing the live board updates in place is a single
+        status line (see ``_status_line``), which always fits on screen. This is what makes the
+        board free of both the 'reprints every tick' and 'rows disappear' bugs: nothing tall is
+        ever held as a live frame."""
         st = self._states.get(name)
         if st is None:
             return
@@ -464,7 +473,22 @@ class OsintProgress:
                 st.state = _classify_skip(st.note)
             else:
                 st.state = "done"
+            # Print this source's final row ONCE, now, as a static (scrolling) line.
+            self._finished += 1
+            self._print_static_row(name, st, self._finished)
         self._refresh()
+
+    def _print_static_row(self, name: str, st: "_SourceState", pos: int) -> None:
+        """Emit ONE completed-source line to the console (static; scrolls into history). Printed
+        via the live board's console so it interleaves correctly above the live status line."""
+        row = self._row(st, _display_name(name, st.label), time.monotonic(),
+                        _SPINNER_FRAMES[0], pos=pos, total=self._total)
+        if self._live is not None:
+            # console.print through the Live renders the static line ABOVE the live status line,
+            # then repaints only the (single-line) status — no full-board redraw.
+            self._live.console.print(row)
+        else:
+            self._console.print(row)
 
 
     # Column geometry for the source rows (aligned; leaders fill the middle).
@@ -575,75 +599,62 @@ class OsintProgress:
             line.append(n, style=MUTED)
         return line
 
-    def _render(self):
+    def _status_line(self):
+        """The ONE line the live board updates in place: progress bar + [done/total] + which
+        sources are currently running + elapsed. Always a single line, so it always fits on
+        screen and Live updates it in place without ever repainting a multi-row frame.
+
+        (The completed sources' rows are printed once as static lines by ``_print_static_row``;
+        they scroll through history and are not part of this live renderable.)"""
         now = time.monotonic()
         frame = _SPINNER_FRAMES[int((now * 12)) % len(_SPINNER_FRAMES)]
-        total = len(self._states)
-        done = sum(1 for s in self._states.values()
-                   if s.state not in ("queued", "running"))
+        done = self._finished
+        total = self._total
+        running = [self._states[n] for n in self._states
+                   if self._states[n].state == "running"]
+        elapsed = now - self._start
 
-        lines = []
-        # NO stage header here — the single stage header ([◆] KAALYX::OSINT + TARGET/SOURCES/MODE)
-        # is printed once by print_banner() BEFORE the board. The live board renders only the
-        # progress bar + per-source rows beneath it, so the header never appears twice.
-        # 1) Progress bar + N/total :: elapsed
-        elapsed = time.monotonic() - self._start
-        bar = self._progress_bar(done, total)
-        bar_line = Text("    ")
-        bar_line.append_text(bar)
-        bar_line.append(f" {done}/{total} ", style="white")
-        bar_line.append(":: ", style=MUTED)
-        bar_line.append(self._mmss(elapsed), style="white")
-        lines.append(bar_line)
-        lines.append(Text(""))
-        # 3) One row per source, in insertion (pipeline) order — ALWAYS every source, including
-        #    queued ones (shown as "queued"). Rows are never hidden or collapsed behind a summary;
-        #    if the board is taller than the terminal, the Live uses vertical_overflow="visible"
-        #    (see live()) so the content scrolls through normal terminal history instead of being
-        #    clipped with an ellipsis.
-        for i, (name, st) in enumerate(self._states.items(), start=1):
-            lines.append(self._row(st, _display_name(name, st.label), now, frame,
-                                    pos=i, total=total))
-        return Group(*lines)
+        line = Text("    ")
+        line.append_text(self._progress_bar(done, total))
+        line.append(f" {done}/{total} ", style="white")
+        line.append(":: ", style=MUTED)
+        line.append(self._mmss(elapsed), style="white")
+        if running:
+            # Name the active source(s); the spinner frame animates so a long-running one shows life.
+            names = ", ".join(_display_name(n, self._states[n].label)
+                              for n in self._states if self._states[n].state == "running")
+            if len(names) > 46:
+                names = names[:45] + "…"
+            line.append(f"  {frame} ", style="bold cyan")
+            line.append(names, style="cyan")
+        elif done >= total:
+            line.append("  done", style="bold green")
+        return line
 
     def _refresh(self) -> None:
         if self._live is not None:
             self._live.refresh()
 
     def live(self):
-        """Context manager yielding an auto-refreshing ``rich.Live`` board that stays a SINGLE
-        in-place frame regardless of terminal interaction (keypresses, resize).
+        """Context manager yielding a ``rich.Live`` that manages ONLY the single status line
+        (``get_renderable=self._status_line``). Because that renderable is always one line, it
+        always fits on screen and Live updates it in place — it can never overflow the terminal,
+        so it can never fall into the 'repaint the whole frame every tick' failure mode. Every
+        source's full row is printed separately as a static line by ``_print_static_row`` and
+        scrolls through terminal history like any normal output.
 
-        ``get_renderable=self._render`` makes Live recompute the board on every one of its
-        ``refresh_per_second`` ticks (not only on start/finish events), so the spinner frame
-        — derived from the clock in ``_render`` — animates continuously even while a slow
-        source blocks between events.
-
-        Robustness against duplicate frames (the board re-printing itself):
-          * ``redirect_stdout/stderr`` capture any stray program write during the fan-out.
-          * A terminal-mode guard (:class:`_QuietTerminal`) disables tty ECHO + canonical mode
-            for the duration, so stray KEYPRESSES aren't echoed onto the screen — an echoed
-            char is console output Live didn't emit, which makes a non-transient Live
-            checkpoint the current frame and start a fresh one below (the "board printed N
-            times" bug). Draining is best-effort and a no-op off a real tty / on Windows.
-          * RESIZE: rich 13.x re-reads the console size every refresh and redraws in place; the
-            terminal guard removes the only remaining trigger (echoed input), so a resize alone
-            just reflows the same single frame.
-        """
+        redirect_stdout/stderr + the _LiveWithQuietTerminal guard remain, but they now only have
+        to protect a one-line frame, which is trivially robust."""
         from rich.live import Live
 
         live = Live(
-            get_renderable=self._render,
+            get_renderable=self._status_line,
             console=self._console,
-            refresh_per_second=12,
+            refresh_per_second=8,
             auto_refresh=True,
             transient=False,
             redirect_stdout=True,
             redirect_stderr=True,
-            # Show EVERY source row always; when the board is taller than the terminal, let it
-            # scroll through normal terminal history rather than clipping the tail with an
-            # ellipsis (rich's default "ellipsis"). Never hide/collapse rows.
-            vertical_overflow="visible",
         )
         self._live = live
         return _LiveWithQuietTerminal(live)

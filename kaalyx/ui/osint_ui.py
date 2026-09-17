@@ -6,9 +6,10 @@ Provides:
 * :class:`OsintProgress` — a live, in-place panel showing every OSINT source and its state
   (queued → running (spinner) → done/skipped/failed) as they run concurrently. Driven by
   the ``progress`` hook from :func:`kaalyx.stages.sources.run_sources`.
-* result-table renderers (emails, employees, SPF/DMARC posture, cloud/bucket exposures,
-  findings) — aligned tables instead of dumped text.
-* :func:`summary_panel` — a bordered summary box printed when the stage finishes.
+* result renderers (whois, emails, employees, SPF/DMARC posture, social, host/IP intel,
+  findings) — all in the borderless hacky/cybersec board idiom (bracket markers, dotted
+  leaders, UPPERCASE section headers, no boxes), a continuation of the source board's style.
+* :func:`summary_panel` — a borderless closing block printed when the stage finishes.
 
 All rendering goes through the shared console (:func:`kaalyx.core.logging.get_console`) so
 it interleaves cleanly with logging.
@@ -20,10 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from rich.box import HEAVY, ROUNDED
 from rich.console import Group
-from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from ..core.logging import get_console
@@ -663,38 +661,56 @@ class OsintProgress:
 # --- Result tables ----------------------------------------------------------------------
 
 
-def emails_table(rows: list) -> Table | None:
-    """Aligned table of discovered emails (+ breach data if present)."""
+def _NA() -> "Text":
+    """The 'no data for this FIELD' marker: 'N/A' in red. Distinct from a source's 0 hit-count
+    (which stays GREEN — a clean zero-result is a valid successful outcome, not a failure). Red
+    N/A means 'this particular field/record has no value', not 'the source failed'."""
+    return Text("N/A", style="red")
+
+
+def _section_header(name: str, subtitle: str = ""):
+    """A borderless '[◆] NAME :: subtitle' section header in the locked board idiom."""
+    return Text.assemble(("[◆] ", "bold orange1"), (name, "bold orange1"),
+                         ((f" :: {subtitle}" if subtitle else ""), MUTED))
+
+
+def emails_table(rows: list):
+    """Discovered emails (+ breach data) as borderless board-idiom lines. ``None`` when empty."""
     if not rows:
         return None
-    table = Table(title="Emails", box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white", expand=False)
-    table.add_column("Address", style="white")
-    table.add_column("Source", style=MUTED)
-    table.add_column("Breached", justify="center")
+    lines = [_section_header("EMAILS", f"{len(rows)} address(es)"), Text("")]
     for r in rows:
         breached = r["breached"] if isinstance(r, dict) or hasattr(r, "keys") else r.breached
-        addr = r["address"]
-        source = r["source"]
-        count = r["breach_count"]
-        breach_cell = (
-            Text(f"⚠ {count}", style="bold red") if breached else Text("—", style=MUTED)
-        )
-        table.add_row(addr, source, breach_cell)
-    return table
+        addr, source, count = r["address"], r["source"], r["breach_count"]
+        line = Text("    ")
+        line.append(addr, style="white")
+        pad = max(1, 40 - len(addr))
+        line.append(" " + "." * pad + " ", style=MUTED)
+        if breached:
+            line.append(f"⚠ breached ×{count}", style="bold red")
+        else:
+            line.append("clean", style="green")
+        line.append(f"  ({source})", style=MUTED)
+        lines.append(line)
+    return Group(*lines)
 
 
-def employees_table(rows: list) -> Table | None:
+def employees_table(rows: list):
+    """Discovered people/employees as borderless board-idiom lines. ``None`` when empty."""
     if not rows:
         return None
-    table = Table(title="People / Employees", box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white")
-    table.add_column("Name", style="white")
-    table.add_column("Role", style=MUTED)
-    table.add_column("Source", style=MUTED)
+    lines = [_section_header("PEOPLE / EMPLOYEES", f"{len(rows)}"), Text("")]
     for r in rows:
-        table.add_row(r["name"], r["role"] or "—", r["source"])
-    return table
+        name = r["name"]
+        line = Text("    ")
+        line.append(name, style="white")
+        pad = max(1, 34 - len(name))
+        line.append(" " + "." * pad + " ", style=MUTED)
+        role = r["role"]
+        line.append_text(Text(role, style="cyan") if role else _NA())
+        line.append(f"  ({r['source']})", style=MUTED)
+        lines.append(line)
+    return Group(*lines)
 
 
 # Fixed display order for the email/DNS posture table — every type ALWAYS shown (found or not).
@@ -722,49 +738,53 @@ def _dmarc_interpretation(dmarc_value: str) -> str:
     return "DMARC present — policy unclear from the record"
 
 
-def mail_hygiene_table(records: list) -> Table | None:
-    """Show the full email/DNS security posture: SPF, DMARC, DKIM, CAA, MTA-STS, TLS-RPT, BIMI
-    (every type ALWAYS present — its value, or an explicit dim "not found"), then the SPOOFABLE
-    verdict with a one-line plain-English interpretation."""
+def mail_hygiene_table(records: list):
+    """Email/DNS security posture as borderless board-idiom lines: SPF, DMARC, DKIM, CAA,
+    MTA-STS, TLS-RPT, BIMI — every type ALWAYS shown, with its value or a red ``N/A`` when that
+    record is absent (a missing record is a per-field 'no data', hence N/A) — then the SPOOFABLE
+    verdict + one-line plain-English DMARC interpretation. ``None`` when nothing was assessed."""
     by_kind: dict[str, list] = {}
     for r in records:
         by_kind.setdefault(r["kind"], []).append(r)
     if not any(k in by_kind for k in _MAIL_ROW_ORDER) and "spoofable" not in by_kind:
         return None
 
-    table = Table(title="Email / DNS Security Posture", box=ROUNDED,
-                  border_style=ACCENT_DIM, title_style=f"bold {ACCENT}",
-                  header_style="bold white")
-    table.add_column("Record", style="cyan", no_wrap=True)
-    table.add_column("Value", style="white", overflow="fold")
+    lines = [_section_header("EMAIL / DNS SECURITY", "anti-spoofing & DNS records"), Text("")]
+
+    def _row(label: str, value, style: str = "white"):
+        line = Text("    ")
+        line.append(f"{label:<9}", style="cyan")
+        line.append("  ", style=MUTED)
+        if isinstance(value, Text):
+            line.append_text(value)
+        else:
+            line.append(str(value), style=style)
+        return line
 
     for kind in _MAIL_ROW_ORDER:
         label = kind.upper().replace("_", "-")
         rows = by_kind.get(kind)
         if not rows:
-            # Type wasn't emitted at all — still show it so the table is complete.
-            table.add_row(label, Text("not found", style=MUTED))
+            lines.append(_row(label, _NA()))          # type absent → red N/A (per-field no data)
             continue
         for r in rows:
             val = str(r["value"])
             if val.lower().startswith("not found"):
-                table.add_row(label, Text(val, style=MUTED))
+                lines.append(_row(label, _NA()))      # explicit "not found" → red N/A too
             else:
-                table.add_row(label, val)
+                lines.append(_row(label, val))
 
-    # SPOOFABLE verdict + plain-English interpretation of the DMARC enforcement.
     spoof = (by_kind.get("spoofable") or [None])[0]
     if spoof is not None:
+        lines.append(Text(""))
         spoofable = str(spoof["value"]).lower() == "yes"
         dmarc_val = (by_kind.get("dmarc") or [{"value": "not found"}])[0]["value"]
-        verdict = Text(
-            f"YES — {spoof['detail']}" if spoofable else f"no — {spoof['detail']}",
-            style="bold red" if spoofable else "green",
-        )
-        table.add_row(Text("SPOOFABLE", style="bold"), verdict)
-        table.add_row("", Text(_dmarc_interpretation(dmarc_val),
-                               style="red" if spoofable else "green"))
-    return table
+        verdict = Text(f"YES — {spoof['detail']}" if spoofable else f"no — {spoof['detail']}",
+                       style="bold red" if spoofable else "green")
+        lines.append(_row("SPOOFABLE", verdict))
+        lines.append(_row("", Text(_dmarc_interpretation(dmarc_val),
+                                    style="red" if spoofable else "green")))
+    return Group(*lines)
 
 
 _WHOIS_SECTION_TITLES = {
@@ -813,23 +833,22 @@ def whois_table(records: list):
     return Group(*lines)
 
 
-def social_table(records: list) -> Table | None:
-    """Show discovered social-media profiles (the social source) as a table, so the data is
-    visible during the scan instead of only saved to social.txt."""
+def social_table(records: list):
+    """Discovered social-media profiles as borderless board-idiom lines. ``None`` when empty."""
     rows = [r for r in records if r["kind"] == "social"]
     if not rows:
         return None
-    table = Table(title="Social Profiles", box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white")
-    table.add_column("Platform", style="cyan", no_wrap=True)
-    table.add_column("Handle / Profile", style="white", overflow="fold")
+    lines = [_section_header("SOCIAL PROFILES", f"{len(rows)}"), Text("")]
     for r in rows:
-        # value is "<platform>: <handle>"; detail is the platform. Split for clean columns.
         val = r["value"]
         platform = (r["detail"] or (val.split(":", 1)[0] if ":" in val else "")).strip()
         handle = val.split(":", 1)[1].strip() if ":" in val else val
-        table.add_row(platform, handle)
-    return table
+        line = Text("    ")
+        line.append(f"{platform.upper():<12}", style="cyan")
+        line.append("  ", style=MUTED)
+        line.append_text(Text(handle, style="white") if handle else _NA())
+        lines.append(line)
+    return Group(*lines)
 
 
 def _parse_ip_detail(detail: str) -> dict:
@@ -959,80 +978,76 @@ _CATEGORY_TITLES = [
 _SEV_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 
 
-def _is_complex(row) -> bool:
-    """A finding needs the spacious CARD format (not a table row) when its detail is large or
-    multi-line — e.g. a hardcoded Postman credential with request/header/value/URL. A short,
-    single-line detail (TruffleHog's ``repo | file:line | masked``) fits a compact table."""
-    ev = _row_get(row, "evidence")
-    return "\n" in ev or len(ev) > 100
+# Severity → the leading bracket marker, matching the source board's [icon] idiom. Colour comes
+# from severity_style; the glyph signals urgency at a glance.
+_SEV_MARKER = {
+    "critical": "‼", "high": "!", "medium": "!", "low": "·", "info": "i", "unknown": "·",
+}
 
 
-def _finding_card(row):
-    """Render one complex finding as a bordered card with every detail line visible."""
-    sev = _row_get(row, "severity", "unknown")
+def _finding_lines(row) -> list:
+    """Render ONE finding as borderless lines in the source-board idiom:
+
+        [!] HIGH  ✔ verified  <title> ....... <short detail>
+              <label>  <value>          (extra evidence lines, indented, only when present)
+
+    A short single-line detail sits on the header line after a dotted leader; a long or
+    multi-line evidence body is spread over indented continuation lines (no box, nothing
+    truncated). Full secret values render literally (no masking, no markup eaten)."""
+    sev = _row_get(row, "severity", "unknown").lower()
+    marker = _SEV_MARKER.get(sev, "·")
+    sev_style = severity_style(sev)
     title = _row_get(row, "title")
-    body = Table.grid(padding=(0, 1))
-    body.add_column(style="cyan", no_wrap=True)     # label
-    body.add_column(style="white", overflow="fold")  # value (wraps, never truncates)
-    body.add_row(Text(sev.upper(), style=severity_style(sev)), _verified_cell(row))
     tgt = _row_get(row, "target")
-    if tgt:
-        body.add_row("Target", Text(tgt))
-    # evidence is newline-separated lines. Some are structured "Label: value" (from the Postman
-    # parser); others are free text that legitimately contains a colon (a URL like
-    # ``https://host/.json``, ``preview: {...}`` with JSON). Only split on the first colon when
-    # the part before it looks like a short label — no spaces, no slashes, and reasonably short —
-    # so a colon inside a URL/value never gets mistaken for a label separator.
     ev = _row_get(row, "evidence")
-    if "\n" in ev:
-        for line in ev.split("\n"):
-            head = line.partition(":")[0]
-            is_label = (":" in line and head.strip()
-                        and " " not in head.strip() and "/" not in head
-                        and len(head.strip()) <= 16)
-            # Wrap value cells in Text() so a value containing rich-markup brackets — a full
-            # secret value, or a "[redacted:N]" marker — renders literally, never as markup.
-            if is_label:
-                lbl, _, val = line.partition(":")
-                body.add_row(lbl.strip(), Text(val.strip()))
-            elif line.strip():
-                body.add_row("", Text(line.strip()))
+
+    header = Text("    ")
+    header.append(f"[{marker}] ", style=sev_style)
+    header.append(f"{sev.upper():<8} ", style=sev_style)
+    header.append_text(_verified_cell(row))
+    header.append("  ", style=MUTED)
+    header.append(title, style="white")
+
+    lines = [header]
+    # Short, single-line evidence → one dotted-leader continuation under the title.
+    short = ev and "\n" not in ev and len(ev) <= 100
+    if short:
+        lines.append(Text.assemble(("          ", ""), (ev, MUTED)))
     else:
-        body.add_row("Detail", Text(ev or _row_get(row, "description")))
-    return Panel(body, title=Text(title, style="bold white"), title_align="left",
-                 border_style=severity_style(sev), box=ROUNDED, padding=(0, 1))
+        if tgt:
+            lines.append(Text.assemble(("          target  ", "cyan"), (tgt, "white")))
+        if "\n" in ev:
+            # Structured "Label: value" lines (Postman creds) vs free text w/ a colon (URLs/JSON).
+            for line in ev.split("\n"):
+                head = line.partition(":")[0]
+                is_label = (":" in line and head.strip()
+                            and " " not in head.strip() and "/" not in head
+                            and len(head.strip()) <= 16)
+                if is_label:
+                    lbl, _, val = line.partition(":")
+                    lines.append(Text.assemble(("          ", ""),
+                                               (f"{lbl.strip()}  ", "cyan"),
+                                               *_as_assemble(Text(val.strip()))))
+                elif line.strip():
+                    lines.append(Text.assemble(("          ", ""),
+                                               *_as_assemble(Text(line.strip(), style=MUTED))))
+        elif ev:
+            lines.append(Text.assemble(("          ", ""), *_as_assemble(Text(ev, style=MUTED))))
+        elif not tgt:
+            lines.append(Text.assemble(("          ", ""),
+                                       (_row_get(row, "description"), MUTED)))
+    return lines
 
 
-def _simple_findings_table(rows: list, section_title: str) -> Table:
-    """Compact table for simple findings (short single-line detail), full width, folding."""
-    table = Table(title=section_title, box=ROUNDED, border_style=ACCENT_DIM,
-                  title_style=f"bold {ACCENT}", header_style="bold white", expand=True)
-    table.add_column("Sev", width=9, no_wrap=True)
-    table.add_column("Verified", width=10, justify="center", no_wrap=True)
-    table.add_column("Title", style="white", overflow="fold", ratio=2, min_width=18)
-    table.add_column("Detail", style=MUTED, overflow="fold", ratio=3, min_width=22)
-    for r in rows:
-        sev = _row_get(r, "severity", "unknown")
-        detail = _row_get(r, "evidence") or _row_get(r, "target") or ""
-        table.add_row(
-            Text(sev.upper(), style=severity_style(sev)),
-            _verified_cell(r), _row_get(r, "title"), Text(detail, style=MUTED),
-        )
-    return table
-
-
-def render_findings(rows: list, limit: int = 40) -> list:
-    """Findings rendered Option-3 style: GROUPED BY CATEGORY, each group using the format that
-    fits its detail — a compact table for simple findings, spacious cards for complex ones.
-
-    Returns a list of renderables (section header + table/cards per category) so no detail is
-    ever truncated to keep a uniform table tidy. Empty list when there are no findings.
-    """
+def render_findings(rows: list, limit: int = 60) -> list:
+    """Findings in the locked hacky/cybersec board idiom — NO borders, NO boxed tables. Grouped
+    by category under UPPERCASE headings, each finding a ``[marker] SEV verified title`` line
+    with indented evidence beneath. Matches the source-board visual language so findings read as
+    a continuation of it. Empty list when there are no findings."""
     if not rows:
         return []
     rows = sorted(rows, key=lambda r: _SEV_ORDER.get(_row_get(r, "severity", "unknown"), 0),
                   reverse=True)[:limit]
-    # Bucket by category, preserving the presentation order; unknown categories go last.
     buckets: dict[str, list] = {}
     for r in rows:
         buckets.setdefault(_row_get(r, "category", "other") or "other", []).append(r)
@@ -1041,17 +1056,16 @@ def render_findings(rows: list, limit: int = 40) -> list:
     ordered_cats += [c for c in buckets if c not in ordered_cats]
     title_map = dict(_CATEGORY_TITLES)
 
-    out: list = [Text("Findings", style=f"bold {ACCENT}")]
+    out: list = [Text.assemble(("[◆] ", "bold orange1"), ("FINDINGS", "bold orange1"),
+                               (f" :: {len(rows)} across {len(buckets)} categories", MUTED)),
+                 Text("")]
     for cat in ordered_cats:
-        group = buckets[cat]
         section = title_map.get(cat, cat.replace("-", " ").title())
-        complex_rows = [r for r in group if _is_complex(r)]
-        simple_rows = [r for r in group if not _is_complex(r)]
-        if simple_rows:
-            out.append(_simple_findings_table(simple_rows, section))
-        for r in complex_rows:
-            out.append(_finding_card(r))
-    return out
+        out.append(Text(f"  {section.upper()}", style=f"bold {ACCENT}"))
+        for r in buckets[cat]:
+            out.extend(_finding_lines(r))
+        out.append(Text(""))
+    return [Group(*out)]
 
 
 def findings_table(rows: list, limit: int = 25):
@@ -1103,7 +1117,7 @@ def summary_panel(
     source_states: list[tuple[str, str, int, str]],
     duration_s: float,
     verified_counts: dict[str, int] | None = None,
-) -> Panel:
+) -> Group:
     """Build the bordered end-of-stage summary panel.
 
     Args:
@@ -1114,16 +1128,6 @@ def summary_panel(
         duration_s: how long the stage took.
         verified_counts: optional {verified, unverified} finding split (TruffleHog etc.).
     """
-    # Left: headline numbers.
-    numbers = Table.grid(padding=(0, 2))
-    numbers.add_column(justify="right", style=f"bold {ACCENT}")
-    numbers.add_column(style="white")
-    for label, key in (
-        ("Subdomains", "subdomains"), ("Emails", "emails"), ("People", "employees"),
-        ("OSINT records", "osint"), ("Findings", "findings"),
-    ):
-        numbers.add_row(str(counts.get(key, 0)), label)
-
     # Severity breakdown line (only non-zero severities).
     sev_line = Text()
     for sev in ("critical", "high", "medium", "low", "info"):
@@ -1146,31 +1150,32 @@ def summary_panel(
     )
     failed_names = [n for n, s, _, _ in source_states if s == "failed"]
 
-    body_parts = [
-        numbers,
-        Text(""),
-        Text("findings:", style="bold white"),
-        sev_line,
-    ]
-    # Verified/unverified split — makes a big credential scan's real hits legible at a glance.
+    # Borderless closing block in the locked board idiom — no box, consistent with the findings
+    # and source-board style. Counts stay GREEN even at 0 (a clean zero-result is a valid,
+    # successful outcome, not a failure — distinct from a red per-field N/A).
+    header = Text.assemble(
+        ("[◆] ", "bold orange1"), ("KAALYX::OSINT COMPLETE", "bold orange1"),
+        (f" :: {domain} · {format_duration(duration_s)}", MUTED),
+    )
+    body_parts = [header, Text("")]
+    for label, key in (("SUBDOMAINS", "subdomains"), ("EMAILS", "emails"),
+                       ("PEOPLE", "employees"), ("OSINT RECORDS", "osint"),
+                       ("FINDINGS", "findings")):
+        n = counts.get(key, 0)
+        row = Text("    ")
+        row.append(f"{label:<15}", style="cyan")
+        row.append("  ", style=MUTED)
+        row.append(f"{n}", style="green")     # 0 stays green: valid clean result, not a failure
+        body_parts.append(row)
+    body_parts += [Text(""), Text("    FINDINGS BY SEVERITY", style=f"bold {ACCENT}"),
+                   Text.assemble(("      ", ""), *_as_assemble(sev_line))]
     if verified_counts and (verified_counts.get("verified") or verified_counts.get("unverified")):
         v, u = verified_counts.get("verified", 0), verified_counts.get("unverified", 0)
         body_parts.append(Text.assemble(
-            (f"{v} verified", "bold green" if v else MUTED), ("  ", ""),
-            (f"{u} unverified", "yellow" if u else MUTED),
-        ))
-    body_parts += [
-        Text(""),
-        Text("sources:", style="bold white"),
-        rollup,
-    ]
+            ("      ", ""), (f"{v} verified", "bold green" if v else MUTED), ("  ", ""),
+            (f"{u} unverified", "yellow" if u else MUTED)))
+    body_parts += [Text(""), Text("    SOURCES", style=f"bold {ACCENT}"),
+                   Text.assemble(("      ", ""), *_as_assemble(rollup))]
     if failed_names:
-        body_parts.append(Text(f"failed: {', '.join(failed_names)}", style="red"))
-    body = Group(*body_parts)
-
-    title = Text.assemble(
-        ("✔ OSINT complete", "bold green"), ("   ", ""),
-        (domain, f"bold {ACCENT}"), ("   ", ""), (format_duration(duration_s), MUTED),
-    )
-    return Panel(body, title=title, title_align="left", border_style="green",
-                 box=HEAVY, padding=(1, 2))
+        body_parts.append(Text(f"      failed: {', '.join(failed_names)}", style="red"))
+    return Group(*body_parts)

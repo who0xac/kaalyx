@@ -131,33 +131,34 @@ _BANNER_DIVIDER = "─" * 51
 _BANNER_AUTHOR = "who0xac"
 
 
-def main_banner():
+def main_banner(show_commit: bool = False):
     """Build the Kaalyx startup banner as a rich renderable.
 
     Styling: the ASCII art is RED; on the version/tagline line the version is bold YELLOW,
     the ``|`` separator dim, and the tagline bold GREEN; the divider dim; the author muted.
+
+    The installed commit SHA is shown next to the version ONLY when *show_commit* is true
+    (i.e. under --verbose/-vv) — it's a debugging aid for spotting a stale install, not part of
+    the default user-facing banner.
     """
     from rich.console import Group
     from rich.text import Text
 
     from .. import __version__
 
-    # Show the installed commit next to the version so a STALE install is immediately visible —
-    # e.g. an old pipx build that predates a source/fix (the "MOBILE_APPS missing / key not read
-    # even though update was run" class of confusion). Best-effort; never breaks the banner.
-    sha = None
-    try:
-        from ..core.updater import installed_commit
-        sha = installed_commit(timeout=2.0)
-    except Exception:
-        sha = None
-
     version_bits = [
         ("    ", ""),
         (f"v{__version__}", "bold yellow"),
     ]
-    if sha:
-        version_bits += [(" (", MUTED), (sha, "yellow"), (")", MUTED)]
+    if show_commit:
+        sha = None
+        try:
+            from ..core.updater import installed_commit
+            sha = installed_commit(timeout=2.0)
+        except Exception:
+            sha = None
+        if sha:
+            version_bits += [(" (", MUTED), (sha, "yellow"), (")", MUTED)]
     version_bits += [
         ("  |  ", MUTED),
         ("Automated Recon & Vulnerability Engine", "bold green"),
@@ -174,11 +175,11 @@ def main_banner():
     )
 
 
-def print_main_banner() -> None:
-    """Print the Kaalyx startup banner to the shared console."""
+def print_main_banner(show_commit: bool = False) -> None:
+    """Print the Kaalyx startup banner. *show_commit* (under --verbose) appends the commit SHA."""
     from ..core.logging import get_console
 
-    get_console().print(main_banner())
+    get_console().print(main_banner(show_commit=show_commit))
 
 
 # --- Dot progress bar (used by `kaalyx update`) -----------------------------------------

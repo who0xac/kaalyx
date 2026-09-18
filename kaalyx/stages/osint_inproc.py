@@ -1021,51 +1021,112 @@ def _strip_html(s: str) -> str:
     return " ".join(text.split())[:160]
 
 
-async def search_grep_app(domain: str) -> tuple[list[OsintRecord], list["Subdomain"]]:
-    """Search grep.app's public-code index for *domain* (keyless JSON API).
+# A URL/endpoint in a code snippet. The path stops at the first char unlikely to be part of a
+# real URL in code — quotes, brackets, backticks, whitespace — so we don't swallow trailing code
+# artifacts (a line number, a closing quote, ``vault:`` on the next token).
+_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-]+(?:/[A-Za-z0-9._~/?#@!$&*+,;=%\-]*)?")
 
-    Returns ``(records, subdomains)``: a ``grep_app`` OsintRecord per matching repo/path (with a
-    plain-text code excerpt), plus any subdomains of *domain* extracted from the matched snippets
-    (fed into subdomain discovery, like github_subdomains). Never raises — any HTTP/parse failure
-    yields empty (the caller reports a clean skip)."""
+
+def _clean_url(u: str) -> str:
+    """Trim trailing punctuation a code snippet commonly appends to a URL (``)``, ``'``, ``,``,
+    a stray digit run from a line number, etc.)."""
+    u = u.rstrip("'\").,;:>]}`")
+    # Drop a trailing all-digits run glued on with no separator (a snippet line number).
+    u = re.sub(r"(?<=[/A-Za-z])\d{1,4}$", "", u)
+    return u.rstrip("/") if u.endswith("://") else u
+
+
+@dataclass
+class GrepAppResult:
+    """Everything grep.app yielded, structured so it CROSS-FEEDS other sources/stages instead of
+    being a standalone finding — mirroring how Postman/Swagger data is fanned out."""
+    records: list[OsintRecord] = field(default_factory=list)      # grep_app OsintRecords (display/DB)
+    subdomains: list = field(default_factory=list)                # Subdomain objs → subdomain count/list
+    urls: list[str] = field(default_factory=list)                 # API endpoints/URLs → Web stage
+    owners: dict[str, list[str]] = field(default_factory=dict)    # gh owner -> repos → org discovery
+    raw: str = ""                                                 # raw text dump → dual-output file
+    total: int = 0                                                # total hits grep.app reported
+
+
+async def search_grep_app(domain: str) -> GrepAppResult:
+    """Search grep.app's public-code index for *domain* (keyless JSON API) and extract everything
+    reusable, the same way we fan out Postman/Swagger data:
+
+      * a ``grep_app`` OsintRecord per matching repo/path (repo · file · branch · code excerpt),
+      * SUBDOMAINS of the target found in the snippets → fed to subdomain discovery,
+      * API endpoints / URLs on the target's domain → carried for the Web stage,
+      * the GitHub OWNER of each matching repo (owner/repo) → an org/username candidate that
+        strengthens discover_github_org (a keyless signal, no token needed),
+      * a raw text dump for dual-output on disk.
+
+    Never raises — any HTTP/parse failure yields an empty result (the caller reports a clean
+    skip)."""
     from ..data.models import Subdomain
 
-    records: list[OsintRecord] = []
+    out = GrepAppResult()
     subs: dict[str, Subdomain] = {}
+    urls: set[str] = set()
     seen: set[str] = set()
+    raw_lines: list[str] = [f"# grep.app code search for {domain}"]
     async with httpx.AsyncClient(timeout=20, follow_redirects=True,
                                  headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
         try:
             resp = await client.get("https://grep.app/api/search", params={"q": domain})
         except httpx.HTTPError as exc:
             logger.debug("grep.app search failed for %s: %s", domain, exc)
-            return records, []
+            return out
         if resp.status_code != 200:
             logger.debug("grep.app returned HTTP %s for %s", resp.status_code, domain)
-            return records, []
+            return out
         try:
-            hits = (resp.json().get("hits") or {}).get("hits") or []
+            hits_obj = resp.json().get("hits") or {}
+            hits = hits_obj.get("hits") or []
         except ValueError:
-            return records, []
+            return out
+        out.total = hits_obj.get("total", len(hits))
         for h in hits:
-            repo = h.get("repo", "")
+            repo = h.get("repo", "")          # "owner/name"
             path = h.get("path", "")
+            branch = h.get("branch", "")
             if not repo:
                 continue
             key = f"{repo}/{path}"
             snippet = _strip_html(((h.get("content") or {}).get("snippet") or ""))
             if key not in seen:
                 seen.add(key)
-                records.append(OsintRecord(
+                out.records.append(OsintRecord(
                     kind="grep_app", value=key,
-                    detail=(f"{h.get('branch','')}: {snippet}" if snippet else h.get("branch", "")),
-                    source="grep_app"))
-            # Extract subdomains of the target from the matched code snippet.
+                    detail=(f"{branch}: {snippet}" if snippet else branch), source="grep_app"))
+                raw_lines.append(f"{key}\t{branch}\t{snippet}")
+            # (a) repo OWNER → org/username candidate for discover_github_org.
+            owner = repo.split("/", 1)[0]
+            if owner:
+                out.owners.setdefault(owner, [])
+                if repo not in out.owners[owner]:
+                    out.owners[owner].append(repo)
+            # (b) subdomains of the target from the snippet → subdomain discovery.
             for m in _SUBDOMAIN_RE.findall(snippet):
                 host = m.lower().rstrip(".")
-                if (host.endswith("." + domain) or host == domain) and host not in subs:
+                if host.endswith("." + domain) and host not in subs:
                     subs[host] = Subdomain(hostname=host, source="grep.app")
-    return records, list(subs.values())
+            # (c) API endpoints / URLs on the target domain → Web stage.
+            for u in _URL_RE.findall(snippet):
+                u = _clean_url(u)
+                hostpart = u.split("://", 1)[-1].split("/", 1)[0].lower()
+                if hostpart == domain or hostpart.endswith("." + domain):
+                    urls.add(u)
+    out.subdomains = list(subs.values())
+    out.urls = sorted(urls)
+    if out.urls:
+        raw_lines.append("")
+        raw_lines.append("# API endpoints / URLs found:")
+        raw_lines += [f"  {u}" for u in out.urls]
+    if out.owners:
+        raw_lines.append("")
+        raw_lines.append("# GitHub owners of matching repos (org candidates):")
+        raw_lines += [f"  {o}: {', '.join(rs)}" for o, rs in out.owners.items()]
+    out.raw = "\n".join(raw_lines)
+    return out
 
 
 # GitLab group / namespace discovery --------------------------------------------------------
@@ -1828,7 +1889,8 @@ async def _authenticated_login(client) -> str | None:
     return data.get("login") if data else None
 
 
-async def discover_github_org(target, token: str | None, max_candidates: int = 5) -> list[GithubOrgCandidate]:
+async def discover_github_org(target, token: str | None, max_candidates: int = 5,
+                              extra_owners: dict[str, list[str]] | None = None) -> list[GithubOrgCandidate]:
     """Identify the TARGET's GitHub org(s), ranked by confidence. Never the token owner.
 
     Strategy (thorough by design — we would rather spend a few extra API calls than settle
@@ -1841,17 +1903,50 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
        whose name/login matches the company; a slug that *also* appears in (1) is "high",
        otherwise "medium" (a plain name match — real but weaker).
     3. **Exact-login probe.** If an org literally named after the slug exists, include it.
+    4. **grep.app repo owners (*extra_owners*).** Owners of public repos whose code grep.app
+       found mentioning the domain — a KEYLESS signal (grep.app needs no token), folded in as an
+       additional org candidate whether or not a GitHub token is present.
 
-    Every candidate is verified to be a real account via the API. The account that owns the
-    token is filtered out at every step so a company scan can never resolve to the operator's
-    personal account. Returns ``[]`` when nothing can be confidently identified — the caller
-    then skips trufflehog/gato with a clear reason rather than scanning anyone by default.
+    Every candidate is verified against the API when a token is available; without a token, the
+    grep.app owners are still returned (a name match raises confidence). The token owner is
+    filtered out so a company scan can never resolve to the operator's personal account. Returns
+    ``[]`` when nothing can be confidently identified.
     """
-    if not token:
-        return []
-
     candidates: dict[str, GithubOrgCandidate] = {}
     slugs = _company_slugs(target)
+    extra_owners = extra_owners or {}
+
+    def _fold_grep_owners(verified: dict[str, str] | None) -> None:
+        """Add grep.app repo owners as candidates. *verified* maps login→kind when a token let us
+        verify them; without it we still include name-matched owners (lower confidence)."""
+        for login, repos in extra_owners.items():
+            low = login.lower()
+            if low in candidates:
+                candidates[low].reason += "; also found in grep.app code matches"
+                candidates[low].evidence = (candidates[low].evidence + repos)[:5]
+                continue
+            name_match = any(s in low for s in slugs)
+            kind = (verified or {}).get(low)
+            if kind is None and verified is not None:
+                continue  # token present but this owner isn't a real account → skip
+            # Keyless: an owner whose PUBLIC repos reference the target domain is an evidence-
+            # backed candidate (the same "owns repos mentioning the domain" signal), just
+            # unverified — include it at low confidence (medium if the login also name-matches).
+            candidates[low] = GithubOrgCandidate(
+                login=login, kind=kind or ("org" if name_match else "user"),
+                confidence="high" if (kind == "org" and name_match) else
+                           ("medium" if name_match else "low"),
+                reason="owns public repo(s) grep.app found mentioning "
+                       f"{target.registrable}",
+                evidence=repos[:5])
+
+    if not token:
+        # Keyless path: grep.app owners are the only signal we have — still useful.
+        _fold_grep_owners(verified=None)
+        order = {"high": 3, "medium": 2, "low": 1}
+        return sorted(candidates.values(),
+                      key=lambda c: (order.get(c.confidence, 0), c.kind == "org", len(c.evidence)),
+                      reverse=True)[:max_candidates]
 
     async with httpx.AsyncClient(timeout=20, headers=_github_headers(token), follow_redirects=True) as client:
         token_owner = await _authenticated_login(client)
@@ -1905,6 +2000,17 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
                     login=slug, kind="org", confidence="high",
                     reason=f"an organization named '{slug}' exists on GitHub",
                 )
+
+        # (4) grep.app repo owners — verify each against the API (we have a token here) and fold
+        # in, filtering out the token owner so a scan never resolves to the operator's account.
+        verified: dict[str, str] = {}
+        for login in extra_owners:
+            if token_owner and login.lower() == token_owner.lower():
+                continue
+            kind = await _verify_account(client, login)
+            if kind:
+                verified[login.lower()] = kind
+        _fold_grep_owners(verified=verified)
 
     # Rank: high > medium > low, orgs before users, more evidence first.
     order = {"high": 3, "medium": 2, "low": 1}

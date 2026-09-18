@@ -39,7 +39,7 @@ from __future__ import annotations
 import httpx
 
 from ..core.stage import Stage, StageResult
-from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain
+from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain, WebURL
 from ..monitor.flags import flag_all
 from ..ui import osint_ui
 from . import osint_inproc
@@ -148,9 +148,12 @@ class OsintStage(Stage):
         # Identify the TARGET's GitHub org BEFORE the fan-out so the GitHub-scanning sources
         # (trufflehog, gato) scan the target — never the token owner's account. Runs as a
         # pre-step because those sources need its result and the fan-out is concurrent. If no
-        # org is confidently identified, both sources skip cleanly (see their methods).
-        if (osint_cfg.trufflehog or osint_cfg.github_actions or osint_cfg.workflow_logs) \
-                and ctx.secrets.has_github:
+        # org is confidently identified, those sources skip cleanly (see their methods).
+        # Runs when a token-gated consumer is enabled (needs a token), OR when grep_app is on —
+        # grep.app contributes org candidates KEYLESSLY, so org discovery is useful even with no
+        # token (the candidates are recorded/shown even if the token-gated scanners then skip).
+        token_consumer = (osint_cfg.trufflehog or osint_cfg.github_actions or osint_cfg.workflow_logs)
+        if (token_consumer and ctx.secrets.has_github) or osint_cfg.grep_app:
             await self._discover_github_org()
 
         # Live progress board that updates in place. EVERYTHING — the concurrent fan-out AND
@@ -218,12 +221,18 @@ class OsintStage(Stage):
         all_findings = [f for r in results for f in r.findings]
         all_emails = [e for r in results for e in r.emails]
         all_employees = [e for r in results for e in r.employees]
+        all_urls = [u for r in results for u in r.urls]
 
         flag_all(all_subs, keywords)
 
         if all_subs:
             ctx.repo.bulk_upsert_subdomains(ctx.scan_id, all_subs)
             ctx.writer.write_lines(self.name, "subdomains.txt", [s.hostname for s in all_subs])
+        if all_urls:
+            # API endpoints / URLs (e.g. from grep.app) → the shared web_urls table + a file, so
+            # the Web stage (Part 4) can pick them up rather than rediscovering them.
+            ctx.repo.bulk_upsert_urls(ctx.scan_id, all_urls)
+            ctx.writer.write_lines(self.name, "urls.txt", [u.url for u in all_urls])
         if all_osint:
             ctx.repo.bulk_insert_osint(ctx.scan_id, all_osint)
         if all_emails:
@@ -617,16 +626,35 @@ class OsintStage(Stage):
 
     async def _src_grep_app(self) -> SourceResult:
         """Search grep.app's public-code index for the domain (keyless JSON API). A fast,
-        complementary alternative to GitHub's rate-limited code search — no token needed."""
+        complementary alternative to GitHub's rate-limited code search — no token needed.
+
+        CROSS-FEEDS other sources/stages (not an island): subdomains found in the code go into
+        the shared subdomain list (same as Postman/Swagger); API endpoints/URLs are carried as
+        web_urls for the Web stage; and the matching repos' GitHub owners are stashed in shared
+        state so the org-discovery pre-step folds them into discover_github_org as extra
+        candidates. The org owners are also cached so the pre-step doesn't re-fetch."""
         res = SourceResult(name="grep_app", raw_ext="txt")
         domain = self.ctx.target.registrable
-        records, subs = await osint_inproc.search_grep_app(domain)
-        res.osint, res.subdomains = records, subs
-        res.raw = "\n".join([f"# grep.app code search for {domain}"] +
-                            [f"{r.value}  {r.detail}" for r in records] or ["# no matches"])
-        if records:
-            res.note = (f"{len(records)} repo match(es)"
-                        + (f", {len(subs)} subdomain(s)" if subs else ""))
+        cached = self.ctx.get_shared("grep_app_result")
+        result = cached if cached is not None else await osint_inproc.search_grep_app(domain)
+        self.ctx.set_shared("grep_app_result", result)
+
+        res.osint = result.records
+        res.subdomains = result.subdomains          # → shared subdomain count/list (Part 2)
+        # API endpoints / URLs → web_urls for the Web stage (same shared structure gau/katana use).
+        for u in result.urls:
+            res.urls.append(WebURL(url=u, source="grep.app"))
+        res.raw = result.raw or f"# grep.app code search for {domain}\n# no matches"
+        if result.records:
+            extras = []
+            if result.subdomains:
+                extras.append(f"{len(result.subdomains)} subdomain(s)")
+            if result.urls:
+                extras.append(f"{len(result.urls)} URL(s)")
+            if result.owners:
+                extras.append(f"{len(result.owners)} org candidate(s)")
+            res.note = f"{len(result.records)} repo match(es)" + (
+                " → " + ", ".join(extras) if extras else "")
         else:
             res.note = "no public code mentions the domain (grep.app)"
         return res
@@ -640,8 +668,21 @@ class OsintStage(Stage):
         """
         target = self.ctx.target
         token = self.ctx.secrets.next_github_token()
+        # Feed grep.app's repo owners (a KEYLESS signal) into org discovery. Run grep.app once
+        # here and cache the whole result so _src_grep_app reuses it instead of re-querying.
+        extra_owners: dict[str, list[str]] = {}
+        if self.ctx.config.osint.grep_app:
+            try:
+                grep = self.ctx.get_shared("grep_app_result")
+                if grep is None:
+                    grep = await osint_inproc.search_grep_app(target.registrable)
+                    self.ctx.set_shared("grep_app_result", grep)
+                extra_owners = grep.owners
+            except Exception as exc:  # grep.app must never break org discovery
+                self.log.debug("grep.app owners for org discovery unavailable: %s", exc)
         try:
-            candidates = await osint_inproc.discover_github_org(target, token)
+            candidates = await osint_inproc.discover_github_org(
+                target, token, extra_owners=extra_owners)
         except Exception as exc:  # never let discovery break the stage
             self.log.warning("GitHub org discovery failed: %s", exc)
             candidates = []

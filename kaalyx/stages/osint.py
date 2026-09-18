@@ -281,8 +281,10 @@ class OsintStage(Stage):
         osint_rows = ctx.repo.list_osint(ctx.scan_id)
         finding_rows = ctx.repo.list_findings(ctx.scan_id)
 
-        # One blank line before each result table so the blocks don't run together.
+        # One blank line before each result block. The SOURCE RESULTS roster shows EVERY source's
+        # outcome (all 34, not just the ones with data) — a green count, red N/A, or skip state.
         for table in (
+            osint_ui.source_results_table(results),
             osint_ui.whois_table(osint_rows),
             osint_ui.host_intel_table(osint_rows),
             osint_ui.mail_hygiene_table(osint_rows),

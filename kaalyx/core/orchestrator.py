@@ -21,8 +21,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable
 
-from rich.table import Table
-
 from ..config import Config, Secrets, resolve_paths
 from ..data.db import connect
 from ..data.repository import Repository
@@ -254,32 +252,45 @@ class Orchestrator:
     def _print_summary(
         self, scan_id: int, results: list[StageResult], counts: dict[str, int]
     ) -> None:
-        # A blank line separates this block from the stage's own summary panel above.
-        self.console.print()
-        table = Table(title=f"Kaalyx scan #{scan_id} — {self.target.domain}")
-        table.add_column("Stage", style="cyan")
-        table.add_column("Status")
-        table.add_column("Items")
-        table.add_column("Time", justify="right")
-        for r in results:
-            status = (
-                "[yellow]skipped[/]"
-                if r.skipped
-                else ("[green]ok[/]" if r.ok else "[red]failed[/]")
-            )
-            items = ", ".join(f"{k}={v}" for k, v in r.counts.items()) or "-"
-            table.add_row(r.stage, status, items, f"{r.duration_s:.1f}s")
-        self.console.print(table)
+        """Cross-stage scan summary, in the SAME borderless hacky/cybersec idiom as the OSINT
+        results (no boxed tables — one consistent style tool-wide)."""
+        from rich.text import Text
 
         self.console.print()
-        totals = Table(title="Totals", show_header=False)
+        self.console.print(Text.assemble(
+            ("[◆] ", "bold orange1"), (f"KAALYX::SCAN #{scan_id}", "bold orange1"),
+            (f" :: {self.target.domain}", "grey50")))
+        self.console.print()
+        # Per-stage roll-up: [status] STAGE ... items :: time
+        for r in results:
+            if r.skipped:
+                marker, mstyle, status = "○", "yellow", "skipped"
+            elif r.ok:
+                marker, mstyle, status = "✓", "bold green", "ok"
+            else:
+                marker, mstyle, status = "✘", "bold red", "failed"
+            items = ", ".join(f"{k}={v}" for k, v in r.counts.items()) or "-"
+            line = Text("    ")
+            line.append(f"[{marker}] ", style=mstyle)
+            line.append(f"{r.stage.upper():<12}", style="cyan")
+            line.append(f"{status:<8}", style=mstyle)
+            line.append(items, style="grey50")
+            line.append(f"  :: {r.duration_s:.1f}s", style="grey50")
+            self.console.print(line)
+
+        self.console.print()
+        self.console.print(Text("    TOTALS", style="bold bright_cyan"))
         for key in ("subdomains", "hosts", "web_urls", "findings", "osint"):
-            totals.add_row(key, str(counts.get(key, 0)))
+            row = Text("      ")
+            row.append(f"{key.upper():<12}", style="cyan")
+            # 0 stays GREEN — a clean zero-count is a valid outcome, not a failure.
+            row.append(str(counts.get(key, 0)), style="green")
+            self.console.print(row)
         for sev in ("critical", "high", "medium", "low", "info"):
             n = counts.get(f"sev_{sev}", 0)
             if n:
-                totals.add_row(f"findings.{sev}", str(n))
-        self.console.print(totals)
+                self.console.print(Text.assemble(
+                    ("      ", ""), (f"{('findings.'+sev).upper():<13}", "cyan"), (str(n), "yellow")))
         self.console.print()
 
     def close(self) -> None:

@@ -682,6 +682,58 @@ def _section_header(name: str, subtitle: str = ""):
                          ((f" :: {subtitle}" if subtitle else ""), MUTED))
 
 
+def source_results_table(results: list):
+    """Every source's OUTCOME, in the locked board idiom — ALL sources, not just the ones that
+    found something. Each source shows a status marker + its result: a green hit COUNT (0 stays
+    green — a clean zero is a valid outcome), a red ``N/A`` for a source that produced no data,
+    ``skipped``/``no key`` in yellow, or ``failed`` in red. A persistent post-scan roster so the
+    full set of sources is always visible after a scan, mirroring the live board."""
+    if not results:
+        return None
+    lines = [_section_header("SOURCE RESULTS", f"{len(results)} sources"), Text("")]
+    for r in results:
+        name = _display_name(r.name, r.name)
+        line = Text("    ")
+        # Status marker (matches the live board): ✓ ok / ○ skipped / ✘ failed.
+        if not r.ok:
+            line.append("[✘] ", style="bold red")
+        elif r.skipped:
+            line.append("[○] ", style="yellow")
+        else:
+            line.append("[✓] ", style="bold green")
+        line.append(f"{name:<28}", style="white" if r.ok and not r.skipped else "grey50")
+        pad = max(1, 30 - len(name))
+        line.append(" " + "." * pad + " ", style=MUTED)
+        # Result cell: N/A (red) when a successful source produced nothing; else the count/state.
+        if not r.ok:
+            line.append("failed", style="bold red")
+        elif r.skipped:
+            line.append(_skip_result_text(r.note))
+        elif r.total > 0:
+            line.append(f"{r.total} hits", style="green")   # 0 wouldn't reach here
+        else:
+            line.append_text(_NA())                          # ran clean, found nothing → red N/A
+        # A short trailing note for context (skip reason etc.), trimmed to stay on one line.
+        note = (r.note or "").strip()
+        if note and not r.skipped and r.ok and r.total == 0:
+            note = ""  # N/A already conveys it
+        if note:
+            n = note if len(note) <= 34 else note[:33] + "…"
+            line.append(f"  {n}", style=MUTED)
+        lines.append(line)
+    return Group(*lines)
+
+
+def _skip_result_text(note: str) -> "Text":
+    """Result cell for a skipped source: 'no key' (yellow) or 'skipped' (yellow) from its note."""
+    state = _classify_skip(note or "")
+    if state == "no_key":
+        return Text("no key", style="yellow")
+    if state == "not_installed":
+        return Text("not installed", style="bold orange1")
+    return Text("skipped", style="yellow")
+
+
 def emails_table(rows: list):
     """Discovered emails (+ breach data) as borderless board-idiom lines. ``None`` when empty."""
     if not rows:
@@ -1074,12 +1126,6 @@ def render_findings(rows: list, limit: int = 60) -> list:
             out.extend(_finding_lines(r))
         out.append(Text(""))
     return [Group(*out)]
-
-
-def findings_table(rows: list, limit: int = 25):
-    """Back-compat shim: return a Group of the grouped-findings renderables (or ``None``)."""
-    parts = render_findings(rows, limit=limit)
-    return Group(*parts) if parts else None
 
 
 def _row_get(row, key: str, default: str = "") -> str:

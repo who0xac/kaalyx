@@ -44,6 +44,7 @@ from ..core.stage import Stage, StageResult
 from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain
 from ..monitor.flags import flag_all
 from ..ui import osint_ui
+from ..ui import osint_report
 from . import osint_inproc
 from . import shodan_inproc
 from ..parsers import osint_parsers as P
@@ -258,8 +259,9 @@ class OsintStage(Stage):
             )
         self._write_status_file(results)
         self._write_raw_source_files(results)
+        self._write_report(results)
 
-        # Render result tables + summary panel (read back from DB so dedup/merge is reflected).
+        # Compact terminal output only (roster + flagged callout + folder path).
         self._render_results(results)
 
         failed = [r.name for r in results if not r.ok]
@@ -273,56 +275,84 @@ class OsintStage(Stage):
         }
         return self.result(ok=True, counts=counts, detail=detail)
 
+    def _flagged_items(self, results: list[SourceResult]) -> list[str]:
+        """Compute the short list of genuinely noteworthy items for the compact terminal callout.
+
+        Deliberately high-signal — only things an operator should look at first: a GitHub-org
+        that could not be confidently identified (so the secret scanners skipped), any
+        VERIFIED/live-authenticated secret, an exposed/downloadable .git, an exposed Firebase DB,
+        and any critical/high finding. NOT a dump of every finding (that lives in the report)."""
+        flagged: list[str] = []
+
+        # Org-identification integrity: the guard against a silent wrong-org scan.
+        token_consumer = any(getattr(self.ctx.config.osint, s)
+                             for s in ("trufflehog", "github_actions", "workflow_logs"))
+        if token_consumer and self.ctx.secrets.has_github:
+            org = self.ctx.get_shared("github_org")
+            reason = self.ctx.get_shared("github_org_reason") or ""
+            if not org:
+                flagged.append("GitHub org NOT confidently identified — org secret scanners "
+                               "skipped (no wrong-org scan). " + reason)
+
+        for r in results:
+            for f in r.findings:
+                sev = (getattr(f.severity, "value", None) or str(f.severity)).lower()
+                conf = (getattr(f.confidence, "value", None) or str(f.confidence)).lower()
+                if conf == "confirmed":
+                    flagged.append(f"VERIFIED secret ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
+                elif sev in ("critical", "high"):
+                    flagged.append(f"{sev.upper()} ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
+        return flagged
+
     def _render_results(self, results: list[SourceResult]) -> None:
+        """Compact terminal output ONLY: the per-source roster (name + count) and a short flagged
+        callout. NO finding-by-finding detail, NO raw dumps — all of that lives in the report
+        file written by :meth:`_persist`. The completion message is emitted by the orchestrator's
+        caller via the values returned here through StageResult."""
         ctx = self.ctx
         console = osint_ui.get_console()
 
-        email_rows = ctx.repo.list_emails(ctx.scan_id)
-        emp_rows = ctx.repo.list_employees(ctx.scan_id)
-        osint_rows = ctx.repo.list_osint(ctx.scan_id)
-        finding_rows = ctx.repo.list_findings(ctx.scan_id)
-
-        # 1) SOURCE RESULTS roster — the quick-scan summary: every source + a real hit COUNT
-        #    (green, incl. "0 hits") or skip/failed state. No false N/A on counts.
+        # 1) SOURCE RESULTS roster — every source + a real hit COUNT (green, incl. 0) or
+        #    skip/failed state. The one compact per-source view the terminal keeps.
         roster = osint_ui.source_results_table(results)
         if roster is not None:
             console.print()
             console.print(roster)
 
-        # 2) A DETAILED [◆] block for EVERY source (all 35, in pipeline order) — the specialized
-        #    rich renderers for whois/ip_info/mail_dns/social/email_harvest/theharvester, and a
-        #    generic block for the rest. Sources that found nothing still render a block saying so.
-        for renderable in osint_ui.source_detail_blocks(results, osint_rows, email_rows, emp_rows):
-            if renderable is not None:
-                console.print()
-                console.print(renderable)
-
-        # 3) Findings grouped by category (severity-tagged), in the borderless idiom.
-        for renderable in osint_ui.render_findings(finding_rows):
+        # 2) FLAGGED FOR REVIEW — only genuinely noteworthy items (org mismatch, verified
+        #    secrets, critical/high findings). Nothing prints when there is nothing to flag.
+        flagged = self._flagged_items(results)
+        callout = osint_ui.flagged_callout(flagged)
+        if callout is not None:
             console.print()
-            console.print(renderable)
+            console.print(callout)
 
-        counts = ctx.repo.scan_counts(ctx.scan_id)
-        sev_counts = {
-            sev: counts.get(f"sev_{sev}", 0)
-            for sev in ("critical", "high", "medium", "low", "info")
-        }
-        def _state(r: SourceResult) -> str:
-            if not r.ok:
-                return "failed"
-            return "skipped" if r.skipped else "done"
-
-        source_states = [(r.name, _state(r), r.total, r.note) for r in results]
+        # 3) Compact completion message — folder path + one-line tally. No detail, no dumps.
         duration = sum(r.duration_s for r in results)
-        # Verified/unverified split — for credential findings (TruffleHog live-tests each
-        # secret), 'confirmed' means the secret actually authenticated; everything else is a
-        # pattern match not yet validated. Surfaced so a big org scan's real hits stand out.
-        verified = sum(1 for r in finding_rows if (r["confidence"] or "").lower() == "confirmed")
-        verified_counts = {"verified": verified, "unverified": len(finding_rows) - verified}
+        n_findings = sum(len(r.findings) for r in results)
+        folder = str(ctx.writer.stage_dir(self.name))
         console.print()
-        console.print(osint_ui.summary_panel(
-            ctx.domain, counts, sev_counts, source_states, duration, verified_counts
+        console.print(osint_ui.completion_message(
+            ctx.domain, folder, duration, len(results), n_findings, len(flagged),
         ))
+
+    def _write_report(self, results: list[SourceResult]) -> None:
+        """Write the full, human-readable OSINT report — every source's output in a clean,
+        field-labeled layout — to ``<domain>/osint/osint_report.txt``. This is the main artifact:
+        the terminal stays compact, the full detail lives here. Never raises (a report-write
+        failure must not take down the scan)."""
+        try:
+            duration = sum(r.duration_s for r in results)
+            text = osint_report.build_osint_report(
+                self.ctx.domain, results,
+                org=self.ctx.get_shared("github_org"),
+                org_reason=self.ctx.get_shared("github_org_reason"),
+                duration_s=duration,
+                flagged=self._flagged_items(results),
+            )
+            self.ctx.writer.write_text(self.name, "osint_report.txt", text)
+        except Exception as exc:  # a report-write failure must never break the scan
+            self.log.warning("Could not build OSINT report: %s", exc)
 
     def _write_osint_files(self, records: list[OsintRecord]) -> None:
         by_kind: dict[str, list[str]] = {}

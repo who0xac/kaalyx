@@ -1340,3 +1340,39 @@ def summary_panel(
     if failed_names:
         body_parts.append(Text(f"      failed: {', '.join(failed_names)}", style="red"))
     return Group(*body_parts)
+
+
+def flagged_callout(flagged: list[str]):
+    """A short, high-signal callout for the genuinely noteworthy items (an org mismatch, verified
+    secrets, an exposed .git, …) — the only detail the compact terminal shows beyond per-source
+    counts. Each entry is a one-line string already summarizing the concern. Returns ``None`` when
+    there is nothing to flag (so the caller prints nothing)."""
+    if not flagged:
+        return None
+    lines = [_section_header("FLAGGED FOR REVIEW", f"{len(flagged)} item(s)"), Text("")]
+    for item in flagged:
+        lines.append(Text.assemble(("    ! ", "bold yellow"), (item, "white")))
+    return Group(*lines)
+
+
+def completion_message(domain: str, folder: str, duration_s: float,
+                       n_sources: int, n_findings: int, n_flagged: int):
+    """The compact end-of-stage completion block. Shows ONLY the folder where all OSINT output
+    (the full report, raw files, everything) was saved — not any individual filename — plus a
+    one-line tally. Deliberately terse: the full detail lives in the report file, not the
+    terminal."""
+    header = Text.assemble(
+        ("[◆] ", "bold orange1"), ("KAALYX::OSINT COMPLETE", "bold orange1"),
+        (f" :: {domain} · {format_duration(duration_s)}", MUTED),
+    )
+    tally = Text.assemble(
+        ("    ", ""), (f"{n_sources} sources", "green"), (" · ", MUTED),
+        (f"{n_findings} findings", "green"), (" · ", MUTED),
+        (f"{n_flagged} flagged for review", "yellow" if n_flagged else MUTED),
+    )
+    return Group(
+        header, Text(""),
+        Text("    Results saved to:", style=f"bold {ACCENT}"),
+        Text(f"    {folder}", style="white"),
+        Text(""), tally,
+    )

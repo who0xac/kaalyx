@@ -275,34 +275,46 @@ class OsintStage(Stage):
         }
         return self.result(ok=True, counts=counts, detail=detail)
 
-    def _flagged_items(self, results: list[SourceResult]) -> list[str]:
-        """Compute the short list of genuinely noteworthy items for the compact terminal callout.
+    def _flagged(self, results: list[SourceResult]) -> tuple[list[str], set[str]]:
+        """Compute the genuinely noteworthy items for the compact callout AND the set of source
+        names that carry a flag (so the board can put a ⚠ right on those rows).
 
         Deliberately high-signal — only things an operator should look at first: a GitHub-org
         that could not be confidently identified (so the secret scanners skipped), any
         VERIFIED/live-authenticated secret, an exposed/downloadable .git, an exposed Firebase DB,
         and any critical/high finding. NOT a dump of every finding (that lives in the report)."""
-        flagged: list[str] = []
+        items: list[str] = []
+        sources: set[str] = set()
 
-        # Org-identification integrity: the guard against a silent wrong-org scan.
+        # Org-identification integrity: the guard against a silent wrong-org scan. The concern is
+        # attributed to the org-scanning sources so their rows carry the ⚠ on the board.
         token_consumer = any(getattr(self.ctx.config.osint, s)
                              for s in ("trufflehog", "github_actions", "workflow_logs"))
         if token_consumer and self.ctx.secrets.has_github:
             org = self.ctx.get_shared("github_org")
             reason = self.ctx.get_shared("github_org_reason") or ""
             if not org:
-                flagged.append("GitHub org NOT confidently identified — org secret scanners "
-                               "skipped (no wrong-org scan). " + reason)
+                items.append("GitHub org NOT confidently identified — org secret scanners "
+                             "skipped (no wrong-org scan). " + reason)
+                for s in ("trufflehog", "github_actions", "workflow_logs"):
+                    if getattr(self.ctx.config.osint, s):
+                        sources.add(s)
 
         for r in results:
             for f in r.findings:
                 sev = (getattr(f.severity, "value", None) or str(f.severity)).lower()
                 conf = (getattr(f.confidence, "value", None) or str(f.confidence)).lower()
                 if conf == "confirmed":
-                    flagged.append(f"VERIFIED secret ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
+                    items.append(f"VERIFIED secret ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
+                    sources.add(r.name)
                 elif sev in ("critical", "high"):
-                    flagged.append(f"{sev.upper()} ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
-        return flagged
+                    items.append(f"{sev.upper()} ({r.name}): {f.title} · {f.target}".rstrip(" ·"))
+                    sources.add(r.name)
+        return items, sources
+
+    def _flagged_items(self, results: list[SourceResult]) -> list[str]:
+        """The flagged-item display strings (the report and callout use these)."""
+        return self._flagged(results)[0]
 
     def _render_results(self, results: list[SourceResult]) -> None:
         """Compact terminal output ONLY: the per-source roster (name + count) and a short flagged
@@ -312,16 +324,18 @@ class OsintStage(Stage):
         ctx = self.ctx
         console = osint_ui.get_console()
 
-        # 1) SOURCE RESULTS roster — every source + a real hit COUNT (green, incl. 0) or
-        #    skip/failed state. The one compact per-source view the terminal keeps.
-        roster = osint_ui.source_results_table(results)
-        if roster is not None:
+        flagged, flagged_sources = self._flagged(results)
+
+        # 1) SOURCE RESULTS board — every source grouped under a category header, with a plain
+        #    status icon (✔/✘/○, or ⚠ on a flagged row) before the name and a hit COUNT. The one
+        #    compact per-source view the terminal keeps, printed once statically after the scan.
+        board = osint_ui.grouped_source_board(results, flagged_sources)
+        if board is not None:
             console.print()
-            console.print(roster)
+            console.print(board)
 
         # 2) FLAGGED FOR REVIEW — only genuinely noteworthy items (org mismatch, verified
         #    secrets, critical/high findings). Nothing prints when there is nothing to flag.
-        flagged = self._flagged_items(results)
         callout = osint_ui.flagged_callout(flagged)
         if callout is not None:
             console.print()

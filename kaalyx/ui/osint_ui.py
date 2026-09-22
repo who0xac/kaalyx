@@ -3,13 +3,16 @@
 Provides:
 
 * :func:`print_banner` — the OSINT module ASCII banner (figlet-slant "OSINT").
-* :class:`OsintProgress` — a live, in-place panel showing every OSINT source and its state
-  (queued → running (spinner) → done/skipped/failed) as they run concurrently. Driven by
-  the ``progress`` hook from :func:`kaalyx.stages.sources.run_sources`.
+* :class:`OsintProgress` — during the scan, a single live status line (progress bar +
+  elapsed + an animated cyan braille spinner naming the running source(s)). Per-source rows
+  are NOT printed while the scan runs; they appear once at the end in the grouped board. This
+  keeps the tall board out of the height-limited Live frame. Driven by the ``progress`` hook
+  from :func:`kaalyx.stages.sources.run_sources`.
+* :func:`grouped_source_board` — the final end-of-scan board: every source grouped under a
+  category header, with a PLAIN status icon (✔ green / ✘ red / ⚠ yellow-flagged / ○ dim) before
+  the name, no bracketed markers and no [N/T] prefix.
 * result renderers (whois, emails, employees, SPF/DMARC posture, social, host/IP intel,
-  findings) — all in the borderless hacky/cybersec board idiom (bracket markers, dotted
-  leaders, UPPERCASE section headers, no boxes), a continuation of the source board's style.
-* :func:`summary_panel` — a borderless closing block printed when the stage finishes.
+  findings) — borderless board idiom, dotted leaders, UPPERCASE headers, no boxes.
 
 All rendering goes through the shared console (:func:`kaalyx.core.logging.get_console`) so
 it interleaves cleanly with logging.
@@ -472,9 +475,11 @@ class OsintProgress:
                 st.state = _classify_skip(st.note)
             else:
                 st.state = "done"
-            # Print this source's final row ONCE, now, as a static (scrolling) line.
+            # Track completion for the live progress line. Per-source rows are NOT printed during
+            # the scan any more — the full category-grouped board is printed once at the end (see
+            # grouped_source_board). During the scan the only live output is the single status
+            # line, which keeps the tall board out of the height-limited Live frame.
             self._finished += 1
-            self._print_static_row(name, st, self._finished)
         self._refresh()
 
     def _print_static_row(self, name: str, st: "_SourceState", pos: int) -> None:
@@ -682,12 +687,124 @@ def _section_header(name: str, subtitle: str = ""):
                          ((f" :: {subtitle}" if subtitle else ""), MUTED))
 
 
+# Category grouping for the end-of-scan board. Every source belongs to exactly one category;
+# the board prints these groups in this order, each under an UPPERCASE header. New sources must
+# be added to a category here (a source not listed falls into "OTHER" so it's never dropped).
+_SOURCE_CATEGORIES: list[tuple[str, list[str]]] = [
+    ("INFRASTRUCTURE & DNS",
+     ["whois", "dns", "ip_info", "mail_dns", "tls_cert", "internetdb"]),
+    ("CODE & SECRETS",
+     ["github_subdomains", "gitgraber", "trufflehog", "github_actions", "workflow_logs",
+      "badsecrets", "retirejs"]),
+    ("CLOUD & STORAGE",
+     ["cloud_enum", "s3scanner", "firebase"]),
+    ("IDENTITY & TENANT",
+     ["m365", "gitlab", "dockerhub"]),
+    ("PEOPLE & EMAIL",
+     ["email_harvest", "theharvester", "social", "breach_lookup", "leak_search"]),
+    ("APPS & PRESENCE",
+     ["mobile_apps", "affiliate_domains", "dnstwist"]),
+    ("API & THIRD-PARTY",
+     ["api_leaks", "third_party_misconfig", "exposed_git"]),
+    ("ATTACK SURFACE (SHODAN)",
+     ["shodan_org", "shodan_favicon", "shodan_vulns", "shodan_host"]),
+    ("RECON AIDS",
+     ["google_dorks"]),
+]
+
+
+def _plain_status_icon(r) -> "Text":
+    """The plain (un-bracketed) status icon for a source's final row, colored per the locked
+    scheme: ✔ green (ran ok), ✘ red (failed), ○ dim (skipped / not installed / no key). The ⚠
+    flagged marker is applied by the caller (it depends on cross-source flag state), not here."""
+    if not r.ok:
+        return Text("✘", style="bold red")
+    if r.skipped:
+        return Text("○", style="grey50")
+    return Text("✔", style="bold green")
+
+
+def grouped_source_board(results: list, flagged_sources: set[str] | None = None):
+    """The final, locked end-of-scan board: every source grouped under a category header, with a
+    PLAIN status icon (✔/✘/○, or ⚠ for a flagged row) directly before the source name — no
+    bracketed markers and no per-row [N/T] prefix. A ⚠ (yellow) overrides the normal icon for any
+    source in *flagged_sources* (e.g. an org-mismatch / data-integrity concern) so the flag is
+    visible right on its row. Sources not in any category fall into a trailing OTHER group so none
+    is ever dropped. Returns a single Group (printed statically once, after the scan)."""
+    if not results:
+        return None
+    flagged_sources = flagged_sources or set()
+    by_name = {r.name: r for r in results}
+    placed: set[str] = set()
+
+    lines: list = [_section_header("SOURCE RESULTS", f"{len(results)} sources"), Text("")]
+
+    def _emit_row(r) -> None:
+        name = _display_name(r.name, r.name)
+        flagged = r.name in flagged_sources
+        icon = Text("⚠", style="bold yellow") if flagged else _plain_status_icon(r)
+        # Name style: dim for skipped, red for failed, yellow when flagged, else white.
+        if flagged:
+            name_style = "yellow"
+        elif not r.ok:
+            name_style = "red"
+        elif r.skipped:
+            name_style = "grey50"
+        else:
+            name_style = "white"
+        line = Text("    ")
+        line.append_text(icon)
+        line.append(" ")
+        line.append(f"{name:<28}", style=name_style)
+        pad = max(1, 30 - len(name))
+        line.append(" " + "." * pad + " ", style=MUTED)
+        # Result cell: green hit COUNT (0 stays green — a valid clean result), yellow skip state,
+        # red failed.
+        if not r.ok:
+            line.append("failed", style="bold red")
+        elif r.skipped:
+            line.append(_skip_result_text(r.note))
+        else:
+            line.append(f"{r.total} hits", style="green")
+        note = (r.note or "").strip()
+        if note:
+            n = note if len(note) <= 34 else note[:33] + "…"
+            line.append(f"  {n}", style=MUTED)
+        lines.append(line)
+
+    for title, names in _SOURCE_CATEGORIES:
+        rows = [by_name[n] for n in names if n in by_name]
+        if not rows:
+            continue
+        lines.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+        for r in rows:
+            _emit_row(r)
+            placed.add(r.name)
+        lines.append(Text(""))
+
+    # Any source not assigned to a category — never drop it.
+    leftover = [r for r in results if r.name not in placed]
+    if leftover:
+        lines.append(Text("  OTHER", style=f"bold {ACCENT}"))
+        for r in leftover:
+            _emit_row(r)
+        lines.append(Text(""))
+
+    # Drop the trailing blank so the board ends cleanly.
+    while lines and isinstance(lines[-1], Text) and not lines[-1].plain:
+        lines.pop()
+    return Group(*lines)
+
+
 def source_results_table(results: list):
     """Every source's OUTCOME, in the locked board idiom — ALL sources, not just the ones that
     found something. Each source shows a status marker + its result: a green hit COUNT (0 stays
     green — a clean zero is a valid outcome), a red ``N/A`` for a source that produced no data,
     ``skipped``/``no key`` in yellow, or ``failed`` in red. A persistent post-scan roster so the
-    full set of sources is always visible after a scan, mirroring the live board."""
+    full set of sources is always visible after a scan, mirroring the live board.
+
+    Superseded on the terminal by :func:`grouped_source_board` (category-grouped, plain icons);
+    kept for any caller that still wants the flat ungrouped roster."""
     if not results:
         return None
     lines = [_section_header("SOURCE RESULTS", f"{len(results)} sources"), Text("")]

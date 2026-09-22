@@ -1032,6 +1032,7 @@ _CATEGORY_TITLES = [
     ("attack-surface", "Attack Surface (Shodan org/ASN)"),
     ("related-infra", "Related Infrastructure (favicon pivot)"),
     ("cve", "Known CVE Tags (passive)"),
+    ("company-intel", "Company Intelligence"),
     ("exposed-git", "Exposed / Downloadable .git"),
     ("typosquatting", "Typosquatting / Look-alike Domains"),
 ]

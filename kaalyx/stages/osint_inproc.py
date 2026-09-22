@@ -1036,11 +1036,32 @@ def _clean_url(u: str) -> str:
     return u.rstrip("/") if u.endswith("://") else u
 
 
+# Third-party SaaS/service host suffixes worth surfacing when a ``<company>.<suffix>`` hostname
+# shows up in code — a real external dependency (HR/ATS, support, status, etc.), the same class
+# of signal as a Postman-derived service. (host-suffix, human name.)
+_THIRD_PARTY_SERVICES = {
+    "darwinbox.in": "Darwinbox (HR/ATS)", "darwinbox.com": "Darwinbox (HR/ATS)",
+    "myshopify.com": "Shopify", "zendesk.com": "Zendesk", "freshdesk.com": "Freshdesk",
+    "atlassian.net": "Atlassian/Jira", "statuspage.io": "Statuspage",
+    "workday.com": "Workday", "greenhouse.io": "Greenhouse (ATS)",
+    "lever.co": "Lever (ATS)", "bamboohr.com": "BambooHR", "successfactors.com": "SAP SuccessFactors",
+    "service-now.com": "ServiceNow", "okta.com": "Okta", "auth0.com": "Auth0",
+    "sharepoint.com": "SharePoint", "salesforce.com": "Salesforce", "netlify.app": "Netlify",
+    "vercel.app": "Vercel", "herokuapp.com": "Heroku", "pages.dev": "Cloudflare Pages",
+    "github.io": "GitHub Pages", "gitbook.io": "GitBook", "readthedocs.io": "Read the Docs",
+}
+# A hostname token in a code snippet (broader than the target-domain regex — catches
+# third-party service hosts like polycab.darwinbox.in too).
+_HOSTNAME_RE = re.compile(
+    r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,}[a-z]{2,24})\b", re.IGNORECASE)
+
+
 @dataclass
 class GrepAppResult:
     """Everything grep.app yielded, structured so it CROSS-FEEDS other sources/stages instead of
     being a standalone finding — mirroring how Postman/Swagger data is fanned out."""
     records: list[OsintRecord] = field(default_factory=list)      # grep_app OsintRecords (display/DB)
+    findings: list[Finding] = field(default_factory=list)         # structured findings (company intel, 3rd-party svc)
     subdomains: list = field(default_factory=list)                # Subdomain objs → subdomain count/list
     urls: list[str] = field(default_factory=list)                 # API endpoints/URLs → Web stage
     owners: dict[str, list[str]] = field(default_factory=dict)    # gh owner -> repos → org discovery
@@ -1059,74 +1080,174 @@ async def search_grep_app(domain: str) -> GrepAppResult:
         strengthens discover_github_org (a keyless signal, no token needed),
       * a raw text dump for dual-output on disk.
 
-    Never raises — any HTTP/parse failure yields an empty result (the caller reports a clean
-    skip)."""
+    QUERIES: the FULL registrable domain (e.g. ``polycab.com``) — NOT the bare base label, which
+    matches unrelated things (a ``POLYCAB.NS`` stock ticker, other companies sharing the word).
+    The base label is also queried but its hits are only kept when they carry real context
+    (structured company metadata, a third-party service host), and every record is
+    CONFIDENCE-TAGGED: a snippet containing the literal domain string → ``direct`` (high); a bare
+    name match → ``keyword`` (low), same keyword-match cap used elsewhere.
+
+    STRUCTURED EXTRACTION (not just the raw line): company-metadata objects
+    (``{url:'polycab.com', hq:'Mumbai, IN', type:'...'}``) become a company-intel finding, and a
+    ``<company>.<known-SaaS>`` host (e.g. ``polycab.darwinbox.in``) becomes a third-party-service
+    finding + a subdomain. Never raises — any failure yields an empty result (caller skips)."""
     from ..data.models import Subdomain
 
     out = GrepAppResult()
     subs: dict[str, Subdomain] = {}
     urls: set[str] = set()
-    seen: set[str] = set()
-    raw_lines: list[str] = [f"# grep.app code search for {domain}"]
+    seen: set[str] = set()          # repo/path already recorded
+    seen_findings: set[tuple] = set()   # (title, reference) → dedup findings across both queries
+    base = domain.split(".")[0].lower()
+    raw_lines: list[str] = [f"# grep.app code search for {domain} (+base label '{base}')"]
+
+    async def _query(client, q: str) -> list[dict]:
+        try:
+            resp = await client.get("https://grep.app/api/search", params={"q": q})
+        except httpx.HTTPError as exc:
+            logger.debug("grep.app query %r failed: %s", q, exc)
+            return []
+        if resp.status_code != 200:
+            logger.debug("grep.app %r → HTTP %s", q, resp.status_code)
+            return []
+        try:
+            hobj = resp.json().get("hits") or {}
+        except ValueError:
+            return []
+        out.total += hobj.get("total", 0)
+        return hobj.get("hits") or []
+
     async with httpx.AsyncClient(timeout=20, follow_redirects=True,
                                  headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
-        try:
-            resp = await client.get("https://grep.app/api/search", params={"q": domain})
-        except httpx.HTTPError as exc:
-            logger.debug("grep.app search failed for %s: %s", domain, exc)
-            return out
-        if resp.status_code != 200:
-            logger.debug("grep.app returned HTTP %s for %s", resp.status_code, domain)
-            return out
-        try:
-            hits_obj = resp.json().get("hits") or {}
-            hits = hits_obj.get("hits") or []
-        except ValueError:
-            return out
-        out.total = hits_obj.get("total", len(hits))
-        for h in hits:
-            repo = h.get("repo", "")          # "owner/name"
-            path = h.get("path", "")
-            branch = h.get("branch", "")
+        # Full domain first (authoritative), then the base label (context-only).
+        hits = await _query(client, domain)
+        base_hits = await _query(client, base) if base and base != domain else []
+
+        def _process(hit: dict, from_domain_query: bool) -> None:
+            repo, path, branch = hit.get("repo", ""), hit.get("path", ""), hit.get("branch", "")
             if not repo:
-                continue
+                return
             key = f"{repo}/{path}"
-            snippet = _strip_html(((h.get("content") or {}).get("snippet") or ""))
+            snippet = _strip_html(((hit.get("content") or {}).get("snippet") or ""))
+            low = snippet.lower()
+            has_domain = domain in low
+            # RELEVANCE: literal domain in the snippet → direct/high; else a bare keyword hit.
+            # A base-label-query hit with NO domain AND no extractable context is dropped as noise
+            # (this is what removes the POLYCAB.NS stock-ticker false positives).
+            svc = _extract_third_party(low, base)
+            meta = _extract_company_meta(snippet, domain)
+            if not has_domain and not svc and not meta:
+                return  # keyword-only, no context → noise, skip
+            confidence = Confidence.FIRM if has_domain else Confidence.TENTATIVE
+            tag = "direct" if has_domain else "keyword"
             if key not in seen:
                 seen.add(key)
                 out.records.append(OsintRecord(
                     kind="grep_app", value=key,
-                    detail=(f"{branch}: {snippet}" if snippet else branch), source="grep_app"))
-                raw_lines.append(f"{key}\t{branch}\t{snippet}")
-            # (a) repo OWNER → org/username candidate for discover_github_org.
+                    detail=f"[{tag}] {branch}: {snippet}" if snippet else f"[{tag}] {branch}",
+                    source="grep_app"))
+                raw_lines.append(f"[{tag}]\t{key}\t{branch}\t{snippet}")
+            # repo OWNER → org candidate (only for domain-backed hits, to avoid noise owners).
             owner = repo.split("/", 1)[0]
-            if owner:
+            if owner and (has_domain or svc):
                 out.owners.setdefault(owner, [])
                 if repo not in out.owners[owner]:
                     out.owners[owner].append(repo)
-            # (b) subdomains of the target from the snippet → subdomain discovery.
+            # subdomains of the target → subdomain discovery.
             for m in _SUBDOMAIN_RE.findall(snippet):
                 host = m.lower().rstrip(".")
                 if host.endswith("." + domain) and host not in subs:
                     subs[host] = Subdomain(hostname=host, source="grep.app")
-            # (c) API endpoints / URLs on the target domain → Web stage.
+            # API endpoints / URLs on the target domain → Web stage.
             for u in _URL_RE.findall(snippet):
                 u = _clean_url(u)
-                hostpart = u.split("://", 1)[-1].split("/", 1)[0].lower()
-                if hostpart == domain or hostpart.endswith("." + domain):
+                hp = u.split("://", 1)[-1].split("/", 1)[0].lower()
+                if hp == domain or hp.endswith("." + domain):
                     urls.add(u)
+            # STRUCTURED: third-party service dependency (e.g. polycab.darwinbox.in).
+            if svc:
+                svc_host, svc_name = svc
+                fk = (f"3rd:{svc_host}", key)
+                if fk not in seen_findings:
+                    seen_findings.add(fk)
+                    out.findings.append(Finding(
+                        title=f"Third-party service: {svc_name}",
+                        category="third-party-misconfig", severity=Severity.INFO,
+                        confidence=confidence, target=svc_host, tool="grep_app",
+                        description=f"{domain}'s code references {svc_host} — use of {svc_name}. "
+                                    f"Found in {key}.", evidence=snippet, reference=key, raw=snippet))
+                if svc_host not in subs:   # it's a real hostname → feed subdomain/host discovery
+                    subs[svc_host] = Subdomain(hostname=svc_host, source="grep.app:3rd-party")
+            # STRUCTURED: company metadata object (hq/type/url).
+            if meta:
+                fk = ("meta", key)
+                if fk not in seen_findings:
+                    seen_findings.add(fk)
+                    out.findings.append(Finding(
+                        title=f"Company metadata: {domain}",
+                        category="company-intel", severity=Severity.INFO,
+                        confidence=Confidence.TENTATIVE, target=domain, tool="grep_app",
+                        description="; ".join(f"{k}={v}" for k, v in meta.items())
+                                    + f" (from {key})",
+                        evidence=snippet, reference=key, raw=snippet))
+
+        for h in hits:
+            _process(h, from_domain_query=True)
+        for h in base_hits:
+            _process(h, from_domain_query=False)
+
     out.subdomains = list(subs.values())
     out.urls = sorted(urls)
     if out.urls:
-        raw_lines.append("")
-        raw_lines.append("# API endpoints / URLs found:")
-        raw_lines += [f"  {u}" for u in out.urls]
+        raw_lines += ["", "# API endpoints / URLs found:"] + [f"  {u}" for u in out.urls]
+    if out.findings:
+        raw_lines += ["", "# structured findings:"] + [f"  {f.title}: {f.description}"
+                                                        for f in out.findings]
     if out.owners:
-        raw_lines.append("")
-        raw_lines.append("# GitHub owners of matching repos (org candidates):")
-        raw_lines += [f"  {o}: {', '.join(rs)}" for o, rs in out.owners.items()]
+        raw_lines += ["", "# GitHub owners of matching repos (org candidates):"] + \
+                     [f"  {o}: {', '.join(rs)}" for o, rs in out.owners.items()]
     out.raw = "\n".join(raw_lines)
     return out
+
+
+def _extract_third_party(snippet_low: str, base: str) -> tuple[str, str] | None:
+    """If the snippet contains a ``<base…>.<known-SaaS-suffix>`` host, return ``(host, name)`` —
+    a real third-party service dependency (Darwinbox, Workday, Zendesk, …)."""
+    for host in _HOSTNAME_RE.findall(snippet_low):
+        host = host.lower().rstrip(".")
+        for suffix, name in _THIRD_PARTY_SERVICES.items():
+            # host is like "polycab.darwinbox.in"; require the target's base label as the
+            # left-most sub-label so we attribute it to THIS company, not a generic tenant.
+            if host.endswith("." + suffix) and host.split(".")[0].startswith(base[:5] or base):
+                return host, name
+    return None
+
+
+def _extract_company_meta(snippet: str, domain: str) -> dict[str, str] | None:
+    """Pull structured company metadata (``hq``, ``type``, ``cc`` …) from the object literal that
+    carries the target's ``url:'<domain>'`` — e.g. a vendor/company registry file. Scoped to the
+    ``{ … }`` braces around the domain reference so fields from a NEIGHBOURING company's object
+    (the line before/after in the snippet) are never misattributed. Returns the fields present, or
+    ``None`` (also ``None`` when the domain's own object is truncated out of the snippet window —
+    better to report nothing than the wrong company's data)."""
+    low = snippet.lower()
+    pos = low.find(domain.lower())
+    if pos == -1:
+        return None
+    # Bound to the object literal containing the domain: from the last '{' before it to the
+    # first '}' after it. If either brace is missing from the window, we can't safely attribute
+    # neighbouring fields → bail (avoids the Motherson-vs-Polycab misattribution).
+    lb = snippet.rfind("{", 0, pos)
+    rb = snippet.find("}", pos)
+    if lb == -1 or rb == -1:
+        return None
+    obj = snippet[lb:rb + 1]
+    meta: dict[str, str] = {}
+    for key in ("hq", "type", "cc", "sector", "industry", "country"):
+        m = re.search(rf"\b{key}\s*:\s*['\"]([^'\"]{{1,60}})['\"]", obj, re.IGNORECASE)
+        if m:
+            meta[key] = m.group(1).strip()
+    return meta or None
 
 
 # GitLab group / namespace discovery --------------------------------------------------------

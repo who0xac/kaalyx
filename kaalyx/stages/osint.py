@@ -642,6 +642,7 @@ class OsintStage(Stage):
         self.ctx.set_shared("grep_app_result", result)
 
         res.osint = result.records
+        res.findings = result.findings              # structured company-intel / 3rd-party-svc findings
         res.subdomains = result.subdomains          # → shared subdomain count/list (Part 2)
         # API endpoints / URLs → web_urls for the Web stage (same shared structure gau/katana use).
         for u in result.urls:
@@ -651,6 +652,8 @@ class OsintStage(Stage):
             extras = []
             if result.subdomains:
                 extras.append(f"{len(result.subdomains)} subdomain(s)")
+            if result.findings:
+                extras.append(f"{len(result.findings)} finding(s)")
             if result.urls:
                 extras.append(f"{len(result.urls)} URL(s)")
             if result.owners:

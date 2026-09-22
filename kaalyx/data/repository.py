@@ -48,6 +48,45 @@ def _uncsv(value: str | None) -> list[str]:
     return [v for v in (value or "").split(",") if v]
 
 
+def _finding_location(finding: Finding) -> tuple[str, str, int | None, str]:
+    """Break a finding's location + value out of its packed ``evidence`` into discrete
+    (location, file_path, line_no, secret_value) — the queryable columns the web dashboard needs.
+
+    Secret-scan findings pack ``"repo | file:line | value"`` into ``evidence`` (a compact,
+    one-line shape). This splits it back into real fields so the dashboard can filter/sort/search
+    on them instead of parsing a text blob. Falls back to the finding's own ``target`` for the
+    location and to the whole ``evidence`` for the value when the packed shape isn't present, so
+    a non-secret finding still records a sensible location/value. The value is stored IN FULL
+    (never masked) — the same rule as the text output.
+    """
+    parts = [p.strip() for p in (finding.evidence or "").split(" | ")]
+    location, file_path, line_no, value = "", "", None, ""
+    if len(parts) >= 2:
+        value = parts[-1]
+        loc = parts[-2]
+        if len(parts) >= 3:
+            location = parts[0]
+        if loc:
+            if ":" in loc and loc.rsplit(":", 1)[1].isdigit():
+                file_path, ln = loc.rsplit(":", 1)
+                line_no = int(ln)
+            else:
+                file_path = loc
+    else:
+        value = (finding.evidence or "").strip()
+    if not location:
+        # target often carries "repo:line" or a host — take the repo/host part as the location.
+        tgt = (finding.target or "").strip()
+        if tgt:
+            if ":" in tgt and tgt.rsplit(":", 1)[1].isdigit():
+                location, tln = tgt.rsplit(":", 1)
+                if line_no is None:
+                    line_no = int(tln)
+            else:
+                location = tgt
+    return location, file_path, line_no, value
+
+
 class Repository:
     """Persistence gateway over a single SQLite connection."""
 
@@ -251,17 +290,22 @@ class Repository:
             (scan_id, finding.dedup_key),
         ).fetchone()
 
+        location, file_path, line_no, secret_value = _finding_location(finding)
+        verified = 1 if finding.confidence == Confidence.CONFIRMED else 0
+
         if row is None:
             cur = self.conn.execute(
                 """INSERT INTO findings (scan_id, dedup_key, title, category, severity,
                        confidence, target, tools, description, evidence, reference, raw,
-                       discovered_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       location, file_path, line_no, secret_value, verified, discovered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     scan_id, finding.dedup_key, finding.title, finding.category,
                     finding.severity.value, finding.confidence.value, finding.target,
                     finding.tool, finding.description, finding.evidence,
-                    finding.reference, finding.raw, finding.discovered_at,
+                    finding.reference, finding.raw,
+                    location, file_path, line_no, secret_value, verified,
+                    finding.discovered_at,
                 ),
             )
             self.conn.commit()
@@ -278,14 +322,20 @@ class Repository:
             Confidence(row["confidence"]) if row["confidence"] else Confidence.UNKNOWN,
             finding.confidence,
         )
+        best_verified = 1 if best_conf == Confidence.CONFIRMED else int(row["verified"] or 0)
         self.conn.execute(
-            """UPDATE findings SET tools = ?, severity = ?, confidence = ?,
+            """UPDATE findings SET tools = ?, severity = ?, confidence = ?, verified = ?,
                    evidence = CASE WHEN evidence = '' THEN ? ELSE evidence END,
-                   reference = CASE WHEN reference = '' THEN ? ELSE reference END
+                   reference = CASE WHEN reference = '' THEN ? ELSE reference END,
+                   location = CASE WHEN location = '' THEN ? ELSE location END,
+                   file_path = CASE WHEN file_path = '' THEN ? ELSE file_path END,
+                   line_no = COALESCE(line_no, ?),
+                   secret_value = CASE WHEN secret_value = '' THEN ? ELSE secret_value END
                WHERE id = ?""",
             (
-                _csv(sorted(tools)), best_sev.value, best_conf.value,
-                finding.evidence, finding.reference, row["id"],
+                _csv(sorted(tools)), best_sev.value, best_conf.value, best_verified,
+                finding.evidence, finding.reference,
+                location, file_path, line_no, secret_value, row["id"],
             ),
         )
         self.conn.commit()

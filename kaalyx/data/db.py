@@ -19,7 +19,7 @@ from ..core.logging import get_logger
 
 logger = get_logger("db")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -111,6 +111,14 @@ CREATE TABLE IF NOT EXISTS findings (
     evidence       TEXT    NOT NULL DEFAULT '',
     reference      TEXT    NOT NULL DEFAULT '',
     raw            TEXT    NOT NULL DEFAULT '',
+    -- Discrete, queryable location/value columns for the web dashboard (Part 6). Secret-scan
+    -- findings pack "repo | file:line | value" into evidence; these break that out so the
+    -- dashboard can filter/sort/search on real fields instead of parsing a text blob.
+    location       TEXT    NOT NULL DEFAULT '',         -- repo / owner / host the finding is in
+    file_path      TEXT    NOT NULL DEFAULT '',         -- file within the repo (secrets)
+    line_no        INTEGER,                             -- line within the file (NULL if n/a)
+    secret_value   TEXT    NOT NULL DEFAULT '',         -- the full, unmasked detected value
+    verified       INTEGER NOT NULL DEFAULT 0,          -- 1 if the secret live-authenticated
     alerted        INTEGER NOT NULL DEFAULT 0,         -- Telegram alert sent?
     discovered_at  TEXT    NOT NULL,
     UNIQUE(scan_id, dedup_key)
@@ -187,10 +195,39 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     else:
         existing = int(row["value"])
         if existing != SCHEMA_VERSION:
-            # Migration hook: only v1 exists today, so nothing to do yet.
-            logger.warning(
-                "DB schema v%d differs from code v%d — migrations not yet implemented",
-                existing,
-                SCHEMA_VERSION,
+            _migrate(conn, existing)
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION),),
             )
+    # Indexes that reference a migration-added column live here (not in _SCHEMA's executescript)
+    # so a pre-migration table without that column doesn't error out before _migrate runs. Safe
+    # for both a fresh DB (column present from _SCHEMA) and a migrated one.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_findings_verified ON findings(scan_id, verified)")
     conn.commit()
+
+
+def _finding_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r["name"] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
+
+
+def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+    """Apply additive, non-destructive migrations to an existing DB (a per-domain re-scan opens
+    the same file). Only ADD COLUMN so no data is ever lost. Idempotent — each column is added
+    only if absent, so a partially-migrated DB is safe to re-open."""
+    # v3: discrete queryable location/value columns on findings for the web dashboard.
+    existing_cols = _finding_columns(conn)
+    additive = [
+        ("location", "TEXT NOT NULL DEFAULT ''"),
+        ("file_path", "TEXT NOT NULL DEFAULT ''"),
+        ("line_no", "INTEGER"),
+        ("secret_value", "TEXT NOT NULL DEFAULT ''"),
+        ("verified", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for col, decl in additive:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE findings ADD COLUMN {col} {decl}")
+    # The idx_findings_verified index is (re)created by _init_schema after this returns, once the
+    # column is guaranteed present.
+    logger.info("Migrated DB schema v%d → v%d (added finding location/value columns)",
+                from_version, SCHEMA_VERSION)

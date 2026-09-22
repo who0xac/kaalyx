@@ -215,6 +215,11 @@ class OsintStage(Stage):
     # -- persistence + rendering -------------------------------------------------------
 
     def _persist(self, results: list[SourceResult]) -> StageResult:
+        # Structured records + per-source raw/formatted files are ALREADY written per source as
+        # each one finishes (the concurrent finish hook → _flush_source). This final pass writes
+        # the AGGREGATE text artifacts (subdomains.txt, emails.txt, the cross-source report) and
+        # re-affirms every source's DB rows/files as an idempotent safety net (upserts + dedup
+        # merge make the repeat writes harmless), then renders the compact terminal output.
         ctx = self.ctx
         keywords = ctx.config.flagging.interesting_keywords
 
@@ -404,24 +409,66 @@ class OsintStage(Stage):
                          + (f"\t{f.evidence}" if f.evidence else ""))
         return "\n".join(parts)
 
+    def _persist_source_records(self, r: SourceResult) -> None:
+        """Write ONE source's structured records to SQLite immediately. Every record type goes to
+        its own table with real columns (findings → title/severity/verified/location/file/line/
+        value, osint → kind/value/detail/source, emails, employees, subdomains, urls) so the web
+        dashboard (Part 6) can query/filter/search rather than parse text. Idempotent: the tables
+        upsert by their UNIQUE keys and findings merge by dedup_key, so the final batch pass over
+        all results simply re-affirms the same rows. Never raises."""
+        ctx = self.ctx
+        try:
+            if r.subdomains:
+                flag_all(r.subdomains, ctx.config.flagging.interesting_keywords)
+                ctx.repo.bulk_upsert_subdomains(ctx.scan_id, r.subdomains)
+            if r.urls:
+                ctx.repo.bulk_upsert_urls(ctx.scan_id, r.urls)
+            if r.osint:
+                ctx.repo.bulk_insert_osint(ctx.scan_id, r.osint)
+            if r.emails:
+                ctx.repo.bulk_upsert_emails(ctx.scan_id, r.emails)
+            if r.employees:
+                ctx.repo.bulk_upsert_employees(ctx.scan_id, r.employees)
+            for finding in r.findings:
+                ctx.repo.upsert_finding(ctx.scan_id, finding)
+        except Exception as exc:  # noqa: BLE001 — a DB write must never break the live scan
+            self.log.debug("per-source DB persist failed for %s: %s", r.name, exc)
+
     def _flush_source(self, r: SourceResult) -> None:
-        """Persist ONE source's raw file the moment it finishes, so completed sources' data is on
-        disk immediately — durable if a later source crashes/interrupts the scan, and inspectable
-        while the rest still run. Idempotent: called per-source on the finish hook, and the raw
-        pass at the end simply rewrites the same files. Never raises (a write error must not take
-        down the live scan)."""
+        """Persist ONE source COMPLETELY the moment it finishes — its raw file, its readable
+        ``.formatted.txt``, AND its structured SQLite records — so a completed source's data is
+        fully on disk and queryable while the OTHER sources are still running (this fires from the
+        concurrent finish hook, per source, not in a batch at the end). Clean separation of
+        artifacts:
+          * raw, unchanged tool stdout  → ``osint/tool_output/<source>.<ext>``
+          * readable field-labeled text → ``osint/<source>.formatted.txt``
+          * structured records          → SQLite tables (queryable columns)
+        Idempotent and never raises (a write error must not take down the live scan)."""
+        # 1) raw stdout / record dump → tool_output/ (raw data only).
         try:
             content = r.raw if r.raw else self._dump_source(r)
             header = r.note if (not content and r.note) else ""
             self.ctx.writer.raw_source_output(self.name, r.name, content, r.raw_ext, header)
-        except Exception as exc:  # noqa: BLE001 — a raw-file write must never break the scan
-            self.log.debug("per-source flush failed for %s: %s", r.name, exc)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("per-source raw flush failed for %s: %s", r.name, exc)
+        # 2) readable formatted section → osint/<source>.formatted.txt (alongside the report).
+        try:
+            text = osint_report.render_single_source(
+                self.ctx.domain, r,
+                org=self.ctx.get_shared("github_org"),
+                org_reason=self.ctx.get_shared("github_org_reason"),
+            )
+            self.ctx.writer.write_text(self.name, f"{r.name}.formatted.txt", text)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("per-source formatted write failed for %s: %s", r.name, exc)
+        # 3) structured records → SQLite (queryable columns) — immediately, per source.
+        self._persist_source_records(r)
 
     def _write_raw_source_files(self, results: list[SourceResult]) -> None:
-        """Write ONE dedicated raw file per source, ALWAYS — even when a source was skipped or
-        found nothing (an empty file records that it ran). Sources are already flushed
-        individually as they finish (:meth:`_flush_source`); this final pass guarantees every
-        source has its file even if a finish hook was missed."""
+        """Final safety-net pass: re-flush every source (raw + formatted + DB) so every source has
+        its artifacts even if a finish hook was missed, and post-steps whose result is finalized
+        after the fan-out (breach_lookup, leak_search) are captured. Sources are already flushed
+        individually as they finish (:meth:`_flush_source`); this is idempotent."""
         for r in results:
             self._flush_source(r)
 

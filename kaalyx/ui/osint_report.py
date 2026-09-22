@@ -513,6 +513,63 @@ def _warning_for(r: SourceResult, org_note: str | None) -> str | None:
     return None
 
 
+def _org_note(org: str | None, org_reason: str | None) -> str:
+    """The one-line org note the secret-scanning sections warn with — either which org WAS scanned
+    or, when none was confident, that those scanners were skipped (the data-integrity guard)."""
+    if org:
+        return f"GitHub org scanned: {org}" + (f" ({org_reason})" if org_reason else "")
+    return ("No GitHub org was confidently identified — the org secret scanners "
+            "(TruffleHog / gato / workflow logs) were SKIPPED rather than risk scanning an "
+            "unrelated account" + (f". {org_reason}" if org_reason else "."))
+
+
+def render_source_section(r: SourceResult, org_note: str = "", *, header: bool = True) -> list[str]:
+    """Render ONE source's field-labeled section as a list of text lines — the shared unit used
+    by both the cross-source report and each per-source ``<source>.formatted.txt`` file. Includes
+    the ``=== HEADER ===`` (unless *header* is False), any data-integrity warning callout, then the
+    source's data via its registered renderer (or the generic fallback), or a status line when it
+    skipped / failed / found nothing. Never raises — a renderer error degrades to the generic
+    layout so one bad source can't break output."""
+    lines: list[str] = []
+    if header:
+        display = _DISPLAY_NAMES.get(r.name, r.name.upper())
+        desc = _SOURCE_DESC.get(r.name, "")
+        lines += _section_header(display, desc)
+        lines.append("")
+
+    warn = _warning_for(r, org_note)
+    if warn:
+        lines.append(f"{_INDENT}!! {warn}")
+        lines.append("")
+
+    status = _status_line(r)
+    if status is not None:
+        lines.append(status)
+    else:
+        renderer = _RENDERERS.get(r.name, _render_generic)
+        try:
+            body = renderer(r)
+        except Exception as exc:  # a renderer must never break output
+            body = _render_generic(r) + [_field("(render note)", f"{type(exc).__name__}: {exc}")]
+        lines += body
+    if r.note and status is None:
+        lines.append("")
+        lines.append(_field("Note", r.note))
+    return lines
+
+
+def render_single_source(domain: str, r: SourceResult, *, org: str | None = None,
+                         org_reason: str | None = None) -> str:
+    """The full text of one source's ``<source>.formatted.txt`` file — the same field-labeled
+    section that appears in the cross-source report, as a standalone document with a short title.
+    Written the moment the source finishes (per-source flush), so a completed source's readable
+    output is on disk while others still run."""
+    title = _DISPLAY_NAMES.get(r.name, r.name.upper())
+    lines = [f"# {title} — {domain}", ""]
+    lines += render_source_section(r, _org_note(org, org_reason))
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def build_osint_report(
     domain: str,
     results: list[SourceResult],
@@ -537,13 +594,7 @@ def build_osint_report(
     failed = sum(1 for r in results if not r.ok)
 
     # The org note the secret-scanning sections warn with.
-    if org:
-        org_note = f"GitHub org scanned: {org}" + (f" ({org_reason})" if org_reason else "")
-    else:
-        org_note = ("No GitHub org was confidently identified — the org secret scanners "
-                    "(TruffleHog / gato / workflow logs) were SKIPPED rather than risk scanning an "
-                    "unrelated account"
-                    + (f". {org_reason}" if org_reason else "."))
+    org_note = _org_note(org, org_reason)
 
     lines: list[str] = []
     lines.append("#" * 78)
@@ -558,29 +609,7 @@ def build_osint_report(
     lines.append("")
 
     for r in results:
-        display = _DISPLAY_NAMES.get(r.name, r.name.upper())
-        desc = _SOURCE_DESC.get(r.name, "")
-        lines += _section_header(display, desc)
-        lines.append("")
-
-        warn = _warning_for(r, org_note)
-        if warn:
-            lines.append(f"{_INDENT}!! {warn}")
-            lines.append("")
-
-        status = _status_line(r)
-        if status is not None:
-            lines.append(status)
-        else:
-            renderer = _RENDERERS.get(r.name, _render_generic)
-            try:
-                body = renderer(r)
-            except Exception as exc:  # a renderer must never break report generation
-                body = _render_generic(r) + [_field("(render note)", f"{type(exc).__name__}: {exc}")]
-            lines += body
-        if r.note and status is None:
-            lines.append("")
-            lines.append(_field("Note", r.note))
+        lines += render_source_section(r, org_note)
         lines.append("")
         lines.append("")
 

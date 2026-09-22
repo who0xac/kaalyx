@@ -36,6 +36,8 @@ Credential/leak coverage (post-harvest chaining):
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 
 from ..core.stage import Stage, StageResult
@@ -60,6 +62,7 @@ SOURCE_LABELS: dict[str, str] = {
     "leak_search": "Leak search (creds)",
     "github_subdomains": "GitHub subdomains",
     "grep_app": "grep.app code search",
+    "gitgraber": "gitGraber (secret regexes)",
     "trufflehog": "TruffleHog (org)",
     "cloud_enum": "Cloud enum",
     "s3scanner": "S3 scanner",
@@ -113,6 +116,7 @@ class OsintStage(Stage):
             "social": (osint_cfg.social, self._src_social),
             "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
             "grep_app": (osint_cfg.grep_app, self._src_grep_app),
+            "gitgraber": (osint_cfg.gitgraber, self._src_gitgraber),
             "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
             "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
             "s3scanner": (osint_cfg.s3scanner, self._src_s3scanner),
@@ -660,6 +664,57 @@ class OsintStage(Stage):
                 " → " + ", ".join(extras) if extras else "")
         else:
             res.note = "no public code mentions the domain (grep.app)"
+        return res
+
+    async def _src_gitgraber(self) -> SourceResult:
+        """gitGraber — service-specific secret-pattern scan of public GitHub code (needs a
+        GITHUB_TOKEN). Complementary to trufflehog (org repos) and grep.app/github_subdomains
+        (generic keyword search): gitGraber uses curated per-service regexes (AWS/Stripe/Twilio/
+        Mailgun/PayPal/Heroku/…). It reads tokens from its own config.py, so we GENERATE that
+        file at scan time from our rotated GITHUB_TOKEN (never argv, never committed)."""
+        import shutil
+        res = SourceResult(name="gitgraber", raw_ext="txt")
+        if not self.ctx.secrets.has_github:
+            res.skipped, res.note = True, "skipped: GITHUB_TOKEN not set"
+            res.raw = "# skipped: GITHUB_TOKEN not set"
+            return res
+        # Locate the cloned gitGraber (install.sh clones to ~/src/gitGraber).
+        gg_dir = Path.home() / "src" / "gitGraber"
+        gg_py = gg_dir / "gitGraber.py"
+        keywords = gg_dir / "wordlists" / "keywords.txt"
+        venv_py = gg_dir / ".venv" / "bin" / "python"
+        python_bin = str(venv_py) if venv_py.exists() else "python3"
+        if not gg_py.exists():
+            res.skipped, res.note = True, "skipped: gitGraber not installed (run: kaalyx tools --install)"
+            res.raw = "# skipped: gitGraber not installed"
+            return res
+        # Generate config.py with our token(s). gitGraber does `from config import GITHUB_TOKENS`
+        # plus optional Slack/Discord/Telegram vars — provide safe empty defaults so importing it
+        # never errors and no notifier fires. Written fresh each run; never committed.
+        tokens = self.ctx.secrets.github_tokens or []
+        try:
+            (gg_dir / "config.py").write_text(
+                "GITHUB_TOKENS = " + repr(tokens) + "\n"
+                "SLACK_WEBHOOKURL = ''\n"
+                "DISCORD_WEBHOOKURL = ''\n"
+                "TELEGRAM_CONFIG = {'token': '', 'chat_id': 0}\n",
+                encoding="utf-8")
+        except OSError as exc:
+            res.skipped, res.note = True, f"skipped: could not write gitGraber config ({exc})"
+            res.raw = f"# skipped: {exc}"
+            return res
+        # Run from gitGraber's own dir (it reads config.py / wordlists / writes rawGitUrls.txt
+        # relative to cwd). Query the full registrable domain. No -s/-d/-tg → no notifiers.
+        cmd = [python_bin, str(gg_py), "-k", str(keywords), "-q", self.ctx.target.registrable]
+        out = await self.ctx.runner.run(cmd, cwd=str(gg_dir), timeout=900, label="gitGraber")
+        if not out.started:
+            res.skipped, res.note = True, "skipped: gitGraber not runnable"
+            res.raw = "# skipped: gitGraber not runnable"
+            return res
+        res.raw = out.stdout
+        res.findings = P.parse_gitgraber(out.stdout)
+        res.note = (f"{len(res.findings)} possible secret(s)" if res.findings
+                    else "no secrets matched in public code")
         return res
 
     async def _discover_github_org(self) -> None:

@@ -74,6 +74,7 @@ osint:
   leak_search: true            # LeakSearch — actual leaked creds from ProxyNova/COMB dump
   github_subdomains: true
   grep_app: true                # grep.app public-code search for the domain (keyless)
+  gitgraber: true               # gitGraber — service-specific secret regexes (needs GITHUB_TOKEN)
   trufflehog: true             # GitHub org secret scan (needs GITHUB_TOKEN)
   cloud_enum: true
   s3scanner: true

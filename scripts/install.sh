@@ -310,7 +310,7 @@ parse_args "$@"
 OSINT_TOOLS=(
     whois dnsx github-subdomains trufflehog cloud_enum s3scanner badsecrets
     retire theHarvester misconfig-mapper h8mail porch-pirate swaggerspy gato
-    git-dumper msftrecon spoofy dnstwist
+    git-dumper msftrecon spoofy dnstwist gitgraber
 )
 # Part 2 — Subdomains.
 SUBDOMAIN_TOOLS=(
@@ -1071,6 +1071,33 @@ install_porch_pirate() { pipx_install porch-pirate porch-pirate; }
 # console entry point, so pipx (isolated, on PATH) matches our other Python CLI tools.
 install_dnstwist()    { pipx_install dnstwist dnstwist; }
 
+# S3Scanner (sa7mon): prefer the distro apt package (simpler, no Go toolchain needed) and fall
+# back to `go install` only if apt doesn't provide it. Kali ships `s3scanner`, and it's the same
+# tool with the same `-bucket <name>` flag we already invoke, so the apt build is a drop-in. The
+# runnable check (does `s3scanner --help` work) decides success either way.
+install_s3scanner() {
+    if command -v s3scanner >/dev/null 2>&1; then
+        info "s3scanner already installed."
+        return
+    fi
+    if [[ "${PKG}" == "apt" ]] && ${SUDO} apt-get install -y s3scanner 2>/dev/null \
+            && command -v s3scanner >/dev/null 2>&1; then
+        log "s3scanner installed from apt."
+        return
+    fi
+    # Fallback: build from source with Go (the previous method).
+    log "apt s3scanner unavailable; building from source via go install…"
+    go_install s3scanner github.com/sa7mon/s3scanner
+}
+
+# gitGraber (hisxo): git clone + venv. Service-specific secret-pattern scanner (AWS/Stripe/
+# Twilio/Mailgun/… regexes) — complementary to trufflehog. Ships wordlists/keywords.txt. Needs
+# a config.py with GITHUB_TOKENS; Kaalyx GENERATES that at scan time from GITHUB_TOKEN (never
+# committed), so install just needs the code + deps runnable.
+install_gitgraber() {
+    git_venv_tool gitGraber https://github.com/hisxo/gitGraber.git gitGraber.py req
+}
+
 # LeakSearch (JoelGMSec): git clone + venv + wrapper. Kaalyx invokes it as `LeakSearch`
 # (capital L — matches the entry script name), querying the keyless ProxyNova/COMB dump.
 install_leaksearch() {
@@ -1269,7 +1296,6 @@ MANIFEST=(
   "subdomains|go|alterx|go_install alterx github.com/projectdiscovery/alterx/cmd/alterx"
   "subdomains,osint|go|github-subdomains|go_install github-subdomains github.com/gwen001/github-subdomains"
   "osint|go|misconfig-mapper|go_install misconfig-mapper github.com/intigriti/misconfig-mapper/cmd/misconfig-mapper"
-  "osint|go|s3scanner|go_install s3scanner github.com/sa7mon/s3scanner"
   "hosts|go|naabu|go_install naabu github.com/projectdiscovery/naabu/v2/cmd/naabu"
   "hosts|go|httpx|go_install httpx github.com/projectdiscovery/httpx/cmd/httpx"
   "web|go|gowitness|go_install gowitness github.com/sensepost/gowitness"
@@ -1300,6 +1326,8 @@ MANIFEST=(
   "osint|repo|trufflehog|install_trufflehog"
   "osint,web|repo|trufflehog|install_trufflehog"
   "osint|repo|cloud_enum|install_cloud_enum"
+  "osint|repo|s3scanner|install_s3scanner"
+  "osint|repo|gitgraber|install_gitgraber"
   "osint|repo|LeakSearch|install_leaksearch"
   "osint|repo|swaggerspy|install_swaggerspy"
   "osint|repo|gato|install_gato"

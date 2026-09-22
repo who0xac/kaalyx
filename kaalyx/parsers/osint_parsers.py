@@ -320,6 +320,53 @@ def _trufflehog_location(meta: dict) -> tuple[str, str, str]:
     return (repo or link, file, line)
 
 
+def parse_gitgraber(stdout: str, source: str = "gitgraber") -> list[Finding]:
+    """Parse gitGraber stdout into secret findings.
+
+    gitGraber prints a block per hit::
+
+        [!] POSSIBLE <TYPE> TOKEN FOUND (keyword used:<query>)
+        [+] Commit <hash> : <date> by <author>
+        [+] RAW URL : <raw_git_url>
+        [+] Token : <token_value>
+        [+] Repository URL : <repo_url>
+
+    Each block → one ``secret`` finding. gitGraber uses service-specific regexes (AWS/Stripe/
+    Twilio/Mailgun/…), so a hit is a strong, service-typed signal — but it's a public-code
+    pattern match, not a live-validated credential, so confidence is TENTATIVE (unverified) and
+    severity MEDIUM (HIGH-severity providers like AWS/private-key aren't auto-escalated here;
+    the operator verifies). The FULL token value is kept (no masking, per project rule)."""
+    findings: list[Finding] = []
+    blocks = re.split(r"(?=\[!\]\s*POSSIBLE\b)", stdout)
+    high_types = {"aws", "private", "rsa", "gcp", "google", "azure"}
+    for block in blocks:
+        m = re.search(r"\[!\]\s*POSSIBLE\s+(.+?)\s+TOKEN FOUND", block, re.IGNORECASE)
+        if not m:
+            continue
+        ttype = m.group(1).strip()
+        token = _grab(block, r"\[\+\]\s*Token\s*:\s*(.+)")
+        raw_url = _grab(block, r"\[\+\]\s*RAW URL\s*:\s*(\S+)")
+        repo_url = _grab(block, r"\[\+\]\s*Repository URL\s*:\s*(\S+)")
+        if not token:
+            continue
+        sev = Severity.HIGH if any(w in ttype.lower() for w in high_types) else Severity.MEDIUM
+        findings.append(Finding(
+            title=f"gitGraber: possible {ttype} token",
+            category="secret", severity=sev, confidence=Confidence.TENTATIVE,
+            target=repo_url or raw_url or "", tool=source,
+            description=f"gitGraber matched a {ttype} token pattern in public GitHub code. "
+                        "Service-specific regex match — verify against the provider before use.",
+            evidence=f"{ttype}: {token}",     # full value, per the no-mask rule
+            reference=raw_url or repo_url, raw=block.strip()[:500]))
+    return findings
+
+
+def _grab(text: str, pattern: str) -> str:
+    """First regex group in *text* (stripped), or ''."""
+    m = re.search(pattern, text)
+    return m.group(1).strip() if m else ""
+
+
 def parse_trufflehog(
     stdout: str, source: str = "trufflehog", restrict_owner: str | None = None
 ) -> list[Finding]:

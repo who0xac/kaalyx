@@ -1769,13 +1769,15 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
     Strategy (thorough by design — we would rather spend a few extra API calls than settle
     for scanning the wrong account):
 
-    1. **Code search for the domain.** Owners of repos whose code mentions the target domain
-       are strong candidates ("high" when the owner is an organization). This is the correct,
-       evidence-backed signal the bug report pointed at.
+    1. **Code search for the domain.** Owners of repos whose code mentions the target domain are
+       candidates, but a code mention ALONE is a weak signal (an unrelated org can ship a file
+       that references the domain — e.g. a site extractor named after it), so such an owner is
+       "high" ONLY when its login name-matches the company slug, otherwise "low". Being an
+       organization does NOT raise confidence on its own.
     2. **Org search by company slug.** ``GET /search/users?q=<slug>+type:org`` finds orgs
-       whose name/login matches the company; a slug that *also* appears in (1) is "high",
-       otherwise "medium" (a plain name match — real but weaker).
-    3. **Exact-login probe.** If an org literally named after the slug exists, include it.
+       whose name/login matches the company; a slug that *also* appears in (1) is "high" (two
+       independent signals agree), an exact login==slug is "high", a fuzzy name hit is "low".
+    3. **Exact-login probe.** If an org literally named after the slug exists, include it ("high").
 
     Every candidate is verified against the GitHub API, which needs a token — so without one
     there is no evidence-backed signal and ``[]`` is returned rather than an unverified guess.
@@ -1793,18 +1795,29 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
     async with httpx.AsyncClient(timeout=20, headers=_github_headers(token), follow_redirects=True) as client:
         token_owner = await _authenticated_login(client)
 
-        # (1) code-search owners mentioning the domain
+        # (1) code-search owners mentioning the domain.
+        # CRITICAL: "owns a repo whose code mentions the domain" is BY ITSELF a WEAK signal — a
+        # completely unrelated org can mention a domain in code (e.g. yt-dlp ships an extractor
+        # file named lecturio.py that contains "lecturio.com"; that does NOT make yt-dlp
+        # Lecturio's GitHub org). So this signal alone is NEVER high. High requires the owner's
+        # LOGIN to name-match the target company slug (real corroboration that this account is the
+        # company), or a second independent signal — the org-name search in step (2) upgrades a
+        # code-search owner to high only when both agree. Being an organization (kind == "org")
+        # is NOT corroboration and must not raise confidence on its own. This is the guard against
+        # scanning an unrelated org's secrets under the target's report.
         domain_owners = await _owners_mentioning_domain(client, target.registrable, token_owner)
         for login, repos in domain_owners.items():
             kind = await _verify_account(client, login)
             if kind is None:
                 continue
             name_match = any(s in login.lower() for s in slugs)
-            conf = "high" if (kind == "org" or name_match) else "medium"
+            conf = "high" if name_match else "low"
             candidates[login.lower()] = GithubOrgCandidate(
                 login=login, kind=kind, confidence=conf,
                 reason=("owns repo(s) whose code mentions "
-                        f"{target.registrable}" + (" and name matches target" if name_match else "")),
+                        f"{target.registrable}"
+                        + (" and login name-matches target" if name_match
+                           else " (weak: code mention only, name does not match)")),
                 evidence=repos[:5],
             )
 

@@ -1003,253 +1003,6 @@ async def extract_tls_cert(domain: str) -> tuple[list[OsintRecord], list[str]]:
     return records, sorted(set(sans))
 
 
-# grep.app public code search --------------------------------------------------------------
-# grep.app indexes a large set of public GitHub repos and exposes a keyless JSON search API its
-# own frontend uses: GET https://grep.app/api/search?q=<query> → {"hits":{"total":N,"hits":[
-#   {"repo","path","branch","content":{"snippet": <HTML>}}]}}. A fast, complementary index to
-# GitHub's own rate-limited code-search API (same purpose as github_subdomains, different source).
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_SUBDOMAIN_RE = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61})\b",
-                           re.IGNORECASE)
-
-
-def _strip_html(s: str) -> str:
-    """Turn a grep.app HTML snippet into a plain one-line code excerpt."""
-    import html as _html
-    text = _HTML_TAG_RE.sub("", s or "")
-    text = _html.unescape(text)
-    return " ".join(text.split())[:160]
-
-
-# A URL/endpoint in a code snippet. The path stops at the first char unlikely to be part of a
-# real URL in code — quotes, brackets, backticks, whitespace — so we don't swallow trailing code
-# artifacts (a line number, a closing quote, ``vault:`` on the next token).
-_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-]+(?:/[A-Za-z0-9._~/?#@!$&*+,;=%\-]*)?")
-
-
-def _clean_url(u: str) -> str:
-    """Trim trailing punctuation a code snippet commonly appends to a URL (``)``, ``'``, ``,``,
-    a stray digit run from a line number, etc.)."""
-    u = u.rstrip("'\").,;:>]}`")
-    # Drop a trailing all-digits run glued on with no separator (a snippet line number).
-    u = re.sub(r"(?<=[/A-Za-z])\d{1,4}$", "", u)
-    return u.rstrip("/") if u.endswith("://") else u
-
-
-# Third-party SaaS/service host suffixes worth surfacing when a ``<company>.<suffix>`` hostname
-# shows up in code — a real external dependency (HR/ATS, support, status, etc.), the same class
-# of signal as a Postman-derived service. (host-suffix, human name.)
-_THIRD_PARTY_SERVICES = {
-    "darwinbox.in": "Darwinbox (HR/ATS)", "darwinbox.com": "Darwinbox (HR/ATS)",
-    "myshopify.com": "Shopify", "zendesk.com": "Zendesk", "freshdesk.com": "Freshdesk",
-    "atlassian.net": "Atlassian/Jira", "statuspage.io": "Statuspage",
-    "workday.com": "Workday", "greenhouse.io": "Greenhouse (ATS)",
-    "lever.co": "Lever (ATS)", "bamboohr.com": "BambooHR", "successfactors.com": "SAP SuccessFactors",
-    "service-now.com": "ServiceNow", "okta.com": "Okta", "auth0.com": "Auth0",
-    "sharepoint.com": "SharePoint", "salesforce.com": "Salesforce", "netlify.app": "Netlify",
-    "vercel.app": "Vercel", "herokuapp.com": "Heroku", "pages.dev": "Cloudflare Pages",
-    "github.io": "GitHub Pages", "gitbook.io": "GitBook", "readthedocs.io": "Read the Docs",
-}
-# A hostname token in a code snippet (broader than the target-domain regex — catches
-# third-party service hosts like polycab.darwinbox.in too).
-_HOSTNAME_RE = re.compile(
-    r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,}[a-z]{2,24})\b", re.IGNORECASE)
-
-
-@dataclass
-class GrepAppResult:
-    """Everything grep.app yielded, structured so it CROSS-FEEDS other sources/stages instead of
-    being a standalone finding — mirroring how Postman/Swagger data is fanned out."""
-    records: list[OsintRecord] = field(default_factory=list)      # grep_app OsintRecords (display/DB)
-    findings: list[Finding] = field(default_factory=list)         # structured findings (company intel, 3rd-party svc)
-    subdomains: list = field(default_factory=list)                # Subdomain objs → subdomain count/list
-    urls: list[str] = field(default_factory=list)                 # API endpoints/URLs → Web stage
-    owners: dict[str, list[str]] = field(default_factory=dict)    # gh owner -> repos → org discovery
-    raw: str = ""                                                 # raw text dump → dual-output file
-    total: int = 0                                                # total hits grep.app reported
-
-
-async def search_grep_app(domain: str) -> GrepAppResult:
-    """Search grep.app's public-code index for *domain* (keyless JSON API) and extract everything
-    reusable, the same way we fan out Postman/Swagger data:
-
-      * a ``grep_app`` OsintRecord per matching repo/path (repo · file · branch · code excerpt),
-      * SUBDOMAINS of the target found in the snippets → fed to subdomain discovery,
-      * API endpoints / URLs on the target's domain → carried for the Web stage,
-      * the GitHub OWNER of each matching repo (owner/repo) → an org/username candidate that
-        strengthens discover_github_org (a keyless signal, no token needed),
-      * a raw text dump for dual-output on disk.
-
-    QUERIES: the FULL registrable domain (e.g. ``polycab.com``) — NOT the bare base label, which
-    matches unrelated things (a ``POLYCAB.NS`` stock ticker, other companies sharing the word).
-    The base label is also queried but its hits are only kept when they carry real context
-    (structured company metadata, a third-party service host), and every record is
-    CONFIDENCE-TAGGED: a snippet containing the literal domain string → ``direct`` (high); a bare
-    name match → ``keyword`` (low), same keyword-match cap used elsewhere.
-
-    STRUCTURED EXTRACTION (not just the raw line): company-metadata objects
-    (``{url:'polycab.com', hq:'Mumbai, IN', type:'...'}``) become a company-intel finding, and a
-    ``<company>.<known-SaaS>`` host (e.g. ``polycab.darwinbox.in``) becomes a third-party-service
-    finding + a subdomain. Never raises — any failure yields an empty result (caller skips)."""
-    from ..data.models import Subdomain
-
-    out = GrepAppResult()
-    subs: dict[str, Subdomain] = {}
-    urls: set[str] = set()
-    seen: set[str] = set()          # repo/path already recorded
-    seen_findings: set[tuple] = set()   # (title, reference) → dedup findings across both queries
-    base = domain.split(".")[0].lower()
-    raw_lines: list[str] = [f"# grep.app code search for {domain} (+base label '{base}')"]
-
-    async def _query(client, q: str) -> list[dict]:
-        try:
-            resp = await client.get("https://grep.app/api/search", params={"q": q})
-        except httpx.HTTPError as exc:
-            logger.debug("grep.app query %r failed: %s", q, exc)
-            return []
-        if resp.status_code != 200:
-            logger.debug("grep.app %r → HTTP %s", q, resp.status_code)
-            return []
-        try:
-            hobj = resp.json().get("hits") or {}
-        except ValueError:
-            return []
-        out.total += hobj.get("total", 0)
-        return hobj.get("hits") or []
-
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
-                                 headers={"user-agent": "Mozilla/5.0 (Kaalyx OSINT)"}) as client:
-        # Full domain first (authoritative), then the base label (context-only).
-        hits = await _query(client, domain)
-        base_hits = await _query(client, base) if base and base != domain else []
-
-        def _process(hit: dict, from_domain_query: bool) -> None:
-            repo, path, branch = hit.get("repo", ""), hit.get("path", ""), hit.get("branch", "")
-            if not repo:
-                return
-            key = f"{repo}/{path}"
-            snippet = _strip_html(((hit.get("content") or {}).get("snippet") or ""))
-            low = snippet.lower()
-            has_domain = domain in low
-            # RELEVANCE: literal domain in the snippet → direct/high; else a bare keyword hit.
-            # A base-label-query hit with NO domain AND no extractable context is dropped as noise
-            # (this is what removes the POLYCAB.NS stock-ticker false positives).
-            svc = _extract_third_party(low, base)
-            meta = _extract_company_meta(snippet, domain)
-            if not has_domain and not svc and not meta:
-                return  # keyword-only, no context → noise, skip
-            confidence = Confidence.FIRM if has_domain else Confidence.TENTATIVE
-            tag = "direct" if has_domain else "keyword"
-            if key not in seen:
-                seen.add(key)
-                out.records.append(OsintRecord(
-                    kind="grep_app", value=key,
-                    detail=f"[{tag}] {branch}: {snippet}" if snippet else f"[{tag}] {branch}",
-                    source="grep_app"))
-                raw_lines.append(f"[{tag}]\t{key}\t{branch}\t{snippet}")
-            # repo OWNER → org candidate (only for domain-backed hits, to avoid noise owners).
-            owner = repo.split("/", 1)[0]
-            if owner and (has_domain or svc):
-                out.owners.setdefault(owner, [])
-                if repo not in out.owners[owner]:
-                    out.owners[owner].append(repo)
-            # subdomains of the target → subdomain discovery.
-            for m in _SUBDOMAIN_RE.findall(snippet):
-                host = m.lower().rstrip(".")
-                if host.endswith("." + domain) and host not in subs:
-                    subs[host] = Subdomain(hostname=host, source="grep.app")
-            # API endpoints / URLs on the target domain → Web stage.
-            for u in _URL_RE.findall(snippet):
-                u = _clean_url(u)
-                hp = u.split("://", 1)[-1].split("/", 1)[0].lower()
-                if hp == domain or hp.endswith("." + domain):
-                    urls.add(u)
-            # STRUCTURED: third-party service dependency (e.g. polycab.darwinbox.in).
-            if svc:
-                svc_host, svc_name = svc
-                fk = (f"3rd:{svc_host}", key)
-                if fk not in seen_findings:
-                    seen_findings.add(fk)
-                    out.findings.append(Finding(
-                        title=f"Third-party service: {svc_name}",
-                        category="third-party-misconfig", severity=Severity.INFO,
-                        confidence=confidence, target=svc_host, tool="grep_app",
-                        description=f"{domain}'s code references {svc_host} — use of {svc_name}. "
-                                    f"Found in {key}.", evidence=snippet, reference=key, raw=snippet))
-                if svc_host not in subs:   # it's a real hostname → feed subdomain/host discovery
-                    subs[svc_host] = Subdomain(hostname=svc_host, source="grep.app:3rd-party")
-            # STRUCTURED: company metadata object (hq/type/url).
-            if meta:
-                fk = ("meta", key)
-                if fk not in seen_findings:
-                    seen_findings.add(fk)
-                    out.findings.append(Finding(
-                        title=f"Company metadata: {domain}",
-                        category="company-intel", severity=Severity.INFO,
-                        confidence=Confidence.TENTATIVE, target=domain, tool="grep_app",
-                        description="; ".join(f"{k}={v}" for k, v in meta.items())
-                                    + f" (from {key})",
-                        evidence=snippet, reference=key, raw=snippet))
-
-        for h in hits:
-            _process(h, from_domain_query=True)
-        for h in base_hits:
-            _process(h, from_domain_query=False)
-
-    out.subdomains = list(subs.values())
-    out.urls = sorted(urls)
-    if out.urls:
-        raw_lines += ["", "# API endpoints / URLs found:"] + [f"  {u}" for u in out.urls]
-    if out.findings:
-        raw_lines += ["", "# structured findings:"] + [f"  {f.title}: {f.description}"
-                                                        for f in out.findings]
-    if out.owners:
-        raw_lines += ["", "# GitHub owners of matching repos (org candidates):"] + \
-                     [f"  {o}: {', '.join(rs)}" for o, rs in out.owners.items()]
-    out.raw = "\n".join(raw_lines)
-    return out
-
-
-def _extract_third_party(snippet_low: str, base: str) -> tuple[str, str] | None:
-    """If the snippet contains a ``<base…>.<known-SaaS-suffix>`` host, return ``(host, name)`` —
-    a real third-party service dependency (Darwinbox, Workday, Zendesk, …)."""
-    for host in _HOSTNAME_RE.findall(snippet_low):
-        host = host.lower().rstrip(".")
-        for suffix, name in _THIRD_PARTY_SERVICES.items():
-            # host is like "polycab.darwinbox.in"; require the target's base label as the
-            # left-most sub-label so we attribute it to THIS company, not a generic tenant.
-            if host.endswith("." + suffix) and host.split(".")[0].startswith(base[:5] or base):
-                return host, name
-    return None
-
-
-def _extract_company_meta(snippet: str, domain: str) -> dict[str, str] | None:
-    """Pull structured company metadata (``hq``, ``type``, ``cc`` …) from the object literal that
-    carries the target's ``url:'<domain>'`` — e.g. a vendor/company registry file. Scoped to the
-    ``{ … }`` braces around the domain reference so fields from a NEIGHBOURING company's object
-    (the line before/after in the snippet) are never misattributed. Returns the fields present, or
-    ``None`` (also ``None`` when the domain's own object is truncated out of the snippet window —
-    better to report nothing than the wrong company's data)."""
-    low = snippet.lower()
-    pos = low.find(domain.lower())
-    if pos == -1:
-        return None
-    # Bound to the object literal containing the domain: from the last '{' before it to the
-    # first '}' after it. If either brace is missing from the window, we can't safely attribute
-    # neighbouring fields → bail (avoids the Motherson-vs-Polycab misattribution).
-    lb = snippet.rfind("{", 0, pos)
-    rb = snippet.find("}", pos)
-    if lb == -1 or rb == -1:
-        return None
-    obj = snippet[lb:rb + 1]
-    meta: dict[str, str] = {}
-    for key in ("hq", "type", "cc", "sector", "industry", "country"):
-        m = re.search(rf"\b{key}\s*:\s*['\"]([^'\"]{{1,60}})['\"]", obj, re.IGNORECASE)
-        if m:
-            meta[key] = m.group(1).strip()
-    return meta or None
-
-
 # GitLab group / namespace discovery --------------------------------------------------------
 async def discover_gitlab(company_slugs: list[str]) -> list[OsintRecord]:
     """Look up a public GitLab.com group or user matching the company (keyless public API).
@@ -2010,8 +1763,7 @@ async def _authenticated_login(client) -> str | None:
     return data.get("login") if data else None
 
 
-async def discover_github_org(target, token: str | None, max_candidates: int = 5,
-                              extra_owners: dict[str, list[str]] | None = None) -> list[GithubOrgCandidate]:
+async def discover_github_org(target, token: str | None, max_candidates: int = 5) -> list[GithubOrgCandidate]:
     """Identify the TARGET's GitHub org(s), ranked by confidence. Never the token owner.
 
     Strategy (thorough by design — we would rather spend a few extra API calls than settle
@@ -2024,50 +1776,19 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
        whose name/login matches the company; a slug that *also* appears in (1) is "high",
        otherwise "medium" (a plain name match — real but weaker).
     3. **Exact-login probe.** If an org literally named after the slug exists, include it.
-    4. **grep.app repo owners (*extra_owners*).** Owners of public repos whose code grep.app
-       found mentioning the domain — a KEYLESS signal (grep.app needs no token), folded in as an
-       additional org candidate whether or not a GitHub token is present.
 
-    Every candidate is verified against the API when a token is available; without a token, the
-    grep.app owners are still returned (a name match raises confidence). The token owner is
-    filtered out so a company scan can never resolve to the operator's personal account. Returns
-    ``[]`` when nothing can be confidently identified.
+    Every candidate is verified against the GitHub API, which needs a token — so without one
+    there is no evidence-backed signal and ``[]`` is returned rather than an unverified guess.
+    The token owner is filtered out so a company scan can never resolve to the operator's
+    personal account. Returns ``[]`` when nothing can be confidently identified.
     """
     candidates: dict[str, GithubOrgCandidate] = {}
     slugs = _company_slugs(target)
-    extra_owners = extra_owners or {}
-
-    def _fold_grep_owners(verified: dict[str, str] | None) -> None:
-        """Add grep.app repo owners as candidates. *verified* maps login→kind when a token let us
-        verify them; without it we still include name-matched owners (lower confidence)."""
-        for login, repos in extra_owners.items():
-            low = login.lower()
-            if low in candidates:
-                candidates[low].reason += "; also found in grep.app code matches"
-                candidates[low].evidence = (candidates[low].evidence + repos)[:5]
-                continue
-            name_match = any(s in low for s in slugs)
-            kind = (verified or {}).get(low)
-            if kind is None and verified is not None:
-                continue  # token present but this owner isn't a real account → skip
-            # Keyless: an owner whose PUBLIC repos reference the target domain is an evidence-
-            # backed candidate (the same "owns repos mentioning the domain" signal), just
-            # unverified — include it at low confidence (medium if the login also name-matches).
-            candidates[low] = GithubOrgCandidate(
-                login=login, kind=kind or ("org" if name_match else "user"),
-                confidence="high" if (kind == "org" and name_match) else
-                           ("medium" if name_match else "low"),
-                reason="owns public repo(s) grep.app found mentioning "
-                       f"{target.registrable}",
-                evidence=repos[:5])
 
     if not token:
-        # Keyless path: grep.app owners are the only signal we have — still useful.
-        _fold_grep_owners(verified=None)
-        order = {"high": 3, "medium": 2, "low": 1}
-        return sorted(candidates.values(),
-                      key=lambda c: (order.get(c.confidence, 0), c.kind == "org", len(c.evidence)),
-                      reverse=True)[:max_candidates]
+        # No token → no verifiable signal. Returning an unverified guess is exactly the
+        # data-integrity hazard we must avoid, so identify nothing and let consumers skip.
+        return []
 
     async with httpx.AsyncClient(timeout=20, headers=_github_headers(token), follow_redirects=True) as client:
         token_owner = await _authenticated_login(client)
@@ -2121,17 +1842,6 @@ async def discover_github_org(target, token: str | None, max_candidates: int = 5
                     login=slug, kind="org", confidence="high",
                     reason=f"an organization named '{slug}' exists on GitHub",
                 )
-
-        # (4) grep.app repo owners — verify each against the API (we have a token here) and fold
-        # in, filtering out the token owner so a scan never resolves to the operator's account.
-        verified: dict[str, str] = {}
-        for login in extra_owners:
-            if token_owner and login.lower() == token_owner.lower():
-                continue
-            kind = await _verify_account(client, login)
-            if kind:
-                verified[login.lower()] = kind
-        _fold_grep_owners(verified=verified)
 
     # Rank: high > medium > low, orgs before users, more evidence first.
     order = {"high": 3, "medium": 2, "low": 1}

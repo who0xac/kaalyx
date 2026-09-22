@@ -41,7 +41,7 @@ from pathlib import Path
 import httpx
 
 from ..core.stage import Stage, StageResult
-from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain, WebURL
+from ..data.models import Confidence, Email, Finding, OsintRecord, Severity, Subdomain
 from ..monitor.flags import flag_all
 from ..ui import osint_ui
 from . import osint_inproc
@@ -61,7 +61,6 @@ SOURCE_LABELS: dict[str, str] = {
     "breach_lookup": "Breach lookup",
     "leak_search": "Leak search (creds)",
     "github_subdomains": "GitHub subdomains",
-    "grep_app": "grep.app code search",
     "gitgraber": "gitGraber (secret regexes)",
     "trufflehog": "TruffleHog (org)",
     "cloud_enum": "Cloud enum",
@@ -115,7 +114,6 @@ class OsintStage(Stage):
             "email_harvest": (osint_cfg.email_harvest, self._src_email_harvest),
             "social": (osint_cfg.social, self._src_social),
             "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
-            "grep_app": (osint_cfg.grep_app, self._src_grep_app),
             "gitgraber": (osint_cfg.gitgraber, self._src_gitgraber),
             "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
             "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
@@ -153,11 +151,10 @@ class OsintStage(Stage):
         # (trufflehog, gato) scan the target — never the token owner's account. Runs as a
         # pre-step because those sources need its result and the fan-out is concurrent. If no
         # org is confidently identified, those sources skip cleanly (see their methods).
-        # Runs when a token-gated consumer is enabled (needs a token), OR when grep_app is on —
-        # grep.app contributes org candidates KEYLESSLY, so org discovery is useful even with no
-        # token (the candidates are recorded/shown even if the token-gated scanners then skip).
+        # Only runs when a token-gated consumer is enabled and a token is present — org
+        # discovery has no purpose otherwise (nothing would consume the result).
         token_consumer = (osint_cfg.trufflehog or osint_cfg.github_actions or osint_cfg.workflow_logs)
-        if (token_consumer and ctx.secrets.has_github) or osint_cfg.grep_app:
+        if token_consumer and ctx.secrets.has_github:
             await self._discover_github_org()
 
         # Live progress board that updates in place. EVERYTHING — the concurrent fan-out AND
@@ -233,8 +230,8 @@ class OsintStage(Stage):
             ctx.repo.bulk_upsert_subdomains(ctx.scan_id, all_subs)
             ctx.writer.write_lines(self.name, "subdomains.txt", [s.hostname for s in all_subs])
         if all_urls:
-            # API endpoints / URLs (e.g. from grep.app) → the shared web_urls table + a file, so
-            # the Web stage (Part 4) can pick them up rather than rediscovering them.
+            # API endpoints / URLs → the shared web_urls table + a file, so the Web stage
+            # (Part 4) can pick them up rather than rediscovering them.
             ctx.repo.bulk_upsert_urls(ctx.scan_id, all_urls)
             ctx.writer.write_lines(self.name, "urls.txt", [u.url for u in all_urls])
         if all_osint:
@@ -628,48 +625,10 @@ class OsintStage(Stage):
                     if res.subdomains else "no subdomains found in GitHub code")
         return res
 
-    async def _src_grep_app(self) -> SourceResult:
-        """Search grep.app's public-code index for the domain (keyless JSON API). A fast,
-        complementary alternative to GitHub's rate-limited code search — no token needed.
-
-        CROSS-FEEDS other sources/stages (not an island): subdomains found in the code go into
-        the shared subdomain list (same as Postman/Swagger); API endpoints/URLs are carried as
-        web_urls for the Web stage; and the matching repos' GitHub owners are stashed in shared
-        state so the org-discovery pre-step folds them into discover_github_org as extra
-        candidates. The org owners are also cached so the pre-step doesn't re-fetch."""
-        res = SourceResult(name="grep_app", raw_ext="txt")
-        domain = self.ctx.target.registrable
-        cached = self.ctx.get_shared("grep_app_result")
-        result = cached if cached is not None else await osint_inproc.search_grep_app(domain)
-        self.ctx.set_shared("grep_app_result", result)
-
-        res.osint = result.records
-        res.findings = result.findings              # structured company-intel / 3rd-party-svc findings
-        res.subdomains = result.subdomains          # → shared subdomain count/list (Part 2)
-        # API endpoints / URLs → web_urls for the Web stage (same shared structure gau/katana use).
-        for u in result.urls:
-            res.urls.append(WebURL(url=u, source="grep.app"))
-        res.raw = result.raw or f"# grep.app code search for {domain}\n# no matches"
-        if result.records:
-            extras = []
-            if result.subdomains:
-                extras.append(f"{len(result.subdomains)} subdomain(s)")
-            if result.findings:
-                extras.append(f"{len(result.findings)} finding(s)")
-            if result.urls:
-                extras.append(f"{len(result.urls)} URL(s)")
-            if result.owners:
-                extras.append(f"{len(result.owners)} org candidate(s)")
-            res.note = f"{len(result.records)} repo match(es)" + (
-                " → " + ", ".join(extras) if extras else "")
-        else:
-            res.note = "no public code mentions the domain (grep.app)"
-        return res
-
     async def _src_gitgraber(self) -> SourceResult:
         """gitGraber — service-specific secret-pattern scan of public GitHub code (needs a
-        GITHUB_TOKEN). Complementary to trufflehog (org repos) and grep.app/github_subdomains
-        (generic keyword search): gitGraber uses curated per-service regexes (AWS/Stripe/Twilio/
+        GITHUB_TOKEN). Complementary to trufflehog (org repos) and github_subdomains (generic
+        keyword search): gitGraber uses curated per-service regexes (AWS/Stripe/Twilio/
         Mailgun/PayPal/Heroku/…). It reads tokens from its own config.py, so we GENERATE that
         file at scan time from our rotated GITHUB_TOKEN (never argv, never committed)."""
         import shutil
@@ -726,45 +685,39 @@ class OsintStage(Stage):
         """
         target = self.ctx.target
         token = self.ctx.secrets.next_github_token()
-        # Feed grep.app's repo owners (a KEYLESS signal) into org discovery. Run grep.app once
-        # here and cache the whole result so _src_grep_app reuses it instead of re-querying.
-        extra_owners: dict[str, list[str]] = {}
-        if self.ctx.config.osint.grep_app:
-            try:
-                grep = self.ctx.get_shared("grep_app_result")
-                if grep is None:
-                    grep = await osint_inproc.search_grep_app(target.registrable)
-                    self.ctx.set_shared("grep_app_result", grep)
-                extra_owners = grep.owners
-            except Exception as exc:  # grep.app must never break org discovery
-                self.log.debug("grep.app owners for org discovery unavailable: %s", exc)
         try:
-            candidates = await osint_inproc.discover_github_org(
-                target, token, extra_owners=extra_owners)
+            candidates = await osint_inproc.discover_github_org(target, token)
         except Exception as exc:  # never let discovery break the stage
             self.log.warning("GitHub org discovery failed: %s", exc)
             candidates = []
 
         self.ctx.set_shared("github_org_candidates", candidates)
-        if candidates:
-            best = candidates[0]
+        # DATA-INTEGRITY GATE: only a HIGH-confidence candidate may be auto-scanned by
+        # trufflehog/gato/workflow_logs. A medium/low match (a name-only collision, or an owner
+        # that merely *mentions* the domain in code — e.g. yt-dlp shipping a `lecturio.py`
+        # extractor for lecturio.com) is NOT the target's org and must never be scanned; those
+        # sources skip cleanly instead. This is the guard against the wrong-org scan.
+        best = next((c for c in candidates if c.confidence == "high"), None)
+        if best is not None:
             self.ctx.set_shared("github_org", best.login)
             self.ctx.set_shared("github_org_reason", f"{best.confidence}: {best.reason}")
+            others = [c for c in candidates if c is not best]
             self.log.info(
                 "GitHub org for %s: %s (%s — %s)%s",
                 target.registrable, best.login, best.kind, best.confidence,
-                f"; other candidates: {', '.join(c.login for c in candidates[1:])}"
-                if len(candidates) > 1 else "",
+                f"; NOT scanning weaker candidates: {', '.join(c.login for c in others[:5])}"
+                if others else "",
             )
         else:
             self.ctx.set_shared("github_org", None)
-            self.ctx.set_shared(
-                "github_org_reason",
-                f"no GitHub org confidently identified for {target.registrable}",
-            )
+            weak = ", ".join(f"{c.login}({c.confidence})" for c in candidates[:5])
+            reason = (f"no HIGH-confidence GitHub org for {target.registrable}"
+                      + (f"; ignored weak matches: {weak}" if weak else ""))
+            self.ctx.set_shared("github_org_reason", reason)
             self.log.info(
-                "No GitHub org identified for %s — trufflehog/gato will skip "
-                "(will NOT scan the token owner's account).", target.registrable,
+                "No confident GitHub org for %s — trufflehog/gato/workflow_logs will SKIP "
+                "(refusing to scan a weak/unrelated match%s).", target.registrable,
+                f"; ignored: {weak}" if weak else "",
             )
 
     async def _src_trufflehog(self) -> SourceResult:

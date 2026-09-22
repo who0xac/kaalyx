@@ -192,7 +192,6 @@ class OsintConfig:
     breach_lookup: bool = True       # h8mail breach enrichment (needs key; else skips)
     leak_search: bool = True         # LeakSearch — actual leaked creds from ProxyNova/COMB dump
     github_subdomains: bool = True
-    grep_app: bool = True            # grep.app public-code search for the domain (keyless)
     gitgraber: bool = True           # gitGraber — service-specific secret regexes (needs GITHUB_TOKEN)
     trufflehog: bool = True          # GitHub org secret scan (needs GITHUB_TOKEN)
     cloud_enum: bool = True
@@ -586,7 +585,6 @@ osint:
   breach_lookup: true
   leak_search: true
   github_subdomains: true
-  grep_app: true                # grep.app public-code search for the domain (keyless)
   gitgraber: true               # gitGraber — service-specific secret regexes (needs GITHUB_TOKEN)
   trufflehog: true
   cloud_enum: true

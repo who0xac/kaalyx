@@ -67,7 +67,6 @@ def _version_callback(value: bool) -> None:
 _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("TARGET OPTIONS", [
         ("-t, --target <domain>", "Single domain to scan (apex or subdomain)."),
-        ("-l, --target-list <file>", "File of domains, one per line; scanned in sequence."),
         ("    <domain>", "Positional shortcut for -t (one target)."),
     ]),
     ("SCAN MODE OPTIONS", [
@@ -113,7 +112,7 @@ _HELP_EXAMPLES: list[tuple[str, str]] = [
     ("kaalyx scan example.com --osint-only", "OSINT only, nothing else"),
     ("kaalyx scan example.com --all", "OSINT + Subdomains → Hosts → Web → Vuln"),
     ("kaalyx scan example.com --only-osint whois,dns,mail_dns,m365", "a subset of OSINT sources"),
-    ("kaalyx scan -l targets.txt --no-vuln", "many targets, stop before the Vuln stage"),
+    ("for d in a.com b.com; do kaalyx scan -t \"$d\" --osint-only; done", "many targets via a shell loop"),
     ("kaalyx tools --check", "see which external tools are installed vs. missing"),
 ]
 
@@ -253,24 +252,6 @@ def _apply_osint_selection(
                 setattr(config.osint, src, False)
 
 
-def _load_target_list(path: str) -> list[str]:
-    """Read a target-list file: one domain per line, blanks and #-comments ignored."""
-    try:
-        raw = Path(path).expanduser().read_text(encoding="utf-8")
-    except OSError as exc:
-        console.print(f"[red]Cannot read target list:[/] {exc}")
-        raise typer.Exit(code=2)
-    targets = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            targets.append(line)
-    if not targets:
-        console.print(f"[red]Target list is empty:[/] {path}")
-        raise typer.Exit(code=2)
-    return targets
-
-
 def _scan_one(
     target_str: str,
     *,
@@ -329,7 +310,6 @@ def _run_scan(
     verbose: bool,
     resume: bool,
     mode: str = "full",
-    target_list: Optional[str] = None,
     notify: bool = False,
     dashboard: bool = False,
     report: bool = False,
@@ -382,29 +362,17 @@ def _run_scan(
         sqlmap=sqlmap or config.scan.sqlmap,
     )
 
-    # Assemble the target list: --target-list file, else the single target/positional.
-    if target_list:
-        targets = _load_target_list(target_list)
-    elif target_str:
-        targets = [target_str]
-    else:
-        console.print("[red]No target given.[/] Provide a domain, -t/--target, or -l/--target-list.")
+    # One scan per invocation. To scan several domains, use a shell loop, e.g.
+    #   for d in a.com b.com c.com; do kaalyx scan -t "$d" --osint-only; done
+    if not target_str:
+        console.print("[red]No target given.[/] Provide a domain or -t/--target.")
         raise typer.Exit(code=2)
 
-    # Targets are processed SEQUENTIALLY. Each scan already saturates the box via the
-    # per-scan concurrency semaphore + adaptive rate-limiter; running whole pipelines in
-    # parallel would multiply subprocess/DNS/HTTP load past those per-scan limits and
-    # break the rate-limiter (which is scoped to one scan). Sequential = predictable load
-    # and each target gets full resources.
-    multi = len(targets) > 1
     try:
-        for idx, tgt in enumerate(targets, 1):
-            if multi:
-                console.rule(f"[bold cyan]Target {idx}/{len(targets)}: {tgt}[/]")
-            _scan_one(
-                tgt, config=config, secrets=secrets, mode=mode, resume=resume,
-                options=options, notify=notify, report=report, force_type=force_type,
-            )
+        _scan_one(
+            target_str, config=config, secrets=secrets, mode=mode, resume=resume,
+            options=options, notify=notify, report=report, force_type=force_type,
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted — progress checkpointed; use `kaalyx resume`.[/]")
         raise typer.Exit(code=130)
@@ -428,11 +396,6 @@ def scan(
     target: Optional[str] = typer.Option(
         None, "--target", "-t", metavar="DOMAIN",
         help="Single domain to scan (apex or subdomain).",
-        rich_help_panel="Target",
-    ),
-    target_list: Optional[str] = typer.Option(
-        None, "--target-list", "-l", metavar="FILE",
-        help="File of domains (one per line); each is scanned in sequence.",
         rich_help_panel="Target",
     ),
     # --- Scan mode (mutually exclusive; default = full chain) ---
@@ -534,11 +497,12 @@ def scan(
 ) -> None:
     """Run the Kaalyx pipeline against a target.
 
-    Give the target as a positional arg, [bold]-t/--target[/], or a file via
-    [bold]-l/--target-list[/] (scanned sequentially). Scan modes are mutually exclusive;
-    the default is [bold]--full[/] (Subdomains → Hosts → Web → Vuln). Always-on: dual
-    SQLite+txt output, severity/confidence tagging, interesting-subdomain flagging,
-    adaptive rate-limiting, checkpoint/resume, and scan-history for monitoring.
+    Give the target as a positional arg or [bold]-t/--target[/]. Scan modes are mutually
+    exclusive; the default is [bold]--full[/] (Subdomains → Hosts → Web → Vuln). To scan
+    several domains, use a shell loop (e.g. [dim]for d in a.com b.com; do kaalyx scan -t
+    "$d" --osint-only; done[/]). Always-on: dual SQLite+txt output, severity/confidence
+    tagging, interesting-subdomain flagging, adaptive rate-limiting, checkpoint/resume,
+    and scan-history for monitoring.
 
     [dim]Only Part 1 (OSINT) is implemented so far; other stages report as pending.[/]
     """
@@ -568,9 +532,6 @@ def scan(
 
     # Resolve the target source.
     chosen_target = target or positional_target
-    if target_list and (chosen_target):
-        console.print("[red]Provide either a single target or --target-list, not both.[/]")
-        raise typer.Exit(code=2)
 
     if as_subdomain and as_apex:
         console.print("[red]--as-subdomain and --as-apex are mutually exclusive.[/]")
@@ -581,7 +542,7 @@ def scan(
 
     _run_scan(
         chosen_target, config_path=config, verbose=verbose, resume=resume,
-        mode=mode, target_list=target_list,
+        mode=mode,
         notify=notify, dashboard=dashboard, report=report,
         full_nmap=full_nmap, brutespray=brutespray, ipv6=ipv6, sqlmap=sqlmap,
         as_subdomain=as_subdomain, as_apex=as_apex,

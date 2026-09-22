@@ -704,24 +704,131 @@ def source_results_table(results: list):
         line.append(f"{name:<28}", style="white" if r.ok and not r.skipped else "grey50")
         pad = max(1, 30 - len(name))
         line.append(" " + "." * pad + " ", style=MUTED)
-        # Result cell: N/A (red) when a successful source produced nothing; else the count/state.
+        # Result cell: a completed source ALWAYS shows a real hit COUNT in green — including
+        # "0 hits" for a legitimate clean result (locked rule: green 0 = valid outcome). N/A is
+        # NEVER used for a source's overall count; it is only for a missing FIELD inside a
+        # source's own detailed block.
         if not r.ok:
             line.append("failed", style="bold red")
         elif r.skipped:
             line.append(_skip_result_text(r.note))
-        elif r.total > 0:
-            line.append(f"{r.total} hits", style="green")   # 0 wouldn't reach here
         else:
-            line.append_text(_NA())                          # ran clean, found nothing → red N/A
+            line.append(f"{r.total} hits", style="green")
         # A short trailing note for context (skip reason etc.), trimmed to stay on one line.
         note = (r.note or "").strip()
-        if note and not r.skipped and r.ok and r.total == 0:
-            note = ""  # N/A already conveys it
         if note:
             n = note if len(note) <= 34 else note[:33] + "…"
             line.append(f"  {n}", style=MUTED)
         lines.append(line)
     return Group(*lines)
+
+
+# One-line description per source for its detailed [◆] block header.
+_SOURCE_DESC = {
+    "whois": "registration & ownership", "dns": "DNS records",
+    "ip_info": "geo/asn lookup", "mail_dns": "anti-spoofing & DNS records",
+    "m365": "Microsoft 365 / Entra tenant", "email_harvest": "harvested addresses",
+    "social": "social-media profiles", "breach_lookup": "email breach enrichment",
+    "leak_search": "leaked credentials", "github_subdomains": "subdomains from GitHub code",
+    "grep_app": "public-code references", "trufflehog": "org secret scan",
+    "cloud_enum": "public cloud buckets/blobs", "s3scanner": "S3 buckets",
+    "badsecrets": "known secrets / crypto misconfig", "retirejs": "vulnerable JS libraries",
+    "theharvester": "emails / hosts / people", "third_party_misconfig": "3rd-party SaaS misconfig",
+    "api_leaks": "Postman / Swagger API leaks", "exposed_git": "exposed / downloadable .git",
+    "firebase": "Firebase Realtime DB exposure", "github_actions": "GitHub Actions audit",
+    "google_dorks": "ready-to-run dork URLs", "shodan_org": "org/ASN infrastructure",
+    "shodan_favicon": "favicon-hash pivots", "shodan_vulns": "passive CVE tags",
+    "shodan_host": "per-IP deep lookup", "internetdb": "free per-IP ports/CVEs",
+    "tls_cert": "certificate SANs/issuer/validity", "gitlab": "GitLab namespaces",
+    "dockerhub": "Docker Hub repositories", "mobile_apps": "iOS / Android apps",
+    "affiliate_domains": "related domains (crt.sh)", "dnstwist": "typosquat / look-alike domains",
+    "workflow_logs": "CI-log secret scan",
+}
+
+
+def _generic_source_block(r) -> "Group":
+    """A detailed [◆] block for ONE source, built from its SourceResult. Shows the source's
+    records / findings / subdomains / URLs as labelled lines; when the source didn't run
+    (skipped / no key / not installed / failed) or found nothing, it still renders the block
+    stating that — so the operator sees WHAT was checked even on an empty result. Per-field
+    misses render red N/A; the block never shows N/A for an overall count."""
+    name = _display_name(r.name, r.name)
+    desc = _SOURCE_DESC.get(r.name, "")
+    lines: list = [_section_header(name, desc), Text("")]
+
+    # Didn't run cleanly → say why, then stop (nothing to detail).
+    if not r.ok:
+        lines.append(Text.assemble(("    status  ", "cyan"),
+                                   (f"FAILED — {r.error or r.note or 'unknown error'}", "bold red")))
+        return Group(*lines)
+    if r.skipped:
+        state = _classify_skip(r.note or "")
+        style = "bold orange1" if state == "not_installed" else "yellow"
+        lines.append(Text.assemble(("    status  ", "cyan"),
+                                   (_skip_note(r.note) or "skipped", style)))
+        return Group(*lines)
+
+    body = False
+    # Findings (structured) — severity-tagged one-liners.
+    for f in r.findings:
+        body = True
+        sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        lines.append(Text.assemble(("    ", ""), (f"[{sev.upper()}] ", severity_style(sev)),
+                                    (f.title, "white")))
+        if f.description:
+            lines.append(Text.assemble(("        ", ""), (f.description[:150], MUTED)))
+    # OSINT records — value + detail.
+    for o in r.osint:
+        body = True
+        val = o["value"] if not hasattr(o, "value") else o.value
+        det = o["detail"] if not hasattr(o, "detail") else o.detail
+        line = Text("    ")
+        line.append(str(val), style="white")
+        if det:
+            line.append("  ", style=MUTED); line.append(str(det)[:110], style=MUTED)
+        lines.append(line)
+    # Subdomains discovered by this source.
+    if r.subdomains:
+        body = True
+        lines.append(Text.assemble(("    subdomains  ", "cyan"),
+                                    (", ".join(s.hostname for s in r.subdomains[:20]), "white")))
+    # URLs / endpoints discovered by this source.
+    if r.urls:
+        body = True
+        for u in r.urls[:20]:
+            lines.append(Text.assemble(("    url  ", "cyan"), (u.url, "white")))
+
+    if not body:
+        # Ran clean, found nothing — show it explicitly (green context, not a failure), plus the
+        # source's own note so the operator sees what was checked.
+        lines.append(Text.assemble(("    result  ", "cyan"), ("0 — none found", "green")))
+        if r.note:
+            lines.append(Text.assemble(("    note    ", "cyan"), (r.note[:110], MUTED)))
+    return Group(*lines)
+
+
+def source_detail_blocks(results: list, osint_rows: list, email_rows: list, emp_rows: list) -> list:
+    """A detailed [◆] block for EVERY source, in pipeline order. The four sources with bespoke
+    layouts (whois / ip_info / mail_dns / social) delegate to their rich renderers; every other
+    source gets the generic block. Sources that found nothing still render a block saying so, so
+    the full set of 35 is always visible. Returns a list of renderables to print in order."""
+    specialized = {
+        "whois": lambda: whois_table(osint_rows),
+        "ip_info": lambda: host_intel_table(osint_rows),
+        "mail_dns": lambda: mail_hygiene_table(osint_rows),
+        "social": lambda: social_table(osint_rows),
+        "email_harvest": lambda: emails_table(email_rows),
+        "theharvester": lambda: employees_table(emp_rows),
+    }
+    out: list = []
+    for r in results:
+        block = None
+        if r.name in specialized and r.ok and not r.skipped:
+            block = specialized[r.name]()   # bespoke renderer (may be None if it had no rows)
+        if block is None:
+            block = _generic_source_block(r)
+        out.append(block)
+    return out
 
 
 def _skip_result_text(note: str) -> "Text":

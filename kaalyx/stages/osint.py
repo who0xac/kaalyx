@@ -281,24 +281,22 @@ class OsintStage(Stage):
         osint_rows = ctx.repo.list_osint(ctx.scan_id)
         finding_rows = ctx.repo.list_findings(ctx.scan_id)
 
-        # One blank line before each result block. The SOURCE RESULTS roster shows EVERY source's
-        # outcome (all 34, not just the ones with data) — a green count, red N/A, or skip state.
-        for table in (
-            osint_ui.source_results_table(results),
-            osint_ui.whois_table(osint_rows),
-            osint_ui.host_intel_table(osint_rows),
-            osint_ui.mail_hygiene_table(osint_rows),
-            osint_ui.social_table(osint_rows),
-            osint_ui.emails_table(email_rows),
-            osint_ui.employees_table(emp_rows),
-        ):
-            if table is not None:
-                console.print()
-                console.print(table)
+        # 1) SOURCE RESULTS roster — the quick-scan summary: every source + a real hit COUNT
+        #    (green, incl. "0 hits") or skip/failed state. No false N/A on counts.
+        roster = osint_ui.source_results_table(results)
+        if roster is not None:
+            console.print()
+            console.print(roster)
 
-        # Findings are grouped by category (Option 3): a compact table for simple types,
-        # spacious cards for complex ones (e.g. hardcoded Postman credentials) so no detail
-        # is truncated. render_findings returns a list of renderables to print in order.
+        # 2) A DETAILED [◆] block for EVERY source (all 35, in pipeline order) — the specialized
+        #    rich renderers for whois/ip_info/mail_dns/social/email_harvest/theharvester, and a
+        #    generic block for the rest. Sources that found nothing still render a block saying so.
+        for renderable in osint_ui.source_detail_blocks(results, osint_rows, email_rows, emp_rows):
+            if renderable is not None:
+                console.print()
+                console.print(renderable)
+
+        # 3) Findings grouped by category (severity-tagged), in the borderless idiom.
         for renderable in osint_ui.render_findings(finding_rows):
             console.print()
             console.print(renderable)

@@ -173,6 +173,15 @@ class OsintStage(Stage):
             labels["leak_search"] = SOURCE_LABELS.get("leak_search", "leak_search")
         progress = osint_ui.OsintProgress(labels, target=ctx.domain)
         self._progress = progress
+        # Flag the org-scanning sources on the live board (⚠) when no GitHub org was confidently
+        # identified in the pre-step — so the data-integrity concern is visible on their rows from
+        # the start, not only after they skip. Depends on the org result, which is set above.
+        token_consumer = any(getattr(osint_cfg, s)
+                             for s in ("trufflehog", "github_actions", "workflow_logs"))
+        if token_consumer and ctx.secrets.has_github and not ctx.get_shared("github_org"):
+            for s in ("trufflehog", "github_actions", "workflow_logs"):
+                if getattr(osint_cfg, s):
+                    progress.mark_flagged(s)
         set_console_logging(False)
 
         # Wrap the UI hook so that as EACH source finishes we immediately flush its raw file to
@@ -322,31 +331,25 @@ class OsintStage(Stage):
         return self._flagged(results)[0]
 
     def _render_results(self, results: list[SourceResult]) -> None:
-        """Compact terminal output ONLY: the per-source roster (name + count) and a short flagged
-        callout. NO finding-by-finding detail, NO raw dumps — all of that lives in the report
-        file written by :meth:`_persist`. The completion message is emitted by the orchestrator's
-        caller via the values returned here through StageResult."""
+        """Compact terminal output ONLY, printed to NORMAL scrollback after the live alt-screen
+        board is torn down (the live board is wiped on exit, so this static reprint is the
+        permanent record). NO finding-by-finding detail, NO raw dumps, and NO separate flagged
+        callout — the ⚠ row icon is the only flag indicator; the full detail lives in the report
+        file written by :meth:`_persist`."""
         ctx = self.ctx
         console = osint_ui.get_console()
 
         flagged, flagged_sources = self._flagged(results)
 
-        # 1) SOURCE RESULTS board — every source grouped under a category header, with a plain
-        #    status icon (✔/✘/○, or ⚠ on a flagged row) before the name and a hit COUNT. The one
-        #    compact per-source view the terminal keeps, printed once statically after the scan.
+        # 1) SOURCE RESULTS board — every source grouped under a category header, with a bracketed
+        #    status icon ([✔]/[✘]/[○], or [⚠] on a flagged row) before the name and a hit COUNT.
+        #    Reprinted statically here because the live alt-screen board vanished on scan end.
         board = osint_ui.grouped_source_board(results, flagged_sources)
         if board is not None:
             console.print()
             console.print(board)
 
-        # 2) FLAGGED FOR REVIEW — only genuinely noteworthy items (org mismatch, verified
-        #    secrets, critical/high findings). Nothing prints when there is nothing to flag.
-        callout = osint_ui.flagged_callout(flagged)
-        if callout is not None:
-            console.print()
-            console.print(callout)
-
-        # 3) Compact completion message — folder path + one-line tally. No detail, no dumps.
+        # 2) Compact completion message — folder path + one-line tally. No detail, no dumps.
         duration = sum(r.duration_s for r in results)
         n_findings = sum(len(r.findings) for r in results)
         folder = str(ctx.writer.stage_dir(self.name))

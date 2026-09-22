@@ -327,6 +327,51 @@ def print_banner(domain: str, source_count: int) -> None:
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# Static running-marker glyph shown inside the bracket ([⠙]) while a source runs. It does NOT
+# animate — the motion lives in the dotted leader's pulse (see _pulse_leader). A fixed glyph keeps
+# the bracket column stable so only the leader appears to move.
+_RUN_GLYPH = "⠙"
+
+# The pulse cluster that sweeps the dotted leader while a source runs: small→large→small.
+_PULSE = "·•●•·"
+
+
+def _pulse_leader(width: int, sweep: float) -> "Text":
+    """A dotted leader of *width* chars that animates a small→large→small pulse cluster
+    (``·•●•·``) travelling left→right and looping, against a background of static ``.`` dots.
+    *sweep* is a 0..1 fraction of the cycle (derived from wall-clock time by the caller) so the
+    animation is stateless. Returns a styled Text: the static dots are muted, the pulse is cyan
+    so the moving cluster reads clearly."""
+    width = max(1, width)
+    n = len(_PULSE)
+    # Travel the cluster's leading edge from -n (just off the left) to width (just off the right),
+    # so it enters and exits smoothly rather than popping. Position may be partially off-screen.
+    start = int(round(sweep * (width + n))) - n
+    chars: list[str] = ["."] * width
+    styles: list[bool] = [False] * width  # True = pulse (cyan), False = static dot (muted)
+    for i, ch in enumerate(_PULSE):
+        col = start + i
+        if 0 <= col < width:
+            chars[col] = ch
+            styles[col] = True
+    out = Text()
+    # Coalesce runs of same style into as few spans as possible (cheap; keeps the frame light).
+    run_start = 0
+    for i in range(1, width + 1):
+        if i == width or styles[i] != styles[run_start]:
+            seg = "".join(chars[run_start:i])
+            out.append(seg, style="cyan" if styles[run_start] else MUTED)
+            run_start = i
+    return out
+
+
+def _category_of(source_name: str) -> str:
+    """Return the category title a source belongs to (for the live board's grouping), or 'OTHER'."""
+    for title, names in _SOURCE_CATEGORIES:
+        if source_name in names:
+            return title
+    return "OTHER"
+
 
 def _classify_skip(note: str) -> str:
     """Split a generic skip into an actionable sub-state from its note text:
@@ -412,6 +457,9 @@ class _SourceState:
     # Optional live progress "done/total" for a running source (e.g. LEAKSEARCH 23/47).
     prog_done: int = 0
     prog_total: int = 0
+    # True when this source carries a data-integrity concern or a verified/critical finding — the
+    # board shows a ⚠ on its row instead of the normal outcome icon.
+    flagged: bool = False
 
 
 class OsintProgress:
@@ -475,33 +523,42 @@ class OsintProgress:
                 st.state = _classify_skip(st.note)
             else:
                 st.state = "done"
-            # Track completion for the live progress line. Per-source rows are NOT printed during
-            # the scan any more — the full category-grouped board is printed once at the end (see
-            # grouped_source_board). During the scan the only live output is the single status
-            # line, which keeps the tall board out of the height-limited Live frame.
+            # Flag a source whose result carries a verified/confirmed secret or a critical/high
+            # finding, so its row shows ⚠ the moment it finishes. (The org-scanner data-integrity
+            # flag is set separately by the stage via mark_flagged, since it depends on the
+            # pre-fan-out org-identification result, not this source's own records.)
+            if result is not None and self._result_is_flagged(result):
+                st.flagged = True
+            # Per-source rows are NOT printed as static lines any more — the full board renders
+            # live (see _board / live) and a static copy is printed once at the end by the stage.
             self._finished += 1
         self._refresh()
 
-    def _print_static_row(self, name: str, st: "_SourceState", pos: int) -> None:
-        """Emit ONE completed-source line to the console (static; scrolls into history). Printed
-        via the live board's console so it interleaves correctly above the live status line."""
-        row = self._row(st, _display_name(name, st.label), time.monotonic(),
-                        _SPINNER_FRAMES[0], pos=pos, total=self._total)
-        if self._live is not None:
-            # console.print through the Live renders the static line ABOVE the live status line,
-            # then repaints only the (single-line) status — no full-board redraw.
-            self._live.console.print(row)
-        else:
-            self._console.print(row)
+    @staticmethod
+    def _result_is_flagged(result) -> bool:
+        """True when a source's result has a verified/confirmed secret or a critical/high finding
+        — the same high-signal criteria the stage uses for the flagged set."""
+        for f in getattr(result, "findings", []) or []:
+            sev = (getattr(f.severity, "value", None) or str(f.severity)).lower()
+            conf = (getattr(f.confidence, "value", None) or str(f.confidence)).lower()
+            if conf == "confirmed" or sev in ("critical", "high"):
+                return True
+        return False
 
+    def mark_flagged(self, name: str) -> None:
+        """Mark a source flagged (⚠ on its row) for a reason external to its own result — e.g. the
+        org-scanners when no GitHub org was confidently identified. Idempotent; safe any time."""
+        st = self._states.get(name)
+        if st is not None:
+            st.flagged = True
+            self._refresh()
 
     # Column geometry for the source rows (aligned; leaders fill the middle).
     _NAME_W = 30      # width reserved for "NAME[context]" before the dotted leader
-    _RESULT_W = 9     # right-aligned result field ("00 hits" / "RUNNING" / "23/47")
-    _BAR_W = 46       # progress-bar inner width
+    _LEADER_W = 22    # dotted-leader width (also the pulse-animation travel span)
 
     def _mmss(self, secs: float) -> str:
-        """Time for the bar/running rows: 'S.Ss' under a minute, zero-padded 'MM:SS' at/above
+        """Time for a finished row: 'S.Ss' under a minute, zero-padded 'MM:SS' at/above
         (e.g. 5.2s, 02:25), and 'H:MM:SS' past an hour."""
         secs = max(0.0, secs)
         if secs < 60:
@@ -511,63 +568,56 @@ class OsintProgress:
         m, s = divmod(rem, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-    def _progress_bar(self, done: int, total: int) -> "Text":
-        """[=====>....] filled with '=', a '>' arrowhead at the leading edge, '.' unfilled."""
-        total = max(total, 1)
-        filled = int(round(self._BAR_W * done / total))
-        filled = min(filled, self._BAR_W)
-        if filled <= 0:
-            inner = "." * self._BAR_W
-        elif filled >= self._BAR_W:
-            inner = "=" * self._BAR_W
-        else:
-            inner = ("=" * (filled - 1)) + ">" + ("." * (self._BAR_W - filled))
-        return Text.assemble(("[", ACCENT_DIM), (inner, ACCENT), ("]", ACCENT_DIM))
+    def _row(self, st: "_SourceState", name: str, now: float, sweep: float) -> "Text":
+        """One source row in the locked format: ``[icon] SOURCE_NAME ..leader.. result :: time``.
 
-    def _row(self, st: "_SourceState", name: str, now: float, frame: str,
-             pos: int = 0, total: int = 0) -> "Text":
-        """One source row: '[N/T] [icon] NAME ......... RESULT :: TIME' (name = display name).
-
-        *pos*/*total* prepend a right-aligned '[N/TOTAL]' position tag so the operator sees both
-        which source this is and where it sits in the overall run."""
-        # --- status icon + name/result/time by state ---
-        note = ""
-        show_time = True
-        if st.state == "running":
-            icon = Text("~", style="bold cyan")
+        The bracket icon reflects state — [ ] queued, [⠙] running (static glyph), [✔] done,
+        [✘] failed, [⚠] flagged, [○] skipped/no-key/not-installed. While RUNNING the dotted
+        leader animates a ·•●•· pulse sweeping left→right (driven by *sweep*, a 0..1 wall-clock
+        fraction); in every other state the leader is plain static dots. This single renderer is
+        used both for the LIVE board (every frame, all rows) and the STATIC end board (sweep=0)."""
+        state = st.state
+        flagged = getattr(st, "flagged", False)
+        # --- bracket icon + name colour + result cell ---
+        if state == "running":
+            icon = Text(_RUN_GLYPH, style="bold cyan")
             name_style = "bold white"
-            # LEAKSEARCH-style live counter, else "RUNNING".
-            if st.prog_total > 0:
-                result = Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
-            else:
-                result = Text("RUNNING", style="cyan")
-        elif st.state == "done":
-            icon = Text("✓", style="bold green")
-            name_style = "white"
-            result = Text(f"{min(st.items, 99):02d} hits", style="green")
-        elif st.state == "not_installed":
-            icon = Text("✘", style="bold orange1")
-            name_style = "orange1"
-            result = Text("not installed", style="bold orange1")
-            note = "run: kaalyx tools --install"
+            result = (Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
+                      if st.prog_total > 0 else Text("running", style="cyan"))
             show_time = False
-        elif st.state == "no_key":
-            icon = Text("○", style="yellow")          # skipped (missing key) — distinct from queued
+        elif flagged and state in ("done", "skipped", "no_key"):
+            # A flagged outcome (data-integrity concern / verified secret): ⚠ overrides the icon.
+            icon = Text("⚠", style="bold yellow")
             name_style = "yellow"
-            result = Text("no key", style="yellow")
-            note = _skip_note(st.note)
+            if state == "done":
+                result = Text(f"{st.items} hits", style="green")
+            else:
+                result = Text(_skip_note(st.note) or "skipped", style="yellow")
+            show_time = state == "done"
+        elif state == "done":
+            icon = Text("✔", style="bold green")
+            name_style = "white"
+            result = Text(f"{st.items} hits", style="green")
+            show_time = True
+        elif state == "not_installed":
+            icon = Text("○", style="grey50")
+            name_style = "grey50"
+            result = Text("not installed", style="bold orange1")
             show_time = False
-        elif st.state == "skipped":
-            icon = Text("○", style="yellow")          # ran the check, nothing to do — NOT queued
-            name_style = MUTED
-            result = Text("skipped", style="yellow")
-            note = _skip_note(st.note)
+        elif state == "no_key":
+            icon = Text("○", style="grey50")
+            name_style = "grey50"
+            result = Text(_skip_note(st.note) or "no key", style="yellow")
             show_time = False
-        elif st.state == "failed":
+        elif state == "skipped":
+            icon = Text("○", style="grey50")
+            name_style = "grey50"
+            result = Text(_skip_note(st.note) or "skipped", style="yellow")
+            show_time = False
+        elif state == "failed":
             icon = Text("✘", style="bold red")
             name_style = "red"
-            result = Text("FAILED", style="bold red")
-            note = st.note
+            result = Text("failed", style="bold red")
             show_time = False
         else:  # queued
             icon = Text(" ", style=MUTED)
@@ -575,93 +625,99 @@ class OsintProgress:
             result = Text("queued", style=MUTED)
             show_time = False
 
-        # Dotted leader: name, then dots to fill, then result. Compute visible widths.
-        name_txt = Text(name, style=name_style)
-        # dots between name and result (leave a space each side)
-        result_len = len(result.plain)
-        pad = max(1, self._NAME_W + self._RESULT_W - len(name) - result_len)
         line = Text("    ")                         # 4-space indent
-        if total:
-            # Right-align N within the width of TOTAL so the [N/T] column stays aligned.
-            w = len(str(total))
-            line.append(f"[{pos:>{w}}/{total}] ", style=MUTED)
         line.append("[", style=MUTED)
         line.append_text(icon)
         line.append("] ", style=MUTED)
-        line.append_text(name_txt)
-        line.append(" " + "." * pad + " ", style=MUTED)
+        line.append(f"{name:<{self._NAME_W}}", style=name_style)
+        line.append(" ")
+        # Dotted leader: pulse-animated while running, plain static dots otherwise.
+        if state == "running":
+            line.append_text(_pulse_leader(self._LEADER_W, sweep))
+        else:
+            line.append("." * self._LEADER_W, style=MUTED)
+        line.append(" ")
         line.append_text(result)
-        if show_time:
+        if show_time and st.started > 0:
             end = st.finished if st.finished > 0 else now
-            t = self._mmss(max(0.0, end - st.started)) if st.started > 0 else ""
             line.append(" :: ", style=MUTED)
-            line.append(f"{t:>5}", style="white" if st.state == "done" else "cyan")
-        elif note:
-            # Keep the row on ONE line — trim an over-long note so the board never wraps.
-            n = note if len(note) <= 40 else note[:39] + "…"
-            line.append("  ", style=MUTED)
-            line.append(n, style=MUTED)
-        return line
-
-    def _status_line(self):
-        """The ONE line the live board updates in place: progress bar + [done/total] + which
-        sources are currently running + elapsed. Always a single line, so it always fits on
-        screen and Live updates it in place without ever repainting a multi-row frame.
-
-        (The completed sources' rows are printed once as static lines by ``_print_static_row``;
-        they scroll through history and are not part of this live renderable.)"""
-        now = time.monotonic()
-        frame = _SPINNER_FRAMES[int((now * 12)) % len(_SPINNER_FRAMES)]
-        done = self._finished
-        total = self._total
-        running = [self._states[n] for n in self._states
-                   if self._states[n].state == "running"]
-        elapsed = now - self._start
-
-        line = Text("    ")
-        line.append_text(self._progress_bar(done, total))
-        line.append(f" {done}/{total} ", style="white")
-        line.append(":: ", style=MUTED)
-        line.append(self._mmss(elapsed), style="white")
-        if running:
-            # Name the active source(s); the spinner frame animates so a long-running one shows life.
-            names = ", ".join(_display_name(n, self._states[n].label)
-                              for n in self._states if self._states[n].state == "running")
-            line.append(f"  {frame} ", style="bold cyan")
-            line.append(names, style="cyan")
-        elif done >= total:
-            line.append("  done", style="bold green")
-        # CRITICAL: hard-truncate to the terminal width so the status line is ALWAYS exactly one
-        # physical line. If it wrapped to 2 lines, rich.Live's cursor-up count (based on 1 line)
-        # would be wrong and it would leave the previous frame behind — the "status line prints
-        # multiple times with different timestamps" bug. One line = one in-place update, always.
+            line.append(self._mmss(max(0.0, end - st.started)),
+                        style="white" if state == "done" else "cyan")
+        # CRITICAL: every row must be exactly ONE physical line. A row that wrapped to two lines
+        # would make the board's real line count exceed what Live rendered, and even in alt-screen
+        # a wrapped row misaligns the grid. Hard-truncate to the console width so no row ever
+        # wraps — the same one-line-per-row discipline that keeps the board's geometry exact.
         try:
             width = self._console.size.width
         except Exception:
             width = 80
-        line.truncate(max(10, width - 1), overflow="ellipsis")
+        line.truncate(max(20, width - 1), overflow="ellipsis")
         return line
+
+    def _board(self):
+        """The FULL live board renderable: category headers + every source row, re-rendered every
+        frame. Runs inside a rich.Live in the ALTERNATE SCREEN buffer (see :meth:`live`), which
+        owns the whole viewport and clips to the real terminal height — so a board taller than the
+        screen can never desync the cursor-up math that caused the historical reprint bug (there is
+        no scrollback to miscount against). The pulse sweep is derived from wall-clock time so all
+        running rows animate without per-row state."""
+        now = time.monotonic()
+        # One full sweep of the pulse every ~1.1s; sweep is a 0..1 fraction of that cycle.
+        sweep = (now * 0.9) % 1.0
+        done = self._finished
+        total = self._total
+        elapsed = now - self._start
+
+        parts: list = [
+            _section_header("SOURCE RESULTS",
+                            f"{done}/{total} · {self._mmss(elapsed)}"
+                            + (f" · {self._target}" if self._target else "")),
+            Text(""),
+        ]
+        # Group rows by category, in the canonical order; only show a category that has ≥1 source.
+        placed: set[str] = set()
+        for title, names in _SOURCE_CATEGORIES:
+            rows = [(n, self._states[n]) for n in names if n in self._states]
+            if not rows:
+                continue
+            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+            for n, st in rows:
+                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+                placed.add(n)
+            parts.append(Text(""))
+        leftover = [(n, st) for n, st in self._states.items() if n not in placed]
+        if leftover:
+            parts.append(Text("  OTHER", style=f"bold {ACCENT}"))
+            for n, st in leftover:
+                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+        while parts and isinstance(parts[-1], Text) and not parts[-1].plain:
+            parts.pop()
+        return Group(*parts)
 
     def _refresh(self) -> None:
         if self._live is not None:
             self._live.refresh()
 
     def live(self):
-        """Context manager yielding a ``rich.Live`` that manages ONLY the single status line
-        (``get_renderable=self._status_line``). Because that renderable is always one line, it
-        always fits on screen and Live updates it in place — it can never overflow the terminal,
-        so it can never fall into the 'repaint the whole frame every tick' failure mode. Every
-        source's full row is printed separately as a static line by ``_print_static_row`` and
-        scrolls through terminal history like any normal output.
+        """Context manager yielding a ``rich.Live`` that renders the FULL grouped board live, in
+        the ALTERNATE SCREEN buffer (``screen=True``).
 
-        redirect_stdout/stderr + the _LiveWithQuietTerminal guard remain, but they now only have
-        to protect a one-line frame, which is trivially robust."""
+        Why alt-screen is the safe home for a tall, continuously-animating board: the historical
+        reprint/duplicate-frame bug came from rich moving the cursor UP by the previous frame's
+        line count to repaint — which miscounts once the frame is taller than the viewport and the
+        terminal scrolls. In the alternate screen buffer there IS no scrollback: Live owns the
+        whole viewport, clips the board to the real terminal height, and repaints in place, so that
+        cursor-up miscount is structurally impossible no matter how many rows animate at once. The
+        cost (accepted by design): the board is wiped when we leave alt-screen at scan end, so the
+        stage reprints a static final board into normal scrollback for the permanent record, and
+        rows past the terminal height are off-screen during the scan."""
         from rich.live import Live
 
         live = Live(
-            get_renderable=self._status_line,
+            get_renderable=self._board,
             console=self._console,
-            refresh_per_second=8,
+            screen=True,               # alternate screen buffer — the safety guarantee
+            refresh_per_second=12,     # smooth pulse without excess repaint
             auto_refresh=True,
             transient=False,
             redirect_stdout=True,
@@ -742,22 +798,22 @@ def grouped_source_board(results: list, flagged_sources: set[str] | None = None)
     def _emit_row(r) -> None:
         name = _display_name(r.name, r.name)
         flagged = r.name in flagged_sources
-        icon = Text("⚠", style="bold yellow") if flagged else _plain_status_icon(r)
-        # Name style: dim for skipped, red for failed, yellow when flagged, else white.
+        # Bracketed status icon matching the live board: [✔] done, [✘] failed, [⚠] flagged,
+        # [○] skipped/no-key. The ⚠ overrides the normal outcome icon.
         if flagged:
-            name_style = "yellow"
+            icon, icon_style, name_style = "⚠", "bold yellow", "yellow"
         elif not r.ok:
-            name_style = "red"
+            icon, icon_style, name_style = "✘", "bold red", "red"
         elif r.skipped:
-            name_style = "grey50"
+            icon, icon_style, name_style = "○", "grey50", "grey50"
         else:
-            name_style = "white"
+            icon, icon_style, name_style = "✔", "bold green", "white"
         line = Text("    ")
-        line.append_text(icon)
-        line.append(" ")
-        line.append(f"{name:<28}", style=name_style)
-        pad = max(1, 30 - len(name))
-        line.append(" " + "." * pad + " ", style=MUTED)
+        line.append("[", style=MUTED)
+        line.append(icon, style=icon_style)
+        line.append("] ", style=MUTED)
+        line.append(f"{name:<30}", style=name_style)
+        line.append(" " + "." * 22 + " ", style=MUTED)
         # Result cell: green hit COUNT (0 stays green — a valid clean result), yellow skip state,
         # red failed.
         if not r.ok:
@@ -770,6 +826,12 @@ def grouped_source_board(results: list, flagged_sources: set[str] | None = None)
         if note:
             n = note if len(note) <= 34 else note[:33] + "…"
             line.append(f"  {n}", style=MUTED)
+        # Keep each row to one physical line so the static board stays a clean grid at any width.
+        try:
+            width = get_console().size.width
+        except Exception:
+            width = 80
+        line.truncate(max(20, width - 1), overflow="ellipsis")
         lines.append(line)
 
     for title, names in _SOURCE_CATEGORIES:

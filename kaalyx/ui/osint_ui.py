@@ -72,6 +72,140 @@ class _QuietTerminal:
         return False
 
 
+class _ScrollInput:
+    """Read mouse-wheel and keyboard scroll events from the terminal while the alt-screen board is
+    up, and drive a scroll callback with them. POSIX-only (needs ``termios`` raw stdin); a no-op on
+    Windows or when stdin isn't a tty, so the board still runs, just without manual scroll.
+
+    Terminal features it turns on and relies on (test these on your terminal):
+      * MOUSE TRACKING — emits ``ESC[?1000h`` (button events) + ``ESC[?1006h`` (SGR extended
+        coordinates). The terminal must then send ``ESC[<64;x;yM`` on wheel-up and
+        ``ESC[<65;x;yM`` on wheel-down. Disabled again on exit (``ESC[?1000l`` / ``ESC[?1006l``).
+      * RAW KEY INPUT — stdin is already in cbreak mode (no ECHO/ICANON) via _QuietTerminal, so
+        single keypresses arrive immediately: PgUp ``ESC[5~`` / PgDn ``ESC[6~`` / Up ``ESC[A`` /
+        Down ``ESC[B`` / Home ``ESC[H`` / End ``ESC[F`` / ``g`` / ``G``.
+    Over SSH the local terminal must support mouse reporting; in tmux/screen it needs
+    ``set -g mouse on``. If mouse reporting is unavailable, the keyboard keys still scroll."""
+
+    def __init__(self, on_scroll) -> None:
+        # on_scroll(delta:int|None, absolute:int|None) — delta lines (±) or an absolute offset.
+        self._on_scroll = on_scroll
+        self._fd = None
+        self._thread = None
+        self._stop = False
+        self._term_stream = None   # where to write the enable/disable escape sequences
+
+    def start(self, term_stream) -> None:
+        # POSIX-only: raw stdin + terminal escapes. Bail on Windows or a non-tty.
+        if sys.platform == "win32" or not sys.stdin.isatty():
+            return
+        try:
+            import termios  # noqa: F401 — confirm the raw-tty stack is available
+            termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            return
+        try:
+            self._fd = sys.stdin.fileno()
+        except Exception:
+            self._fd = None
+            return
+        self._term_stream = term_stream
+        # Enable mouse tracking (button + SGR extended). Written to the real terminal stream.
+        self._write("\033[?1000h\033[?1006h")
+        import threading
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _write(self, s: str) -> None:
+        try:
+            stream = self._term_stream if self._term_stream is not None else sys.__stdout__
+            stream.write(s)
+            stream.flush()
+        except Exception:
+            pass
+
+    def _loop(self) -> None:
+        import os
+        import select
+        buf = b""
+        while not self._stop:
+            try:
+                r, _, _ = select.select([self._fd], [], [], 0.2)
+            except Exception:
+                break
+            if not r:
+                continue
+            try:
+                chunk = os.read(self._fd, 256)
+            except Exception:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            buf = self._consume(buf)
+
+    def _consume(self, buf: bytes) -> bytes:
+        """Parse whatever complete input sequences are in *buf*, act on them, return the remainder.
+        Recognises SGR mouse wheel reports and the scroll keys; unknown bytes are dropped."""
+        while buf:
+            # SGR mouse: ESC [ < b ; x ; y (M|m). Wheel-up b=64, wheel-down b=65.
+            if buf.startswith(b"\033[<"):
+                end = None
+                for i, ch in enumerate(buf):
+                    if ch in (ord("M"), ord("m")):
+                        end = i
+                        break
+                if end is None:
+                    return buf  # incomplete — wait for more bytes
+                try:
+                    body = buf[3:end].decode("ascii", "ignore")
+                    b = int(body.split(";")[0])
+                    if b == 64:
+                        self._on_scroll(-3, None)   # wheel up → scroll up 3 lines
+                    elif b == 65:
+                        self._on_scroll(3, None)    # wheel down → scroll down 3 lines
+                except Exception:
+                    pass
+                buf = buf[end + 1:]
+                continue
+            # Scroll keys (escape sequences).
+            for seq, (delta, absolute) in _SCROLL_KEYS.items():
+                if buf.startswith(seq):
+                    self._on_scroll(delta, absolute)
+                    buf = buf[len(seq):]
+                    break
+            else:
+                # Single-char keys g/G, or an unrecognised byte we drop to stay in sync.
+                c = buf[:1]
+                if c == b"g":
+                    self._on_scroll(None, 0)
+                elif c == b"G":
+                    self._on_scroll(None, 10 ** 9)   # clamp to bottom
+                buf = buf[1:]
+        return buf
+
+    def stop(self) -> None:
+        self._stop = True
+        # Disable mouse tracking so the terminal doesn't keep emitting reports afterwards.
+        self._write("\033[?1000l\033[?1006l")
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+
+# Scroll key escape sequences → (delta lines, absolute offset). PAGE keys use a big page step
+# that scroll() clamps to the real viewport height via max_off.
+_SCROLL_KEYS: dict[bytes, tuple] = {
+    b"\033[5~": (-1000, None),   # PgUp  (big up; clamped)
+    b"\033[6~": (1000, None),    # PgDn  (big down; clamped)
+    b"\033[A":  (-1, None),      # Up
+    b"\033[B":  (1, None),       # Down
+    b"\033[H":  (None, 0),       # Home → top
+    b"\033[F":  (None, 10 ** 9), # End  → bottom (clamped)
+    b"\033[1~": (None, 0),       # Home (alt)
+    b"\033[4~": (None, 10 ** 9), # End  (alt)
+}
+
+
 class _FdCapture:
     """Capture EVERYTHING written to the real stdout/stderr file descriptors (1 and 2) for the
     duration, so no write from ANY source can corrupt an in-place ``rich.Live`` board.
@@ -213,10 +347,11 @@ class _LiveWithQuietTerminal:
     below the old one. On SIGWINCH we clear the LiveRender's cached shape and force a refresh,
     so the next frame is drawn cleanly at the current size instead of over a miscounted one."""
 
-    def __init__(self, live) -> None:
+    def __init__(self, live, scroll_input=None) -> None:
         self._live = live
         self._quiet = _QuietTerminal()
         self._fdcap = _FdCapture()
+        self._scroll = scroll_input   # optional _ScrollInput for manual mouse/key scrolling
         self._prev_winch = None
         self._orig_console_file = None
 
@@ -256,9 +391,23 @@ class _LiveWithQuietTerminal:
                 signal.signal(signal.SIGWINCH, self._on_resize)
         except Exception:
             self._prev_winch = None
+        # Start manual-scroll input AFTER entering the alt-screen, so mouse-enable escapes and the
+        # reports they trigger belong to the alt buffer. Write escapes to the real terminal stream.
+        if self._scroll is not None:
+            try:
+                self._scroll.start(self._fdcap.terminal_stream)
+            except Exception:
+                pass
         return result
 
     def __exit__(self, *exc):
+        # Stop scroll input FIRST (disables mouse tracking) while the alt-screen is still up, so the
+        # disable escapes reach it before we tear down.
+        if self._scroll is not None:
+            try:
+                self._scroll.stop()
+            except Exception:
+                pass
         try:
             if self._prev_winch is not None:
                 import signal
@@ -328,39 +477,54 @@ def print_banner(domain: str, source_count: int) -> None:
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # Static running-marker glyph shown inside the bracket ([⠙]) while a source runs. It does NOT
-# animate — the motion lives in the dotted leader's pulse (see _pulse_leader). A fixed glyph keeps
-# the bracket column stable so only the leader appears to move.
-_RUN_GLYPH = "⠙"
+# CYCLING ASCII spinner shown inside the bracket ([|] [/] [-] [\]) while a source runs. ASCII (not
+# braille) so it renders identically on every terminal — a real Kali test showed the old braille
+# ⠙ glyph rendering as a stray quote mark. The frame is chosen from wall-clock time so it cycles.
+_SPINNER_ASCII = "|/-\\"
 
-# The pulse cluster that sweeps the dotted leader while a source runs: small→large→small.
+# The pulse cluster that sweeps the dotted leader while a source runs: small→large→small. Each
+# glyph gets its own bright colour (see _PULSE_STYLES) so the moving cluster is unmistakable
+# against the dim static dots.
 _PULSE = "·•●•·"
+_PULSE_STYLES = {
+    "●": "bold magenta",   # the bright core — most eye-catching
+    "•": "bold cyan",
+    "·": "cyan",
+}
+_DOT_STYLE = "grey35"      # dim grey static dots, for strong contrast with the pulse
+
+
+def _spinner_frame(now: float) -> str:
+    """The current ASCII spinner glyph, cycling ~8 frames/sec off wall-clock time."""
+    return _SPINNER_ASCII[int(now * 8) % len(_SPINNER_ASCII)]
 
 
 def _pulse_leader(width: int, sweep: float) -> "Text":
     """A dotted leader of *width* chars that animates a small→large→small pulse cluster
-    (``·•●•·``) travelling left→right and looping, against a background of static ``.`` dots.
+    (``·•●•·``) travelling left→right and looping, against a background of DIM static ``.`` dots.
     *sweep* is a 0..1 fraction of the cycle (derived from wall-clock time by the caller) so the
-    animation is stateless. Returns a styled Text: the static dots are muted, the pulse is cyan
-    so the moving cluster reads clearly."""
+    animation is stateless. Each pulse glyph is styled its own bright colour (``●`` bold magenta,
+    ``•`` bold cyan, ``·`` cyan) so the moving cluster stands out sharply; the static dots are dim
+    grey."""
     width = max(1, width)
     n = len(_PULSE)
     # Travel the cluster's leading edge from -n (just off the left) to width (just off the right),
     # so it enters and exits smoothly rather than popping. Position may be partially off-screen.
     start = int(round(sweep * (width + n))) - n
     chars: list[str] = ["."] * width
-    styles: list[bool] = [False] * width  # True = pulse (cyan), False = static dot (muted)
     for i, ch in enumerate(_PULSE):
         col = start + i
         if 0 <= col < width:
             chars[col] = ch
-            styles[col] = True
     out = Text()
-    # Coalesce runs of same style into as few spans as possible (cheap; keeps the frame light).
+    # Per-char styling: a static dot is dim; a pulse glyph gets its own bright colour. Coalesce
+    # only consecutive same-style runs so the frame stays light.
+    def style_of(c: str) -> str:
+        return _DOT_STYLE if c == "." else _PULSE_STYLES.get(c, "bold cyan")
     run_start = 0
     for i in range(1, width + 1):
-        if i == width or styles[i] != styles[run_start]:
-            seg = "".join(chars[run_start:i])
-            out.append(seg, style="cyan" if styles[run_start] else MUTED)
+        if i == width or style_of(chars[i]) != style_of(chars[run_start]):
+            out.append("".join(chars[run_start:i]), style=style_of(chars[run_start]))
             run_start = i
     return out
 
@@ -485,6 +649,12 @@ class OsintProgress:
         self._start = time.monotonic()
         self._total = len(self._states)
         self._finished = 0          # how many sources have completed (drives [N/total])
+        # Manual-scroll viewport state (the board is taller than the screen): _scroll_off is the
+        # index of the first BOARD LINE shown; _follow keeps the window tracking the running rows
+        # until the user scrolls, at which point they take control (see scroll()/_board).
+        self._scroll_off = 0
+        self._follow = True
+        self._interrupted = False   # set on Ctrl+C so _board can show a clean interrupted header
 
     def set_progress(self, name: str, done: int, total: int) -> None:
         """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Only the
@@ -571,16 +741,16 @@ class OsintProgress:
     def _row(self, st: "_SourceState", name: str, now: float, sweep: float) -> "Text":
         """One source row in the locked format: ``[icon] SOURCE_NAME ..leader.. result :: time``.
 
-        The bracket icon reflects state — [ ] queued, [⠙] running (static glyph), [✔] done,
-        [✘] failed, [⚠] flagged, [○] skipped/no-key/not-installed. While RUNNING the dotted
-        leader animates a ·•●•· pulse sweeping left→right (driven by *sweep*, a 0..1 wall-clock
-        fraction); in every other state the leader is plain static dots. This single renderer is
-        used both for the LIVE board (every frame, all rows) and the STATIC end board (sweep=0)."""
+        The bracket icon reflects state — [ ] queued, [|/-\\] running (CYCLING ASCII spinner),
+        [✔] done, [✘] failed, [⚠] flagged, [○] skipped/no-key/not-installed. While RUNNING the
+        dotted leader also animates a ·•●•· pulse sweeping left→right (driven by *sweep*, a 0..1
+        wall-clock fraction); in every other state the leader is plain static dots. This single
+        renderer is used both for the LIVE board (every frame) and the STATIC end board (sweep=0)."""
         state = st.state
         flagged = getattr(st, "flagged", False)
         # --- bracket icon + name colour + result cell ---
         if state == "running":
-            icon = Text(_RUN_GLYPH, style="bold cyan")
+            icon = Text(_spinner_frame(now), style="bold cyan")   # cycles per frame off wall-clock
             name_style = "bold white"
             result = (Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
                       if st.prog_total > 0 else Text("running", style="cyan"))
@@ -654,63 +824,146 @@ class OsintProgress:
         line.truncate(max(20, width - 1), overflow="ellipsis")
         return line
 
-    def _board(self):
-        """The FULL live board renderable: category headers + every source row, re-rendered every
-        frame. Runs inside a rich.Live in the ALTERNATE SCREEN buffer (see :meth:`live`), which
-        owns the whole viewport and clips to the real terminal height — so a board taller than the
-        screen can never desync the cursor-up math that caused the historical reprint bug (there is
-        no scrollback to miscount against). The pulse sweep is derived from wall-clock time so all
-        running rows animate without per-row state."""
-        now = time.monotonic()
-        # One full sweep of the pulse every ~1.1s; sweep is a 0..1 fraction of that cycle.
-        sweep = (now * 0.9) % 1.0
-        done = self._finished
-        total = self._total
-        elapsed = now - self._start
-
-        parts: list = [
-            _section_header("SOURCE RESULTS",
-                            f"{done}/{total} · {self._mmss(elapsed)}"
-                            + (f" · {self._target}" if self._target else "")),
-            Text(""),
-        ]
-        # Group rows by category, in the canonical order; only show a category that has ≥1 source.
+    def _body_lines(self, now: float, sweep: float) -> list:
+        """Build the FULL list of board body lines (category headers + every source row), in
+        canonical order. This is the complete board; :meth:`_board` renders a scrolled WINDOW of
+        it. Also records, per body-line index, whether that line is a running row (used to keep the
+        running rows in view while auto-following)."""
+        lines: list = []
+        self._running_line_idxs: list[int] = []
         placed: set[str] = set()
+
+        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
+            lines.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+            for n, st in rows:
+                if st.state == "running":
+                    self._running_line_idxs.append(len(lines))
+                lines.append(self._row(st, _display_name(n, st.label), now, sweep))
+                placed.add(n)
+            lines.append(Text(""))
+
         for title, names in _SOURCE_CATEGORIES:
             rows = [(n, self._states[n]) for n in names if n in self._states]
-            if not rows:
-                continue
-            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-            for n, st in rows:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-                placed.add(n)
-            parts.append(Text(""))
+            if rows:
+                emit_group(title, rows)
         leftover = [(n, st) for n, st in self._states.items() if n not in placed]
         if leftover:
-            parts.append(Text("  OTHER", style=f"bold {ACCENT}"))
-            for n, st in leftover:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-        while parts and isinstance(parts[-1], Text) and not parts[-1].plain:
-            parts.pop()
+            emit_group("OTHER", leftover)
+        while lines and isinstance(lines[-1], Text) and not lines[-1].plain:
+            lines.pop()
+        return lines
+
+    def _viewport_height(self) -> int:
+        """How many BODY lines fit in the scroll window: terminal height minus the header (2
+        lines) and footer (2 lines). Falls back sanely when the size is unknown."""
+        try:
+            h = self._console.size.height
+        except Exception:
+            h = 30
+        return max(4, h - 4)
+
+    def scroll(self, delta: int | None, absolute: int | None = None) -> None:
+        """Move the scroll window by *delta* body lines (negative = up), or jump to *absolute*.
+        Any manual scroll turns AUTO-FOLLOW off so the user's view stays where they put it;
+        scrolling to the very bottom re-arms follow. Called from the input reader thread."""
+        total_lines = len(getattr(self, "_last_body_lines", []) or [])
+        vh = self._viewport_height()
+        max_off = max(0, total_lines - vh)
+        if absolute is not None:
+            self._scroll_off = max(0, min(absolute, max_off))
+        elif delta is not None:
+            self._scroll_off = max(0, min(self._scroll_off + delta, max_off))
+        else:
+            return
+        # Manual control unless we're pinned to the bottom (then keep following new rows).
+        self._follow = self._scroll_off >= max_off
+        self._refresh()
+
+    def set_interrupted(self) -> None:
+        """Mark the board interrupted (Ctrl+C) so its header shows a clean interrupted line for the
+        final rendered frame before we leave the alt-screen."""
+        self._interrupted = True
+        self._refresh()
+
+    def _board(self):
+        """The live board renderable: a SCROLLED WINDOW into the full grouped board, with a header
+        (progress + scroll position) and a footer (key hints + above/below counts). Rendered inside
+        a rich.Live in the ALTERNATE SCREEN buffer (see :meth:`live`): Live owns the whole viewport
+        and clips to the real terminal height, so a board taller than the screen can never desync
+        the cursor-up math behind the historical reprint bug (no scrollback to miscount against).
+        The user scrolls the window freely with the mouse wheel / PgUp-PgDn / arrows while the scan
+        keeps running; auto-follow keeps the running rows in view until they scroll (see scroll())."""
+        now = time.monotonic()
+        sweep = (now * 0.9) % 1.0                      # 0..1 pulse cycle from wall-clock
+        body = self._body_lines(now, sweep)
+        self._last_body_lines = body                   # scroll() reads its length for clamping
+        vh = self._viewport_height()
+        total_lines = len(body)
+        max_off = max(0, total_lines - vh)
+
+        # Auto-follow: keep the LAST running row in view (near the bottom of the window) so newly
+        # started sources scroll into sight; if nothing is running, pin to the bottom.
+        if self._follow:
+            run_idxs = getattr(self, "_running_line_idxs", [])
+            if run_idxs:
+                target = max(0, run_idxs[-1] - vh + 2)  # last running row ~2 lines from the bottom
+                self._scroll_off = min(target, max_off)
+            else:
+                self._scroll_off = max_off
+        self._scroll_off = max(0, min(self._scroll_off, max_off))
+
+        window = body[self._scroll_off:self._scroll_off + vh]
+        above = self._scroll_off
+        below = max(0, total_lines - (self._scroll_off + vh))
+
+        done, total = self._finished, self._total
+        elapsed = now - self._start
+        if self._interrupted:
+            header = Text.assemble(
+                ("[◆] ", "bold orange1"), ("INTERRUPTED", "bold red"),
+                (f" :: {done}/{total} complete · checkpointed · {self._mmss(elapsed)}", MUTED))
+        else:
+            header = _section_header(
+                "SOURCE RESULTS",
+                f"{done}/{total} · {self._mmss(elapsed)}"
+                + (f" · {self._target}" if self._target else "")
+                + (f"   ▲{above}" if above else ""))
+        follow_tag = "follow:on" if self._follow else "follow:off"
+        footer = Text.assemble(
+            ("    ↑/↓ PgUp/PgDn wheel scroll · g/G top/bottom", MUTED),
+            (f"   ▼{below} below" if below else "   (end)", MUTED),
+            (f"   [{follow_tag}]", "cyan" if self._follow else "yellow"))
+
+        parts: list = [header, Text("")]
+        parts.extend(window)
+        parts.append(Text(""))
+        parts.append(footer)
         return Group(*parts)
 
     def _refresh(self) -> None:
         if self._live is not None:
-            self._live.refresh()
+            try:
+                self._live.refresh()
+            except Exception:
+                pass
 
     def live(self):
         """Context manager yielding a ``rich.Live`` that renders the FULL grouped board live, in
-        the ALTERNATE SCREEN buffer (``screen=True``).
+        the ALTERNATE SCREEN buffer (``screen=True``), showing a SCROLLABLE window into the full
+        board.
 
         Why alt-screen is the safe home for a tall, continuously-animating board: the historical
         reprint/duplicate-frame bug came from rich moving the cursor UP by the previous frame's
         line count to repaint — which miscounts once the frame is taller than the viewport and the
         terminal scrolls. In the alternate screen buffer there IS no scrollback: Live owns the
         whole viewport, clips the board to the real terminal height, and repaints in place, so that
-        cursor-up miscount is structurally impossible no matter how many rows animate at once. The
-        cost (accepted by design): the board is wiped when we leave alt-screen at scan end, so the
-        stage reprints a static final board into normal scrollback for the permanent record, and
-        rows past the terminal height are off-screen during the scan."""
+        cursor-up miscount is structurally impossible no matter how many rows animate at once.
+
+        Because the alt-screen has no native scrollback, we provide MANUAL scrolling via
+        :class:`_ScrollInput` (mouse wheel / PgUp-PgDn / arrows / g / G), so the user can look at
+        any part of the 35-row board while the scan runs (see :meth:`_board` / :meth:`scroll`). The
+        board is wiped when we leave alt-screen at scan end, so the stage reprints a static final
+        board into normal scrollback for the permanent record."""
         from rich.live import Live
 
         live = Live(
@@ -724,7 +977,8 @@ class OsintProgress:
             redirect_stderr=True,
         )
         self._live = live
-        return _LiveWithQuietTerminal(live)
+        scroll_input = _ScrollInput(self.scroll)
+        return _LiveWithQuietTerminal(live, scroll_input=scroll_input)
 
 
 # --- Result tables ----------------------------------------------------------------------

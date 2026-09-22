@@ -36,6 +36,7 @@ Credential/leak coverage (post-harvest chaining):
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -192,24 +193,44 @@ class OsintStage(Stage):
             if event == "finish" and result is not None:
                 self._flush_source(result)
 
+        interrupted = False
+        results = []
         try:
             with progress.live():
-                results = await run_sources(sources, _hook)
-                # Breach lookup + LeakSearch run AFTER harvesting (they consume harvested
-                # emails), but INSIDE the board so their rows update live in place.
-                if ctx.config.osint.breach_lookup:
-                    _hook("start", "breach_lookup", None)
-                    await self._enrich_breaches(results)
-                    _hook("finish", "breach_lookup",
-                          self._result_for("breach_lookup", results))
-                if ctx.config.osint.leak_search:
-                    _hook("start", "leak_search", None)
-                    await self._run_leak_search(results)
-                    _hook("finish", "leak_search",
-                          self._result_for("leak_search", results))
+                try:
+                    results = await run_sources(sources, _hook)
+                    # Breach lookup + LeakSearch run AFTER harvesting (they consume harvested
+                    # emails), but INSIDE the board so their rows update live in place.
+                    if ctx.config.osint.breach_lookup:
+                        _hook("start", "breach_lookup", None)
+                        await self._enrich_breaches(results)
+                        _hook("finish", "breach_lookup",
+                              self._result_for("breach_lookup", results))
+                    if ctx.config.osint.leak_search:
+                        _hook("start", "leak_search", None)
+                        await self._run_leak_search(results)
+                        _hook("finish", "leak_search",
+                              self._result_for("leak_search", results))
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # Ctrl+C: mark the board interrupted so its FINAL alt-screen frame reads
+                    # "INTERRUPTED :: N/total complete · checkpointed" instead of just vanishing,
+                    # hold it a beat so the user sees it, then leave the board cleanly. We do NOT
+                    # re-raise: we persist what completed and return normally, so the interrupt
+                    # produces a clean summary instead of an unwound stack + raw log dump.
+                    interrupted = True
+                    progress.set_interrupted()
+                    await asyncio.sleep(0.4)
         finally:
             set_console_logging(True)
             self._progress = None
+
+        if interrupted:
+            # ONE clean line to normal scrollback (no raw INFO/WARNING dump), then persist what
+            # completed so `kaalyx resume` can pick up.
+            done = sum(1 for r in results if r.ok or r.skipped)
+            osint_ui.get_console().print(
+                f"\n[bold yellow]Interrupted[/] — {done}/{len(sources)} sources complete, "
+                "checkpointed. Resume with [cyan]kaalyx resume[/].")
 
         return self._persist(results)
 

@@ -252,15 +252,28 @@ class Orchestrator:
     def _print_summary(
         self, scan_id: int, results: list[StageResult], counts: dict[str, int]
     ) -> None:
-        """Cross-stage scan summary, in the SAME borderless hacky/cybersec idiom as the OSINT
-        results (no boxed tables — one consistent style tool-wide)."""
+        """Whole-scan (cross-stage) summary, in the borderless hacky/cybersec idiom.
+
+        DELIBERATELY SUPPRESSED when only ONE stage actually ran: that stage already printed its
+        own richer completion panel (e.g. ``KAALYX::OSINT COMPLETE``), so a near-identical
+        per-scan block right after it reads as accidental duplicate output. It prints only for a
+        MULTI-stage run, where a per-stage panel + a whole-scan roll-up are genuinely different
+        views: this block is a STAGE-BY-STAGE table (each stage's status/items/time) + grand
+        TOTALS across the whole pipeline — structurally distinct from any single stage's panel,
+        so the two never look like a duplicate.
+        """
         from rich.text import Text
+
+        ran = [r for r in results if not r.skipped]
+        if len(ran) <= 1:
+            return  # one stage → its own COMPLETE panel is the single summary; don't duplicate.
 
         self.console.print()
         self.console.print(Text.assemble(
-            ("[◆] ", "bold orange1"), (f"KAALYX::SCAN #{scan_id}", "bold orange1"),
-            (f" :: {self.target.domain}", "grey50")))
+            ("[◆] ", "bold orange1"), (f"KAALYX::SCAN #{scan_id} COMPLETE", "bold orange1"),
+            (f" :: {self.target.domain} · {len(ran)} stages", "grey50")))
         self.console.print()
+        self.console.print(Text("    STAGES", style="bold bright_cyan"))
         # Per-stage roll-up: [status] STAGE ... items :: time
         for r in results:
             if r.skipped:
@@ -270,7 +283,7 @@ class Orchestrator:
             else:
                 marker, mstyle, status = "✘", "bold red", "failed"
             items = ", ".join(f"{k}={v}" for k, v in r.counts.items()) or "-"
-            line = Text("    ")
+            line = Text("      ")
             line.append(f"[{marker}] ", style=mstyle)
             line.append(f"{r.stage.upper():<12}", style="cyan")
             line.append(f"{status:<8}", style=mstyle)
@@ -282,15 +295,16 @@ class Orchestrator:
         self.console.print(Text("    TOTALS", style="bold bright_cyan"))
         for key in ("subdomains", "hosts", "web_urls", "findings", "osint"):
             row = Text("      ")
-            row.append(f"{key.upper():<12}", style="cyan")
+            row.append(f"{key.upper():<15}", style="cyan")
             # 0 stays GREEN — a clean zero-count is a valid outcome, not a failure.
             row.append(str(counts.get(key, 0)), style="green")
             self.console.print(row)
         for sev in ("critical", "high", "medium", "low", "info"):
             n = counts.get(f"sev_{sev}", 0)
             if n:
+                # ``:<15`` (label ≤13 chars) guarantees a gap before the count — no 'INFO2' run-on.
                 self.console.print(Text.assemble(
-                    ("      ", ""), (f"{('findings.'+sev).upper():<13}", "cyan"), (str(n), "yellow")))
+                    ("      ", ""), (f"{('findings.'+sev).upper():<15}", "cyan"), (str(n), "yellow")))
         self.console.print()
 
     def close(self) -> None:

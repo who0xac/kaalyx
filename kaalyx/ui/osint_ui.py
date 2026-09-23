@@ -704,15 +704,15 @@ class OsintProgress:
 
     def _board(self):
         """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the top, then EVERY source (done, running AND queued) as a row under its OWN category
-        header, in canonical category order, with a BLANK LINE before each category block so
-        sections never run together. Running rows animate the green pulse inline; done/queued rows
-        are static. There is NO separate flat 'running sources' bucket — a running source appears
-        as its own animated row under its category, next to its completed siblings.
+        at the top, then every source under its OWN category header (canonical order, blank line
+        between blocks). Running rows animate the green pulse inline; done/queued rows are static.
 
-        This is a single in-place frame (screen=False): rich redraws it each refresh, which is what
-        lets running rows animate. The accepted tradeoff is that an in-place frame cannot be
-        natively scrolled and crops when taller than the terminal."""
+        HEIGHT-FIT (only kicks in when the full board would exceed the terminal height — on a tall
+        terminal the board is unchanged): compact ONLY categories that are 100% DONE to a one-line
+        summary (e.g. "✔ INFRASTRUCTURE & DNS  6/6 done"). Any category that has a running OR queued
+        source keeps its FULL per-source detail and animation — active work is never compacted. This
+        keeps the same single animated in-place frame (no reprint spam) and data-driven grouping
+        (no mis-grouping); it only compacts finished categories to make room."""
         now = time.monotonic()
         sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
         done, total = self._finished, self._total
@@ -729,27 +729,67 @@ class OsintProgress:
                 (f" :: {done}/{total} done · {self._mmss(elapsed)}"
                  + (f" · {self._target}" if self._target else "")
                  + (f" · {n_running} running" if n_running else ""), MUTED))
-        parts: list = [header]
 
-        # Every source under its OWN category header, in canonical order, with a BLANK LINE before
-        # each category block. done / running / queued all sit together under their header; a
-        # running row animates the pulse via self._row (state == 'running').
+        # Gather categories present, in canonical order, each with its rows.
+        groups: list[tuple[str, list[tuple[str, "_SourceState"]]]] = []
         placed: set[str] = set()
-
-        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
-            parts.append(Text(""))                       # blank line BEFORE each category header
-            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-            for n, st in rows:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-
         for title, names in _SOURCE_CATEGORIES:
             rows = [(n, self._states[n]) for n in names if n in self._states]
             if rows:
-                emit_group(title, rows)
+                groups.append((title, rows))
                 placed.update(n for n, _ in rows)
         leftover = [(n, st) for n, st in self._states.items() if n not in placed]
         if leftover:
-            emit_group("OTHER", leftover)
+            groups.append(("OTHER", leftover))
+
+        def is_fully_done(rows) -> bool:
+            # A category is compactable ONLY if it has NO running and NO queued source.
+            return all(st.state not in ("running", "queued") for _, st in rows)
+
+        # Line cost with a given set of compacted category indices. A compacted (done) category is
+        # a single summary line with NO leading blank (done summaries stack tightly to reclaim space
+        # for active detail); an expanded category is blank(1) + title(1) + N rows.
+        def cost(compacted: set) -> int:
+            t = 1                                        # header
+            for i, (_, rows) in enumerate(groups):
+                t += 1 if i in compacted else (2 + len(rows))
+            return t
+
+        try:
+            avail = self._console.size.height - 1        # 1 line of slack so rich never crops
+        except Exception:
+            avail = 40
+        avail = max(4, avail)
+
+        # Only compact when the FULL board would overflow. Compact 100%-done categories, top-down
+        # (oldest-finished first), stopping as soon as it fits — so the fewest categories collapse.
+        compacted: set = set()
+        if cost(compacted) > avail:
+            for i, (_, rows) in enumerate(groups):
+                if cost(compacted) <= avail:
+                    break
+                if is_fully_done(rows):
+                    compacted.add(i)
+        # Active categories (running/queued) are deliberately NEVER compacted — per the rule. If even
+        # all-done-compacted still overflows (a terminal shorter than the active rows alone), the
+        # active rows are what would clip; keeping active per-source detail visible is the point.
+
+        parts: list = [header]
+        for i, (title, rows) in enumerate(groups):
+            if i in compacted:
+                # Tight one-line summary for a finished category (no leading blank line).
+                flags = sum(1 for _, st in rows if getattr(st, "flagged", False))
+                summary = Text("  ")
+                summary.append("✔ ", style="bold green")
+                summary.append(f"{title}", style=f"bold {ACCENT}")
+                summary.append(f"  {len(rows)}/{len(rows)} done"
+                               + (f" · {flags} flagged" if flags else ""), style=MUTED)
+                parts.append(summary)
+            else:
+                parts.append(Text(""))                   # blank line BEFORE each expanded block
+                parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+                for n, st in rows:
+                    parts.append(self._row(st, _display_name(n, st.label), now, sweep))
         return Group(*parts)
 
     def _refresh(self) -> None:

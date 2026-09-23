@@ -201,10 +201,13 @@ class Orchestrator:
                     await self.notifier.progress(
                         self.target.domain, f"{stage.name} complete", result.counts
                     )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # An interrupted stage propagates here; it was NOT marked complete (we only checkpoint
+            # a stage that returned ok+not-skipped), so it stays resumable. Do not re-raise — mark
+            # the scan aborted, checkpoint, and return cleanly so the CLI shows a tidy message
+            # rather than an unwound stack + raw log dump.
             overall_status = "aborted"
-            logger.warning("Scan cancelled — state checkpointed for resume.")
-            raise
+            logger.warning("Scan interrupted — state checkpointed; resume with `kaalyx resume`.")
         except Exception as exc:  # pragma: no cover - defensive
             overall_status = "failed"
             logger.exception("Scan aborted by unexpected error: %s", exc)

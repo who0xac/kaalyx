@@ -193,7 +193,7 @@ class OsintStage(Stage):
             if event == "finish" and result is not None:
                 self._flush_source(result)
 
-        interrupted = False
+        interrupt_exc: BaseException | None = None
         results = []
         try:
             with progress.live():
@@ -211,26 +211,29 @@ class OsintStage(Stage):
                         await self._run_leak_search(results)
                         _hook("finish", "leak_search",
                               self._result_for("leak_search", results))
-                except (KeyboardInterrupt, asyncio.CancelledError):
-                    # Ctrl+C: mark the board interrupted so its FINAL alt-screen frame reads
-                    # "INTERRUPTED :: N/total complete · checkpointed" instead of just vanishing,
-                    # hold it a beat so the user sees it, then leave the board cleanly. We do NOT
-                    # re-raise: we persist what completed and return normally, so the interrupt
-                    # produces a clean summary instead of an unwound stack + raw log dump.
-                    interrupted = True
+                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                    # Ctrl+C: show a clean interrupted frame, then RE-RAISE. Re-raising is what
+                    # keeps the scan RESUMABLE: the orchestrator only marks a stage complete when
+                    # it returns ok+not-skipped, so returning normally here would (wrongly) mark
+                    # OSINT complete with partial data — and a resume would then SKIP it, showing
+                    # "0 sources · 0 findings". By propagating the interrupt, OSINT stays NOT
+                    # complete, so `kaalyx resume` re-runs the whole stage and recovers everything.
+                    interrupt_exc = exc
                     progress.set_interrupted()
                     await asyncio.sleep(0.4)
         finally:
             set_console_logging(True)
             self._progress = None
 
-        if interrupted:
-            # ONE clean line to normal scrollback (no raw INFO/WARNING dump), then persist what
-            # completed so `kaalyx resume` can pick up.
+        if interrupt_exc is not None:
+            # ONE clean line to normal scrollback (no raw INFO/WARNING dump), then re-raise so the
+            # orchestrator leaves the stage un-checkpointed (resumable). OSINT is one atomic stage,
+            # so resume re-runs it in full — that is how all pre-interrupt results are recovered.
             done = sum(1 for r in results if r.ok or r.skipped)
             osint_ui.get_console().print(
-                f"\n[bold yellow]Interrupted[/] — {done}/{len(sources)} sources complete, "
-                "checkpointed. Resume with [cyan]kaalyx resume[/].")
+                f"\n[bold yellow]Interrupted[/] — {done}/{len(sources)} sources ran; OSINT is "
+                "incomplete and will re-run on [cyan]kaalyx resume[/].")
+            raise interrupt_exc
 
         return self._persist(results)
 

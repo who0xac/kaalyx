@@ -506,13 +506,13 @@ class _SourceState:
 
 
 class _ScanDisplay:
-    """Context manager for the incremental, plain-scrollable OSINT display.
+    """Context manager for the plain, print-once OSINT display.
 
-    No rich.Live frame, no animation, no alt-screen: each source's completion prints ONE plain line
-    (via :meth:`OsintProgress.hook`) that becomes permanent, natively-scrollable terminal history —
-    so nothing ever truncates (no red dots), duplicates, or needs custom scroll handling. On enter
-    it prints a short banner; on exit it prints the full grouped board ONCE (all sources, in the
-    per-source format) as the final summary."""
+    NOTHING is printed while the scan runs (no in-place frame, no animation, no per-source stream).
+    On enter it prints a one-line "scanning…" note so the user knows it started; on exit it prints
+    the FULL grouped board ONCE — every source under its category in the per-source format — as
+    plain text. Because it is printed a single time as ordinary output (never an in-place frame), it
+    can never truncate (no red dots) or duplicate, and the terminal scrolls it natively."""
 
     def __init__(self, progress: "OsintProgress") -> None:
         self._p = progress
@@ -521,8 +521,8 @@ class _ScanDisplay:
         try:
             self._p._console.print(_section_header(
                 "SCANNING", f"{self._p._total} sources"
-                + (f" · {self._p._target}" if self._p._target else "")))
-            self._p._console.print()
+                + (f" · {self._p._target}" if self._p._target else "")
+                + " · results printed when the scan finishes"))
         except Exception:
             pass
         return self
@@ -530,7 +530,7 @@ class _ScanDisplay:
     def __exit__(self, *exc):
         try:
             self._p._console.print()
-            self._p._console.print(self._p._board())   # full grouped board, once, as the summary
+            self._p._console.print(self._p._board())   # full grouped board, ONCE, as the result
         except Exception:
             pass
         return False
@@ -578,11 +578,11 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``. On FINISH, prints ONE plain scrollable line
-        for that source (icon + category + name + result) — no in-place board, no animation, so the
-        output never truncates (no red dots), never duplicates, and the terminal scrolls it
-        natively. The full grouped board is printed once at the end by :class:`_ScanDisplay`. START
-        events just record state (no line, to keep the stream to one line per source)."""
+        """The progress hook passed to ``run_sources``. Records each source's state ONLY — nothing
+        is printed during the scan. The full grouped board (every source in the per-source format)
+        is printed ONCE at the end by :class:`_ScanDisplay`, as plain scrollable text: no in-place
+        frame, so it can never truncate (no red dots) or duplicate, and the terminal scrolls it
+        natively."""
         st = self._states.get(name)
         if st is None:
             return
@@ -607,53 +607,6 @@ class OsintProgress:
             if result is not None and self._result_is_flagged(result):
                 st.flagged = True
             self._finished += 1
-            self._print_event(name, st)          # one plain scrollable line, in completion order
-
-    _CAT_W = 22   # category-tag column width so the NAME columns line up across event lines
-
-    def _print_event(self, name: str, st: "_SourceState") -> None:
-        """Append ONE plain scrollable line for a finished source: [icon] CATEGORY  NAME  result.
-        The category tag keeps grouping clear even though events arrive in completion order. Plain
-        console.print — permanent, natively scrollable, never redrawn."""
-        state = st.state
-        flagged = getattr(st, "flagged", False)
-        if flagged and state in ("done", "skipped", "no_key"):
-            icon, istyle = "!", "bold yellow"
-            result = f"{st.items} hits" if state == "done" else (_skip_note(st.note) or "skipped")
-            rstyle = "green" if state == "done" else "yellow"
-        elif state == "done":
-            icon, istyle = "✔", "bold green"
-            result, rstyle = f"{st.items} hits", "green"
-        elif state in ("skipped", "no_key", "not_installed"):
-            icon, istyle = "○", "grey50"
-            result, rstyle = (_skip_note(st.note) or "skipped"), "yellow"
-        elif state == "failed":
-            icon, istyle = "✘", "bold red"
-            result, rstyle = "failed", "bold red"
-        else:
-            icon, istyle, result, rstyle = "~", "bold cyan", "running", "cyan"
-        secs = self._mmss(max(0.0, (st.finished or time.monotonic()) - st.started)) if st.started else ""
-        cat = _category_of(name)
-        line = Text("  ")
-        line.append("[", style=MUTED)
-        line.append(icon, style=istyle)
-        line.append("] ", style=MUTED)
-        line.append(f"{cat:<{self._CAT_W}}", style=ACCENT)
-        line.append(" ")
-        line.append(f"{_display_name(name, st.label):<{self._NAME_W}}", style="white")
-        line.append(" ")
-        line.append(result, style=rstyle)
-        if secs:
-            line.append(f"  :: {secs}", style=MUTED)
-        try:
-            width = self._console.size.width
-        except Exception:
-            width = 80
-        line.truncate(max(20, width - 1), overflow="ellipsis")
-        try:
-            self._console.print(line)
-        except Exception:
-            pass
 
     @staticmethod
     def _result_is_flagged(result) -> bool:

@@ -3,14 +3,11 @@
 Provides:
 
 * :func:`print_banner` — the OSINT module ASCII banner (figlet-slant "OSINT").
-* :class:`OsintProgress` — during the scan, a single live status line (progress bar +
-  elapsed + an animated cyan braille spinner naming the running source(s)). Per-source rows
-  are NOT printed while the scan runs; they appear once at the end in the grouped board. This
-  keeps the tall board out of the height-limited Live frame. Driven by the ``progress`` hook
-  from :func:`kaalyx.stages.sources.run_sources`.
-* :func:`grouped_source_board` — the final end-of-scan board: every source grouped under a
-  category header, with a PLAIN status icon (✔ green / ✘ red / ⚠ yellow-flagged / ○ dim) before
-  the name, no bracketed markers and no [N/T] prefix.
+* :class:`OsintProgress` — a full, category-grouped live board (see :meth:`OsintProgress._board`):
+  one progress header at the top, then every source under its category header (done / running /
+  queued), running rows animating a coloured pulse in the dotted leader. Rendered in normal
+  scrollback (``screen=False``) so the terminal's own scroll works. Driven by the ``progress``
+  hook from :func:`kaalyx.stages.sources.run_sources`.
 * result renderers (whois, emails, employees, SPF/DMARC posture, social, host/IP intel,
   findings) — borderless board idiom, dotted leaders, UPPERCASE headers, no boxes.
 
@@ -500,11 +497,12 @@ class OsintProgress:
         self._start = time.monotonic()
         self._total = len(self._states)
         self._finished = 0          # how many sources have completed (drives [N/total])
-        # Split-board model (normal scrollback, native terminal scroll — no alt-screen):
-        # completed rows are PRINTED ONCE as static scrollback lines (scroll naturally); only a
-        # compact live TAIL (header + currently-running rows) updates in place and always fits.
-        self._interrupted = False   # set on Ctrl+C so the tail shows a clean interrupted line
-        self._printed_categories: set[str] = set()   # category headers printed to scrollback
+        # Full grouped live board in NORMAL scrollback (screen=False, no alt-screen, no custom
+        # scroll): every source renders under its category header (done / running / queued),
+        # running rows animate in place, and the whole board is redrawn in place each refresh. The
+        # user's native terminal scrollback works. Tradeoff (accepted): on a terminal SHORTER than
+        # the board, in-place redraw of a too-tall frame can desync — the known height limit.
+        self._interrupted = False   # set on Ctrl+C so the board shows a clean interrupted header
 
     def set_progress(self, name: str, done: int, total: int) -> None:
         """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Only the
@@ -516,15 +514,9 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``.
-
-        SPLIT-BOARD DESIGN (safe in normal scrollback): the moment a source FINISHES, its final
-        row is printed EXACTLY ONCE as a static scrollback line (under its category header, printed
-        once), so it scrolls through terminal history and the user's native mouse-wheel scroll can
-        reach it any time. The only thing updated in place is the compact live TAIL (header +
-        currently-running rows, see ``_status_tail``), which is always a few lines and can never
-        exceed the terminal height — so there is no tall live frame and no reprint/desync bug, and
-        crucially NO alt-screen, so native scrollback keeps working."""
+        """The progress hook passed to ``run_sources``. Updates a source's state; the full grouped
+        board (see ``_board``) reflects it on the next refresh. Nothing is printed to scrollback
+        per source — the entire board is the live renderable, redrawn in place."""
         st = self._states.get(name)
         if st is None:
             return
@@ -549,27 +541,7 @@ class OsintProgress:
             if result is not None and self._result_is_flagged(result):
                 st.flagged = True
             self._finished += 1
-            # Print this completed source's row into scrollback now (with its category header if
-            # not already printed), so it becomes permanent, natively-scrollable history.
-            self._print_completed_row(name, st)
         self._refresh()
-
-    def _print_completed_row(self, name: str, st: "_SourceState") -> None:
-        """Print ONE completed source's row (and its category header, once) as a static scrollback
-        line — above the live tail so the tail stays at the bottom. Uses the Live's console when a
-        board is active so the static line is emitted cleanly above the in-place tail."""
-        console = self._live.console if self._live is not None else self._console
-        cat = _category_of(name)
-        if cat not in self._printed_categories:
-            self._printed_categories.add(cat)
-            try:
-                console.print(Text(f"  {cat}", style=f"bold {ACCENT}"))
-            except Exception:
-                pass
-        try:
-            console.print(self._row(st, _display_name(name, st.label), time.monotonic(), 0.0))
-        except Exception:
-            pass
 
     @staticmethod
     def _result_is_flagged(result) -> bool:
@@ -691,47 +663,58 @@ class OsintProgress:
         line.truncate(max(20, width - 1), overflow="ellipsis")
         return line
 
-    # How many running rows the compact tail will show at most (it must always fit the screen).
-    _TAIL_MAX_RUNNING = 6
-
     def set_interrupted(self) -> None:
-        """Mark the scan interrupted (Ctrl+C) so the live tail shows a clean interrupted line."""
+        """Mark the scan interrupted (Ctrl+C) so the board shows a clean interrupted header."""
         self._interrupted = True
         self._refresh()
 
-    def _status_tail(self):
-        """The COMPACT live tail — the only thing updated in place. A progress header plus a row
-        per currently-running source (with the animated pulse), capped at a few lines so it ALWAYS
-        fits the terminal height. Because it is short and lives in NORMAL scrollback (screen=False),
-        the completed rows printed above it scroll through history and the terminal's own scrollbar
-        works; nothing tall is ever held as a live frame, so the reprint/desync bug can't occur."""
+    def _board(self):
+        """The full grouped live board — the single in-place renderable. ONE progress header line
+        at the very top, then every source under its category header (INFRASTRUCTURE & DNS, CODE &
+        SECRETS, …) in canonical order regardless of state, with a blank line separating each
+        category block. Running rows animate the pulse; done/queued rows are static. Redrawn in
+        place each refresh, in NORMAL scrollback (screen=False), so the terminal's own scrollback
+        works. (A board taller than the terminal is the known height limit the user accepted.)"""
         now = time.monotonic()
         sweep = (now * 0.9) % 1.0                      # 0..1 pulse cycle from wall-clock
         done, total = self._finished, self._total
         elapsed = now - self._start
+        running = sum(1 for st in self._states.values() if st.state == "running")
 
+        # (2) ONE persistent progress header at the very top.
         if self._interrupted:
             header = Text.assemble(
                 ("[◆] ", "bold orange1"), ("INTERRUPTED", "bold red"),
                 (f" :: {done}/{total} ran · checkpointed · {self._mmss(elapsed)}", MUTED))
-            return Group(header)
+        else:
+            header = _section_header(
+                "SCANNING",
+                f"{done}/{total} done · {self._mmss(elapsed)}"
+                + (f" · {self._target}" if self._target else "")
+                + (f" · {running} running" if running else ""))
+        parts: list = [header, Text("")]
 
-        running = [(n, st) for n, st in self._states.items() if st.state == "running"]
-        header = _section_header(
-            "SCANNING",
-            f"{done}/{total} done · {self._mmss(elapsed)}"
-            + (f" · {self._target}" if self._target else "")
-            + (f" · {len(running)} running" if running else ""))
-        parts: list = [header]
-        # Show up to _TAIL_MAX_RUNNING running rows with the live pulse; summarise any overflow so
-        # the tail height stays bounded (and therefore always fits the screen).
-        for n, st in running[:self._TAIL_MAX_RUNNING]:
-            parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-        extra = len(running) - self._TAIL_MAX_RUNNING
-        if extra > 0:
-            parts.append(Text(f"    … and {extra} more running", style=MUTED))
-        if not running and done < total:
-            parts.append(Text("    starting…", style=MUTED))
+        # (1)+(3) Every source under its OWN category, in canonical order, with a blank line
+        # separating each category block. done/running/queued all sit together under their header.
+        placed: set[str] = set()
+
+        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
+            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+            for n, st in rows:
+                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+            parts.append(Text(""))          # blank line after each category block (separation)
+
+        for title, names in _SOURCE_CATEGORIES:
+            rows = [(n, self._states[n]) for n in names if n in self._states]
+            if rows:
+                emit_group(title, rows)
+                placed.update(n for n, _ in rows)
+        leftover = [(n, st) for n, st in self._states.items() if n not in placed]
+        if leftover:
+            emit_group("OTHER", leftover)
+        # Trim the trailing blank so the board ends cleanly on its last row.
+        while parts and isinstance(parts[-1], Text) and not parts[-1].plain:
+            parts.pop()
         return Group(*parts)
 
     def _refresh(self) -> None:
@@ -742,21 +725,19 @@ class OsintProgress:
                 pass
 
     def live(self):
-        """Context manager yielding a ``rich.Live`` that renders ONLY the compact live tail (see
-        :meth:`_status_tail`) in NORMAL scrollback (``screen=False``).
+        """Context manager yielding a ``rich.Live`` that renders the FULL grouped board (see
+        :meth:`_board`) in NORMAL scrollback (``screen=False``), redrawn in place each refresh.
 
-        This is the safe way to satisfy "live board + native terminal scroll + no reprint bug":
-        completed source rows are printed once as static scrollback lines by :meth:`hook` (they
-        scroll through history, so the terminal's own mouse-wheel scroll reaches every one), and
-        the ONLY in-place live frame is the short tail — a header plus the currently-running rows,
-        capped at a few lines. Because the live frame is always a handful of lines it can never
-        exceed the terminal height, so rich's cursor-up repaint can never miscount and desync (the
-        historical reprint bug); and because there is no alt-screen, the terminal's native
-        scrollback keeps working throughout the scan. NO custom scroll code, NO alt-screen."""
+        This satisfies the user's chosen model: every source under its category, running rows
+        animating in place, all in normal scrollback so the terminal's own scroll works — with NO
+        alt-screen and NO custom scroll code. The accepted tradeoff: when the board is TALLER than
+        the terminal, rich's in-place cursor-up redraw can miscount and desync (the historical
+        reprint bug) — this is the known height limit of an in-place tall frame in scrollback. On a
+        terminal tall enough to hold the board it renders cleanly."""
         from rich.live import Live
 
         live = Live(
-            get_renderable=self._status_tail,
+            get_renderable=self._board,
             console=self._console,
             screen=False,              # normal scrollback — native terminal scroll keeps working
             refresh_per_second=12,     # smooth pulse without excess repaint
@@ -809,141 +790,6 @@ _SOURCE_CATEGORIES: list[tuple[str, list[str]]] = [
     ("RECON AIDS",
      ["google_dorks"]),
 ]
-
-
-def _plain_status_icon(r) -> "Text":
-    """The plain (un-bracketed) status icon for a source's final row, colored per the locked
-    scheme: ✔ green (ran ok), ✘ red (failed), ○ dim (skipped / not installed / no key). The ⚠
-    flagged marker is applied by the caller (it depends on cross-source flag state), not here."""
-    if not r.ok:
-        return Text("✘", style="bold red")
-    if r.skipped:
-        return Text("○", style="grey50")
-    return Text("✔", style="bold green")
-
-
-def grouped_source_board(results: list, flagged_sources: set[str] | None = None):
-    """The final, locked end-of-scan board: every source grouped under a category header, with a
-    PLAIN status icon (✔/✘/○, or ⚠ for a flagged row) directly before the source name — no
-    bracketed markers and no per-row [N/T] prefix. A ⚠ (yellow) overrides the normal icon for any
-    source in *flagged_sources* (e.g. an org-mismatch / data-integrity concern) so the flag is
-    visible right on its row. Sources not in any category fall into a trailing OTHER group so none
-    is ever dropped. Returns a single Group (printed statically once, after the scan)."""
-    if not results:
-        return None
-    flagged_sources = flagged_sources or set()
-    by_name = {r.name: r for r in results}
-    placed: set[str] = set()
-
-    lines: list = [_section_header("SOURCE RESULTS", f"{len(results)} sources"), Text("")]
-
-    def _emit_row(r) -> None:
-        name = _display_name(r.name, r.name)
-        flagged = r.name in flagged_sources
-        # Bracketed status icon matching the live board: [✔] done, [✘] failed, [⚠] flagged,
-        # [○] skipped/no-key. The ⚠ overrides the normal outcome icon.
-        if flagged:
-            icon, icon_style, name_style = "⚠", "bold yellow", "yellow"
-        elif not r.ok:
-            icon, icon_style, name_style = "✘", "bold red", "red"
-        elif r.skipped:
-            icon, icon_style, name_style = "○", "grey50", "grey50"
-        else:
-            icon, icon_style, name_style = "✔", "bold green", "white"
-        line = Text("    ")
-        line.append("[", style=MUTED)
-        line.append(icon, style=icon_style)
-        line.append("] ", style=MUTED)
-        line.append(f"{name:<30}", style=name_style)
-        line.append(" " + "." * 22 + " ", style=MUTED)
-        # Result cell: green hit COUNT (0 stays green — a valid clean result), yellow skip state,
-        # red failed.
-        if not r.ok:
-            line.append("failed", style="bold red")
-        elif r.skipped:
-            line.append(_skip_result_text(r.note))
-        else:
-            line.append(f"{r.total} hits", style="green")
-        note = (r.note or "").strip()
-        if note:
-            n = note if len(note) <= 34 else note[:33] + "…"
-            line.append(f"  {n}", style=MUTED)
-        # Keep each row to one physical line so the static board stays a clean grid at any width.
-        try:
-            width = get_console().size.width
-        except Exception:
-            width = 80
-        line.truncate(max(20, width - 1), overflow="ellipsis")
-        lines.append(line)
-
-    for title, names in _SOURCE_CATEGORIES:
-        rows = [by_name[n] for n in names if n in by_name]
-        if not rows:
-            continue
-        lines.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-        for r in rows:
-            _emit_row(r)
-            placed.add(r.name)
-        lines.append(Text(""))
-
-    # Any source not assigned to a category — never drop it.
-    leftover = [r for r in results if r.name not in placed]
-    if leftover:
-        lines.append(Text("  OTHER", style=f"bold {ACCENT}"))
-        for r in leftover:
-            _emit_row(r)
-        lines.append(Text(""))
-
-    # Drop the trailing blank so the board ends cleanly.
-    while lines and isinstance(lines[-1], Text) and not lines[-1].plain:
-        lines.pop()
-    return Group(*lines)
-
-
-def source_results_table(results: list):
-    """Every source's OUTCOME, in the locked board idiom — ALL sources, not just the ones that
-    found something. Each source shows a status marker + its result: a green hit COUNT (0 stays
-    green — a clean zero is a valid outcome), a red ``N/A`` for a source that produced no data,
-    ``skipped``/``no key`` in yellow, or ``failed`` in red. A persistent post-scan roster so the
-    full set of sources is always visible after a scan, mirroring the live board.
-
-    Superseded on the terminal by :func:`grouped_source_board` (category-grouped, plain icons);
-    kept for any caller that still wants the flat ungrouped roster."""
-    if not results:
-        return None
-    lines = [_section_header("SOURCE RESULTS", f"{len(results)} sources"), Text("")]
-    for r in results:
-        name = _display_name(r.name, r.name)
-        line = Text("    ")
-        # Status marker (matches the live board): ✓ ok / ○ skipped / ✘ failed.
-        if not r.ok:
-            line.append("[✘] ", style="bold red")
-        elif r.skipped:
-            line.append("[○] ", style="yellow")
-        else:
-            line.append("[✓] ", style="bold green")
-        line.append(f"{name:<28}", style="white" if r.ok and not r.skipped else "grey50")
-        pad = max(1, 30 - len(name))
-        line.append(" " + "." * pad + " ", style=MUTED)
-        # Result cell: a completed source ALWAYS shows a real hit COUNT in green — including
-        # "0 hits" for a legitimate clean result (locked rule: green 0 = valid outcome). N/A is
-        # NEVER used for a source's overall count; it is only for a missing FIELD inside a
-        # source's own detailed block.
-        if not r.ok:
-            line.append("failed", style="bold red")
-        elif r.skipped:
-            line.append(_skip_result_text(r.note))
-        else:
-            line.append(f"{r.total} hits", style="green")
-        # A short trailing note for context (skip reason etc.), trimmed to stay on one line.
-        note = (r.note or "").strip()
-        if note:
-            n = note if len(note) <= 34 else note[:33] + "…"
-            line.append(f"  {n}", style=MUTED)
-        lines.append(line)
-    return Group(*lines)
-
-
 # One-line description per source for its detailed [◆] block header.
 _SOURCE_DESC = {
     "whois": "registration & ownership", "dns": "DNS records",

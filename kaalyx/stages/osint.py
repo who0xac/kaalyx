@@ -355,25 +355,18 @@ class OsintStage(Stage):
         return self._flagged(results)[0]
 
     def _render_results(self, results: list[SourceResult]) -> None:
-        """Compact terminal output ONLY, printed to NORMAL scrollback after the live alt-screen
-        board is torn down (the live board is wiped on exit, so this static reprint is the
-        permanent record). NO finding-by-finding detail, NO raw dumps, and NO separate flagged
-        callout — the ⚠ row icon is the only flag indicator; the full detail lives in the report
-        file written by :meth:`_persist`."""
+        """Terminal output after the scan: JUST the compact completion message. The category-
+        grouped board is the LIVE renderable (screen=False), so its final frame already stays in
+        normal scrollback when Live exits — there is NO separate static "SOURCE RESULTS" summary
+        board (item #7: removed as redundant). NO finding detail / raw dumps here; the [flag] row
+        icon is the only flag indicator and the full detail lives in the report file."""
         ctx = self.ctx
         console = osint_ui.get_console()
 
-        flagged, flagged_sources = self._flagged(results)
+        flagged, _flagged_sources = self._flagged(results)
 
-        # 1) SOURCE RESULTS board — every source grouped under a category header, with a bracketed
-        #    status icon ([✔]/[✘]/[○], or [⚠] on a flagged row) before the name and a hit COUNT.
-        #    Reprinted statically here because the live alt-screen board vanished on scan end.
-        board = osint_ui.grouped_source_board(results, flagged_sources)
-        if board is not None:
-            console.print()
-            console.print(board)
-
-        # 2) Compact completion message — folder path + one-line tally. No detail, no dumps.
+        # Compact completion message — folder path + one-line tally. No detail, no dumps, no
+        # redundant per-source summary (the live grouped board already showed every source).
         duration = sum(r.duration_s for r in results)
         n_findings = sum(len(r.findings) for r in results)
         folder = str(ctx.writer.stage_dir(self.name))

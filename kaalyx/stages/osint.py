@@ -287,7 +287,10 @@ class OsintStage(Stage):
         for finding in all_findings:
             ctx.repo.upsert_finding(ctx.scan_id, finding)
 
-        self._write_osint_files(all_osint)
+        # NOTE: no per-kind <kind>.txt files are written — they duplicated content already in each
+        # source's readable osint/<source>.txt (and would collide with it, e.g. osint/whois.txt).
+        # The cross-source rollups below (findings/subdomains/emails/…) do NOT match any source
+        # name, so they never collide with a per-source file.
         if all_findings:
             ctx.writer.write_lines(
                 self.name, "findings.txt",
@@ -393,16 +396,6 @@ class OsintStage(Stage):
         except Exception as exc:  # a report-write failure must never break the scan
             self.log.warning("Could not build OSINT report: %s", exc)
 
-    def _write_osint_files(self, records: list[OsintRecord]) -> None:
-        by_kind: dict[str, list[str]] = {}
-        for rec in records:
-            if rec.kind == "google_dork":
-                continue  # dorks get their own grouped file
-            line = f"{rec.value}" + (f"  [{rec.detail}]" if rec.detail else "")
-            by_kind.setdefault(rec.kind, []).append(line)
-        for kind, lines in by_kind.items():
-            self.ctx.writer.write_lines(self.name, f"{kind}.txt", lines)
-
     def _write_status_file(self, results: list[SourceResult]) -> None:
         lines = []
         for r in sorted(results, key=lambda x: x.name):
@@ -455,32 +448,32 @@ class OsintStage(Stage):
             self.log.debug("per-source DB persist failed for %s: %s", r.name, exc)
 
     def _flush_source(self, r: SourceResult) -> None:
-        """Persist ONE source COMPLETELY the moment it finishes — its raw file, its readable
-        ``.formatted.txt``, AND its structured SQLite records — so a completed source's data is
-        fully on disk and queryable while the OTHER sources are still running (this fires from the
-        concurrent finish hook, per source, not in a batch at the end). Clean separation of
-        artifacts:
-          * raw, unchanged tool stdout  → ``osint/tool_output/<source>.<ext>``
-          * readable field-labeled text → ``osint/<source>.formatted.txt``
+        """Persist ONE source COMPLETELY the moment it finishes — its raw file, its readable file,
+        AND its structured SQLite records — so a completed source's data is fully on disk and
+        queryable while the OTHER sources are still running (this fires from the concurrent finish
+        hook, per source, not in a batch at the end). EXACTLY TWO files per source, no duplication;
+        the folder distinguishes readable from raw so the readable one needs no ".formatted" tag:
+          * readable field-labeled text → ``osint/<source>.txt``
+          * verbatim raw tool output    → ``osint/tool_output/<source>.raw.<ext>``
           * structured records          → SQLite tables (queryable columns)
         Idempotent and never raises (a write error must not take down the live scan)."""
-        # 1) raw stdout / record dump → tool_output/ (raw data only).
+        # 1) verbatim raw output → tool_output/<source>.raw.<ext> (raw data only).
         try:
             content = r.raw if r.raw else self._dump_source(r)
             header = r.note if (not content and r.note) else ""
             self.ctx.writer.raw_source_output(self.name, r.name, content, r.raw_ext, header)
         except Exception as exc:  # noqa: BLE001
             self.log.debug("per-source raw flush failed for %s: %s", r.name, exc)
-        # 2) readable formatted section → osint/<source>.formatted.txt (alongside the report).
+        # 2) readable field-labeled section → osint/<source>.txt (alongside the report).
         try:
             text = osint_report.render_single_source(
                 self.ctx.domain, r,
                 org=self.ctx.get_shared("github_org"),
                 org_reason=self.ctx.get_shared("github_org_reason"),
             )
-            self.ctx.writer.write_text(self.name, f"{r.name}.formatted.txt", text)
+            self.ctx.writer.write_text(self.name, f"{r.name}.txt", text)
         except Exception as exc:  # noqa: BLE001
-            self.log.debug("per-source formatted write failed for %s: %s", r.name, exc)
+            self.log.debug("per-source readable write failed for %s: %s", r.name, exc)
         # 3) structured records → SQLite (queryable columns) — immediately, per source.
         self._persist_source_records(r)
 
@@ -1361,15 +1354,17 @@ class OsintStage(Stage):
         res = SourceResult(name="google_dorks")
         records, by_category = osint_inproc.generate_google_dorks(self.ctx.target.registrable)
         res.osint = records
-        # Write dorks grouped by category into one readable file for manual review.
-        lines: list[str] = []
+        # The readable dork list is written by the per-source flush to osint/google_dorks.txt
+        # (rendered by the report generator) — no separate file here, to avoid a double write to
+        # the same path. Keep a grouped raw payload so tool_output/google_dorks.raw.txt is useful.
+        raw_lines: list[str] = []
         total = 0
         for category, urls in by_category.items():
-            lines.append(f"### {category}")
-            lines.extend(urls)
-            lines.append("")
+            raw_lines.append(f"### {category}")
+            raw_lines.extend(urls)
+            raw_lines.append("")
             total += len(urls)
-        self.ctx.writer.write_lines(self.name, "google_dorks.txt", lines, sort=False)
+        res.raw = "\n".join(raw_lines)
         res.note = f"{total} dork URLs across {len(by_category)} categories"
         return res
 

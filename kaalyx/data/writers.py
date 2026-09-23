@@ -9,10 +9,11 @@ item per line) wherever possible and never let a write error abort a scan.
 Directory layout::
 
     results/<domain>/
-        kaalyx.log                      # full run log (attached by core.logging)
-        <stage>/                        # osint | subdomains | hosts | web | vulns
-            <artifact>.txt              # e.g. subfinder.txt, all_subdomains.txt
-            tool_output/<source>.<ext>  # verbatim, unprocessed output per source/tool
+        kaalyx.log                        # full run log (attached by core.logging)
+        <stage>/                          # osint | subdomains | hosts | web | vulns
+            <source>.txt                  # READABLE, field-labeled per-source output
+            <artifact>.txt                # cross-source rollups (subdomains.txt, emails.txt, …)
+            tool_output/<source>.raw.<ext># verbatim, unprocessed RAW output per source/tool
 
 Everything for one scan lives under ``results/<domain-slug>/`` and NOTHING is ever written
 outside that per-target tree, so two targets can never contaminate each other's folder. A
@@ -128,29 +129,18 @@ class ResultWriter:
         except OSError as exc:
             logger.warning("Could not append to %s: %s", path, exc)
 
-    def raw_tool_output(self, stage: str, tool: str, stdout: str) -> Path | None:
-        """Persist a tool's verbatim stdout under ``<stage>/tool_output/<tool>.stdout.txt``."""
-        raw_dir = self.stage_dir(stage) / "tool_output"
-        try:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            path = raw_dir / f"{tool}.stdout.txt"
-            path.write_text(stdout, encoding="utf-8")
-            return path
-        except OSError as exc:
-            logger.warning("Could not write raw output for %s: %s", tool, exc)
-            return None
-
     def raw_source_output(self, stage: str, source: str, content: str,
                           ext: str = "txt", header: str = "") -> Path | None:
-        """Persist ONE dedicated raw file per source under ``<stage>/tool_output/<source>.<ext>`` —
-        UNCONDITIONALLY, even when *content* is empty (an empty file records that the source
-        ran and found nothing, mirroring the reference tool). *header* is an optional first
-        line (e.g. a skip reason) so an empty file still says why.
+        """Persist ONE dedicated RAW file per source under ``<stage>/tool_output/<source>.raw.<ext>``
+        — UNCONDITIONALLY, even when *content* is empty (an empty file records that the source ran
+        and found nothing). The ``.raw`` in the name marks it as the verbatim, unformatted tool
+        output, distinct from the readable ``<source>.txt`` in the stage folder. *header* is an
+        optional first line (e.g. a skip reason) so an empty file still says why.
         """
         raw_dir = self.stage_dir(stage) / "tool_output"
         try:
             raw_dir.mkdir(parents=True, exist_ok=True)
-            path = raw_dir / f"{source}.{ext}"
+            path = raw_dir / f"{source}.raw.{ext}"
             body = content if content is not None else ""
             if header:
                 body = f"# {header}\n" + (body if body else "")

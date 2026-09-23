@@ -525,7 +525,7 @@ def _org_note(org: str | None, org_reason: str | None) -> str:
 
 def render_source_section(r: SourceResult, org_note: str = "", *, header: bool = True) -> list[str]:
     """Render ONE source's field-labeled section as a list of text lines — the shared unit used
-    by both the cross-source report and each per-source ``<source>.formatted.txt`` file. Includes
+    by both the cross-source report and each per-source ``osint/<source>.txt`` file. Includes
     the ``=== HEADER ===`` (unless *header* is False), any data-integrity warning callout, then the
     source's data via its registered renderer (or the generic fallback), or a status line when it
     skipped / failed / found nothing. Never raises — a renderer error degrades to the generic
@@ -560,7 +560,7 @@ def render_source_section(r: SourceResult, org_note: str = "", *, header: bool =
 
 def render_single_source(domain: str, r: SourceResult, *, org: str | None = None,
                          org_reason: str | None = None) -> str:
-    """The full text of one source's ``<source>.formatted.txt`` file — the same field-labeled
+    """The full text of one source's readable ``osint/<source>.txt`` file — the same field-labeled
     section that appears in the cross-source report, as a standalone document with a short title.
     Written the moment the source finishes (per-source flush), so a completed source's readable
     output is on disk while others still run."""

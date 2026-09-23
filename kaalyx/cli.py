@@ -1012,9 +1012,11 @@ def _render_update_changelog(old_ref: str, new_ref: str, commits: list[tuple[str
 def _do_update(verbose: bool = False) -> None:
     """Check GitHub for a newer Kaalyx and, if found, reinstall via pipx.
 
-    Shows a dot-style progress bar mapped to real milestones (check → prepare → pull →
-    reinstall → done). Ends with one clear line — "already up to date" or "updated: old →
-    new". Internals (commit hashes, pipx output) are shown only with --verbose. Shared by
+    The quick check-only step (is there anything new?) shows just a transient spinner and, when
+    nothing is new, a clean immediate "already up to date" line with NO progress bar — a bar
+    implies multi-step work that isn't happening. The dot-style progress bar appears ONLY when an
+    update actually exists and is being downloaded/applied (prepare → pull → reinstall → done).
+    Internals (commit hashes, pipx output) are shown only with --verbose. Shared by
     `kaalyx update` and the root `-u/--update` flag.
     """
     from .core import updater
@@ -1044,42 +1046,40 @@ def _do_update(verbose: bool = False) -> None:
         else:  # http / parse
             console.print(f"[yellow]⚠ Update check failed[/] — {check.error_msg}.")
 
-    # --- Step 1: check reachability + latest commit (bar fills while the API call runs). ---
-    with dot_progress() as progress:
-        task = progress.add_task("Checking for updates", total=100)
-
-        check = _run_while_advancing(
-            progress, task, updater.latest_remote_commit, 0, 20
-        )
+    # --- Step 1: check reachability + latest commit. This is a quick, check-ONLY step, so it
+    # shows NO progress bar (a bar implies multi-step work). A transient spinner covers the
+    # network call and clears itself, leaving only the result line for the common no-op case. ---
+    with console.status("[cyan]Checking for updates…[/]", spinner="dots"):
+        check = updater.latest_remote_commit()
         local_sha = updater.installed_commit()
 
-        # Report the SPECIFIC failure reason (rate limit / timeout / TLS / HTTP / network).
-        if check.commit is None:
-            progress.stop()
-            if verbose:
-                console.print(f"[dim]update check error: {check.error_kind} — {check.error_msg}[/]")
-            _check_error_message(check)
-            raise typer.Exit(code=1)
+    # Report the SPECIFIC failure reason (rate limit / timeout / TLS / HTTP / network).
+    if check.commit is None:
+        if verbose:
+            console.print(f"[dim]update check error: {check.error_kind} — {check.error_msg}[/]")
+        _check_error_message(check)
+        raise typer.Exit(code=1)
 
-        progress.update(task, completed=20)  # check succeeded
-        remote_sha, remote_full, remote_date = check.commit
+    remote_sha, remote_full, remote_date = check.commit
 
-        # Already up to date (provable only when we know the installed commit) => skip the
-        # reinstall entirely. local_sha comes from what is *genuinely* installed (package
-        # metadata / git HEAD), not merely from a prior recorded intention.
-        if local_sha and local_sha == remote_sha:
-            progress.stop()
-            if verbose:
-                console.print(f"[dim]installed commit: {local_sha} == latest {remote_sha}[/]")
-            console.print(f"[green]✔ Already up to date[/] (v{current}, {remote_sha})")
-            return
+    # Already up to date (provable only when we know the installed commit) => skip the reinstall
+    # entirely, and show a clean immediate result with NO progress bar (nothing was done).
+    # local_sha comes from what is *genuinely* installed (package metadata / git HEAD), not merely
+    # from a prior recorded intention.
+    if local_sha and local_sha == remote_sha:
+        if verbose:
+            console.print(f"[dim]installed commit: {local_sha} == latest {remote_sha}[/]")
+        console.print(f"[green]✔ Already up to date[/] (v{current}, {remote_sha})")
+        return
 
-        # --- Step 2/3: upgrade in place (bar fills during the real work). ---
-        # Lightweight-first internally (upgrade inside the existing pipx venv, full rebuild only
-        # as a fallback) — but this mechanism detail is NOT shown to the user; the update simply
-        # works or reports failure.
-        # Pin the install to the exact remote commit so pip cannot serve a cached build.
-        progress.update(task, description="Update found, preparing", completed=40)
+    # --- Step 2/3: an update EXISTS — now real multi-step work happens, so show the progress bar
+    # for the download/reinstall only. Lightweight-first internally (upgrade inside the existing
+    # pipx venv, full rebuild only as a fallback), but that mechanism detail is NOT shown; the
+    # update simply works or reports failure. Pin to the exact remote commit so pip cannot serve a
+    # cached build. ---
+    with dot_progress() as progress:
+        task = progress.add_task("Update found, preparing", total=100)
+        progress.update(task, completed=40)
         progress.update(task, description="Pulling latest changes", completed=45)
         progress.update(task, description="Reinstalling via pipx")
         code, output = _run_while_advancing(

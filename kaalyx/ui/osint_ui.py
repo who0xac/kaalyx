@@ -473,6 +473,55 @@ class _SourceState:
     flagged: bool = False
 
 
+class _PeriodicBoard:
+    """Context manager that PRINTS the full grouped board into normal scrollback on a slow cadence
+    — the no-alt-screen, no-custom-scroll, fully-scrollable model.
+
+    Instead of holding a ``rich.Live`` in-place frame (which cannot be natively scrolled), a daemon
+    thread calls ``console.print(progress.board_group())`` roughly every ``interval`` seconds. Each
+    print is permanent, natively-scrollable history — no cursor-up, so no reprint/desync bug and no
+    cropping. A board is printed on enter, whenever the completion count changes (so the user sees
+    progress promptly), on the cadence otherwise, and once more on exit (the final state)."""
+
+    def __init__(self, progress: "OsintProgress", interval: float = 1.5) -> None:
+        self._p = progress
+        self._interval = interval
+        self._stop = None
+        self._thread = None
+
+    def _print_board(self) -> None:
+        try:
+            self._p._console.print(self._p.board_group())
+            self._p._console.print()          # a blank line between successive snapshots
+        except Exception:
+            pass
+
+    def _loop(self) -> None:
+        last_done = -1
+        # Print promptly whenever the number of finished sources changes; otherwise on the cadence.
+        while not self._stop.wait(self._interval):
+            done = self._p._finished
+            if done != last_done:
+                last_done = done
+            self._print_board()
+
+    def __enter__(self):
+        import threading
+        self._stop = threading.Event()
+        self._print_board()                   # initial board so the user sees all sources at once
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 0.5)
+        self._print_board()                   # final board reflecting the finished state
+        return False
+
+
 class OsintProgress:
     """A live, in-place status board for concurrently-running OSINT sources.
 
@@ -579,23 +628,23 @@ class OsintProgress:
         m, s = divmod(rem, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-    def _row(self, st: "_SourceState", name: str, now: float, sweep: float) -> "Text":
-        """One source row in the locked format: ``[icon] SOURCE_NAME ..leader.. result :: time``.
+    def _row(self, st: "_SourceState", name: str, now: float, sweep: float = 0.0) -> "Text":
+        """One source row: ``[icon] SOURCE_NAME ..dots.. result :: time``.
 
-        The bracket icon reflects state — [ ] queued, [|/-\\] running (CYCLING ASCII spinner),
-        [✔] done, [✘] failed, [!] flagged, [○] skipped/no-key/not-installed. While RUNNING the
-        dotted leader also animates a ·•●•· pulse sweeping left→right (driven by *sweep*, a 0..1
-        wall-clock fraction); in every other state the leader is plain static dots. This single
-        renderer is used both for the LIVE board (every frame) and the STATIC end board (sweep=0)."""
+        The bracket icon reflects state — [ ] queued, [~] running, [✔] done, [✘] failed,
+        [!] flagged, [○] skipped/no-key/not-installed. NO animation: the board is printed to
+        normal scrollback (see :meth:`board_group`) so native terminal scroll works, which rules
+        out per-line/per-frame animation. A running row shows a static [~] + elapsed time; the
+        dotted leader is always plain static dots. (*sweep* is unused, kept for signature stability.)"""
         state = st.state
         flagged = getattr(st, "flagged", False)
         # --- bracket icon + name colour + result cell ---
         if state == "running":
-            icon = Text(_spinner_frame(now), style="bold cyan")   # cycles per frame off wall-clock
+            icon = Text("~", style="bold cyan")                   # static running marker (no spin)
             name_style = "bold white"
             result = (Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
                       if st.prog_total > 0 else Text("running", style="cyan"))
-            show_time = False
+            show_time = True                                       # show elapsed for a running row
         elif flagged and state in ("done", "skipped", "no_key"):
             # A flagged outcome (data-integrity concern / verified secret): [!] overrides the icon.
             icon = Text("!", style="bold yellow")
@@ -642,11 +691,9 @@ class OsintProgress:
         line.append("] ", style=MUTED)
         line.append(f"{name:<{self._NAME_W}}", style=name_style)
         line.append(" ")
-        # Dotted leader: pulse-animated while running, plain static dots otherwise.
-        if state == "running":
-            line.append_text(_pulse_leader(self._LEADER_W, sweep))
-        else:
-            line.append("." * self._LEADER_W, style=MUTED)
+        # Dotted leader — always plain static dots (no animation, so the board is safe to print
+        # into scrollback and be natively scrolled).
+        line.append("." * self._LEADER_W, style=MUTED)
         line.append(" ")
         line.append_text(result)
         if show_time and st.started > 0:
@@ -670,21 +717,20 @@ class OsintProgress:
         self._interrupted = True
         self._refresh()
 
-    def _board(self):
-        """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the top, then EVERY source (done, running AND queued) as a row under its OWN category
-        header, in canonical category order, with a BLANK LINE before each category block so
-        sections never run together. Running rows animate the green pulse inline; done/queued rows
-        are static. There is NO separate flat 'running sources' bucket — a running source appears
-        as its own animated row under its category, next to its completed siblings.
+    def board_group(self):
+        """The full grouped board renderable (a rich Group): ONE progress header line at the top,
+        then EVERY source (done, running AND queued) as a row under its OWN category header, in
+        canonical category order, with a BLANK LINE before each category block. No animation.
 
-        This is a single in-place frame (screen=False): rich redraws it each refresh, which is what
-        lets running rows animate. The accepted tradeoff is that an in-place frame cannot be
-        natively scrolled and crops when taller than the terminal."""
-        now = time.monotonic()
-        sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
+        This is NOT held as a live in-place frame — it is PRINTED into normal scrollback by the
+        periodic printer (see :meth:`live`), so the terminal's own mouse-wheel scroll reaches every
+        source and nothing is ever cropped. The board simply reprints, in full, on a slow cadence
+        as state changes; there is no cursor-up redraw, so the reprint/desync bug cannot occur and
+        native scrolling always works. The cost of this (the trade-off the user chose) is that
+        successive board snapshots accumulate down the scrollback, and running rows show a static
+        [~] marker + elapsed time rather than a moving pulse."""
         done, total = self._finished, self._total
-        elapsed = now - self._start
+        elapsed = time.monotonic() - self._start
         n_running = sum(1 for st in self._states.values() if st.state == "running")
 
         if self._interrupted:
@@ -699,16 +745,14 @@ class OsintProgress:
                  + (f" · {n_running} running" if n_running else ""), MUTED))
         parts: list = [header]
 
-        # Every source under its OWN category header, in canonical order, with a BLANK LINE before
-        # each category block. done / running / queued all sit together under their header; a
-        # running row animates the pulse via self._row (state == 'running').
+        now = time.monotonic()
         placed: set[str] = set()
 
         def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
             parts.append(Text(""))                       # blank line BEFORE each category header
             parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
             for n, st in rows:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+                parts.append(self._row(st, _display_name(n, st.label), now))
 
         for title, names in _SOURCE_CATEGORIES:
             rows = [(n, self._states[n]) for n in names if n in self._states]
@@ -721,35 +765,22 @@ class OsintProgress:
         return Group(*parts)
 
     def _refresh(self) -> None:
-        if self._live is not None:
-            try:
-                self._live.refresh()
-            except Exception:
-                pass
+        # No live frame to refresh in the scrollback-reprint model; the periodic printer redraws
+        # the whole board on its cadence. Kept as a no-op so existing callers (hook/set_progress)
+        # don't need to change.
+        return None
 
     def live(self):
-        """Context manager yielding a ``rich.Live`` that renders the FULL grouped board (see
-        :meth:`_board`) in place (``screen=False``, no alt-screen), redrawn each refresh.
+        """Context manager that PRINTS the full grouped board into normal scrollback on a slow
+        cadence — no rich.Live in-place frame, no alt-screen, no custom scroll code.
 
-        This is the locked model: every source under its own category header with blank-line
-        separation, running rows animating the pulse inline, no separate flat 'running' bucket.
-        Because it is a single in-place frame (which is what lets the running rows animate), native
-        mouse-wheel scroll does NOT work during the scan and the board crops when taller than the
-        terminal — the accepted tradeoff of choosing inline animation over native scrolling."""
-        from rich.live import Live
-
-        live = Live(
-            get_renderable=self._board,
-            console=self._console,
-            screen=False,              # normal scrollback — native terminal scroll keeps working
-            refresh_per_second=12,     # smooth pulse without excess repaint
-            auto_refresh=True,
-            transient=False,
-            redirect_stdout=True,
-            redirect_stderr=True,
-        )
-        self._live = live
-        return _LiveWithQuietTerminal(live)
+        This is the model that keeps native terminal scrolling working: the board is emitted with
+        plain ``console.print`` (which becomes permanent, natively-scrollable history) roughly
+        every 1.5s and once more at the end. Because nothing is ever redrawn in place (no cursor-up),
+        there is no reprint/desync bug and no cropping — the whole 34-35 source board is always
+        scrollable. The trade-off (the user's final choice) is that there is no per-row animation
+        and the board repeats down the scrollback as it updates."""
+        return _PeriodicBoard(self)
 
 
 # --- Result tables ----------------------------------------------------------------------

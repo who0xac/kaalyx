@@ -3,10 +3,11 @@
 Provides:
 
 * :func:`print_banner` — the OSINT module ASCII banner (figlet-slant "OSINT").
-* :class:`OsintProgress` — a full, category-grouped live board (see :meth:`OsintProgress._board`):
-  one progress header at the top, then every source under its category header (done / running /
-  queued), running rows animating a coloured pulse in the dotted leader. Rendered in normal
-  scrollback (``screen=False``) so the terminal's own scroll works. Driven by the ``progress``
+* :class:`OsintProgress` — each finished source's row is printed once as a PERMANENT scrollback
+  line under its category header (never redrawn, so the terminal's own mouse-wheel scroll reaches
+  every one); the only in-place live frame is a single indicator line (see
+  :meth:`OsintProgress._live_line`) showing progress + the running source(s) with a green pulse.
+  Normal scrollback (``screen=False``), no alt-screen, no custom scroll. Driven by the ``progress``
   hook from :func:`kaalyx.stages.sources.run_sources`.
 * result renderers (whois, emails, employees, SPF/DMARC posture, social, host/IP intel,
   findings) — borderless board idiom, dotted leaders, UPPERCASE headers, no boxes.
@@ -330,16 +331,15 @@ _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # ⠙ glyph rendering as a stray quote mark. The frame is chosen from wall-clock time so it cycles.
 _SPINNER_ASCII = "|/-\\"
 
-# The pulse cluster that sweeps the dotted leader while a source runs: small→large→small. Each
-# glyph gets its own bright colour (see _PULSE_STYLES) so the moving cluster is unmistakable
-# against the dim static dots.
+# The pulse cluster that sweeps the dotted leader while a source runs: small→large→small. The
+# moving glyphs are BRIGHT GREEN against DIM GREY static dots — a simple, high-contrast pairing.
 _PULSE = "·•●•·"
 _PULSE_STYLES = {
-    "●": "bold magenta",   # the bright core — most eye-catching
-    "•": "bold cyan",
-    "·": "cyan",
+    "●": "bold green",     # the bright moving core
+    "•": "bold green",
+    "·": "green",
 }
-_DOT_STYLE = "grey35"      # dim grey static dots, for strong contrast with the pulse
+_DOT_STYLE = "grey35"      # dim grey static dots, for strong contrast with the green pulse
 
 
 def _spinner_frame(now: float) -> str:
@@ -351,9 +351,8 @@ def _pulse_leader(width: int, sweep: float) -> "Text":
     """A dotted leader of *width* chars that animates a small→large→small pulse cluster
     (``·•●•·``) travelling left→right and looping, against a background of DIM static ``.`` dots.
     *sweep* is a 0..1 fraction of the cycle (derived from wall-clock time by the caller) so the
-    animation is stateless. Each pulse glyph is styled its own bright colour (``●`` bold magenta,
-    ``•`` bold cyan, ``·`` cyan) so the moving cluster stands out sharply; the static dots are dim
-    grey."""
+    animation is stateless. The moving pulse glyphs are BRIGHT GREEN and the static dots are DIM
+    GREY, a simple high-contrast pairing so the moving cluster stands out clearly."""
     width = max(1, width)
     n = len(_PULSE)
     # Travel the cluster's leading edge from -n (just off the left) to width (just off the right),
@@ -470,7 +469,7 @@ class _SourceState:
     prog_done: int = 0
     prog_total: int = 0
     # True when this source carries a data-integrity concern or a verified/critical finding — the
-    # board shows a ⚠ on its row instead of the normal outcome icon.
+    # board shows a [!] on its row instead of the normal outcome icon.
     flagged: bool = False
 
 
@@ -497,12 +496,14 @@ class OsintProgress:
         self._start = time.monotonic()
         self._total = len(self._states)
         self._finished = 0          # how many sources have completed (drives [N/total])
-        # Full grouped live board in NORMAL scrollback (screen=False, no alt-screen, no custom
-        # scroll): every source renders under its category header (done / running / queued),
-        # running rows animate in place, and the whole board is redrawn in place each refresh. The
-        # user's native terminal scrollback works. Tradeoff (accepted): on a terminal SHORTER than
-        # the board, in-place redraw of a too-tall frame can desync — the known height limit.
-        self._interrupted = False   # set on Ctrl+C so the board shows a clean interrupted header
+        # Model that ACTUALLY delivers native scrollback: each source's row is PRINTED ONCE as a
+        # permanent scrollback line the moment it finishes (real terminal history — the user's
+        # mouse wheel scrolls through every one, nothing is ever redrawn or cropped). The ONLY
+        # live in-place frame is a SINGLE indicator line (see _live_line), which always fits, so
+        # rich never crops it and it never fights the scrollback. screen=False, no alt-screen, no
+        # custom scroll code.
+        self._interrupted = False        # set on Ctrl+C so the live line shows a clean note
+        self._printed_categories: set[str] = set()   # category headers already printed once
 
     def set_progress(self, name: str, done: int, total: int) -> None:
         """Update a running source's live done/total counter (e.g. LEAKSEARCH 23/47). Only the
@@ -514,9 +515,10 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``. Updates a source's state; the full grouped
-        board (see ``_board``) reflects it on the next refresh. Nothing is printed to scrollback
-        per source — the entire board is the live renderable, redrawn in place."""
+        """The progress hook passed to ``run_sources``. On FINISH, the source's completed row is
+        printed ONCE as a permanent scrollback line (under its category header, printed once), so
+        the user's native scroll reaches every finished source; the live indicator (see
+        ``_live_line``) just tracks counts + who is running."""
         st = self._states.get(name)
         if st is None:
             return
@@ -541,7 +543,26 @@ class OsintProgress:
             if result is not None and self._result_is_flagged(result):
                 st.flagged = True
             self._finished += 1
+            self._print_row(name, st)     # permanent scrollback line, natively scrollable
         self._refresh()
+
+    def _print_row(self, name: str, st: "_SourceState") -> None:
+        """Print ONE finished source's row (and its category header, once) as a permanent scrollback
+        line ABOVE the live indicator. Printed through the Live's console so it lands cleanly above
+        the single in-place line. These lines are never redrawn — the terminal owns them, so native
+        mouse-wheel scroll reaches all of them and nothing is ever cropped."""
+        console = self._live.console if self._live is not None else self._console
+        cat = _category_of(name)
+        if cat not in self._printed_categories:
+            self._printed_categories.add(cat)
+            try:
+                console.print(Text(f"  {cat}", style=f"bold {ACCENT}"))
+            except Exception:
+                pass
+        try:
+            console.print(self._row(st, _display_name(name, st.label), time.monotonic(), 0.0))
+        except Exception:
+            pass
 
     @staticmethod
     def _result_is_flagged(result) -> bool:
@@ -555,7 +576,7 @@ class OsintProgress:
         return False
 
     def mark_flagged(self, name: str) -> None:
-        """Mark a source flagged (⚠ on its row) for a reason external to its own result — e.g. the
+        """Mark a source flagged ([!] on its row) for a reason external to its own result — e.g. the
         org-scanners when no GitHub org was confidently identified. Idempotent; safe any time."""
         st = self._states.get(name)
         if st is not None:
@@ -581,7 +602,7 @@ class OsintProgress:
         """One source row in the locked format: ``[icon] SOURCE_NAME ..leader.. result :: time``.
 
         The bracket icon reflects state — [ ] queued, [|/-\\] running (CYCLING ASCII spinner),
-        [✔] done, [✘] failed, [⚠] flagged, [○] skipped/no-key/not-installed. While RUNNING the
+        [✔] done, [✘] failed, [!] flagged, [○] skipped/no-key/not-installed. While RUNNING the
         dotted leader also animates a ·•●•· pulse sweeping left→right (driven by *sweep*, a 0..1
         wall-clock fraction); in every other state the leader is plain static dots. This single
         renderer is used both for the LIVE board (every frame) and the STATIC end board (sweep=0)."""
@@ -595,8 +616,8 @@ class OsintProgress:
                       if st.prog_total > 0 else Text("running", style="cyan"))
             show_time = False
         elif flagged and state in ("done", "skipped", "no_key"):
-            # A flagged outcome (data-integrity concern / verified secret): ⚠ overrides the icon.
-            icon = Text("⚠", style="bold yellow")
+            # A flagged outcome (data-integrity concern / verified secret): [!] overrides the icon.
+            icon = Text("!", style="bold yellow")
             name_style = "yellow"
             if state == "done":
                 result = Text(f"{st.items} hits", style="green")
@@ -668,54 +689,41 @@ class OsintProgress:
         self._interrupted = True
         self._refresh()
 
-    def _board(self):
-        """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the very top, then every source under its category header (INFRASTRUCTURE & DNS, CODE &
-        SECRETS, …) in canonical order regardless of state, with a blank line separating each
-        category block. Running rows animate the pulse; done/queued rows are static. Redrawn in
-        place each refresh, in NORMAL scrollback (screen=False), so the terminal's own scrollback
-        works. (A board taller than the terminal is the known height limit the user accepted.)"""
+    def _live_line(self):
+        """The ONLY in-place live frame: a SINGLE line — progress + elapsed + which source(s) are
+        running (with the green pulse). Exactly one line, so rich never crops it and it never
+        overlaps the permanent scrollback rows printed above it. The completed rows are real
+        scrollback (see _print_row), so the terminal's own mouse-wheel scroll reaches every one."""
         now = time.monotonic()
-        sweep = (now * 0.9) % 1.0                      # 0..1 pulse cycle from wall-clock
+        sweep = (now * 0.9) % 1.0
         done, total = self._finished, self._total
         elapsed = now - self._start
-        running = sum(1 for st in self._states.values() if st.state == "running")
 
-        # (2) ONE persistent progress header at the very top.
         if self._interrupted:
-            header = Text.assemble(
+            line = Text.assemble(
                 ("[◆] ", "bold orange1"), ("INTERRUPTED", "bold red"),
                 (f" :: {done}/{total} ran · checkpointed · {self._mmss(elapsed)}", MUTED))
-        else:
-            header = _section_header(
-                "SCANNING",
-                f"{done}/{total} done · {self._mmss(elapsed)}"
-                + (f" · {self._target}" if self._target else "")
-                + (f" · {running} running" if running else ""))
-        parts: list = [header, Text("")]
+            return line
 
-        # (1)+(3) Every source under its OWN category, in canonical order, with a blank line
-        # separating each category block. done/running/queued all sit together under their header.
-        placed: set[str] = set()
-
-        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
-            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-            for n, st in rows:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-            parts.append(Text(""))          # blank line after each category block (separation)
-
-        for title, names in _SOURCE_CATEGORIES:
-            rows = [(n, self._states[n]) for n in names if n in self._states]
-            if rows:
-                emit_group(title, rows)
-                placed.update(n for n, _ in rows)
-        leftover = [(n, st) for n, st in self._states.items() if n not in placed]
-        if leftover:
-            emit_group("OTHER", leftover)
-        # Trim the trailing blank so the board ends cleanly on its last row.
-        while parts and isinstance(parts[-1], Text) and not parts[-1].plain:
-            parts.pop()
-        return Group(*parts)
+        running = [n for n, st in self._states.items() if st.state == "running"]
+        line = Text("[◆] ", style="bold orange1")
+        line.append("SCANNING", style="bold orange1")
+        line.append(f" :: {done}/{total} done · {self._mmss(elapsed)}", style=MUTED)
+        if running:
+            # A small green pulse + the running source name(s), so activity is obvious at a glance.
+            line.append("  ", style=MUTED)
+            line.append_text(_pulse_leader(6, sweep))
+            names = ", ".join(_display_name(n, self._states[n].label) for n in running)
+            line.append(" " + names, style="green")
+        elif done >= total:
+            line.append("  done", style="bold green")
+        # ONE physical line always — truncate to width so it can never wrap into a 2-line frame.
+        try:
+            width = self._console.size.width
+        except Exception:
+            width = 80
+        line.truncate(max(20, width - 1), overflow="ellipsis")
+        return line
 
     def _refresh(self) -> None:
         if self._live is not None:
@@ -725,19 +733,20 @@ class OsintProgress:
                 pass
 
     def live(self):
-        """Context manager yielding a ``rich.Live`` that renders the FULL grouped board (see
-        :meth:`_board`) in NORMAL scrollback (``screen=False``), redrawn in place each refresh.
+        """Context manager yielding a ``rich.Live`` that renders ONLY the single indicator line
+        (see :meth:`_live_line`) in NORMAL scrollback (``screen=False``).
 
-        This satisfies the user's chosen model: every source under its category, running rows
-        animating in place, all in normal scrollback so the terminal's own scroll works — with NO
-        alt-screen and NO custom scroll code. The accepted tradeoff: when the board is TALLER than
-        the terminal, rich's in-place cursor-up redraw can miscount and desync (the historical
-        reprint bug) — this is the known height limit of an in-place tall frame in scrollback. On a
-        terminal tall enough to hold the board it renders cleanly."""
+        This is the model that genuinely delivers "see every source, scroll with the mouse wheel,
+        zero custom scroll": each finished source's row is printed once as a PERMANENT scrollback
+        line by :meth:`_print_row` (real terminal history — never redrawn, never cropped, natively
+        scrollable), and the ONLY in-place live frame is a single line that always fits, so rich
+        can never crop it and it never fights the scrollback. No alt-screen, no custom scroll code.
+        (An in-place FULL board cannot be scrolled — rich rewrites those lines each frame and crops
+        them to the window — which is why the board is printed as scrollback instead.)"""
         from rich.live import Live
 
         live = Live(
-            get_renderable=self._board,
+            get_renderable=self._live_line,
             console=self._console,
             screen=False,              # normal scrollback — native terminal scroll keeps working
             refresh_per_second=12,     # smooth pulse without excess repaint

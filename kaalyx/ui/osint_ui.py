@@ -506,31 +506,75 @@ class _SourceState:
 
 
 class _ScanDisplay:
-    """Context manager for the plain, print-once OSINT display.
+    """Context manager for the LIVE OSINT board, shown in the ALTERNATE SCREEN.
 
-    NOTHING is printed while the scan runs (no in-place frame, no animation, no per-source stream).
-    On enter it prints a one-line "scanning…" note so the user knows it started; on exit it prints
-    the FULL grouped board ONCE — every source under its category in the per-source format — as
-    plain text. Because it is printed a single time as ordinary output (never an in-place frame), it
-    can never truncate (no red dots) or duplicate, and the terminal scrolls it natively."""
+    During the scan a rich.Live renders the full grouped board (:meth:`OsintProgress._board`) in the
+    alternate screen (``screen=True``) and updates it in place as sources finish — animated running
+    rows. Because the alt screen owns the whole terminal and clips to its real height, the board
+    ALWAYS fits: it can never show red-dot truncation and never stacks duplicate copies (both were
+    caused by a too-tall in-place frame in normal scrollback). A dedicated refresh thread drives the
+    animation so it moves even while the async scan is busy. On exit the alt screen is torn down and
+    the final full board is printed ONCE into normal scrollback, so it stays as plain, natively
+    scrollable text. Trade-off (chosen): no mouse-wheel scroll DURING the scan — the user watches it
+    live instead; the final board scrolls freely."""
 
     def __init__(self, progress: "OsintProgress") -> None:
         self._p = progress
+        self._live = None
+        self._quiet = _QuietTerminal()
+        self._stop = None
+        self._thread = None
+
+    def _animate(self) -> None:
+        while not self._stop.wait(1.0 / 12):             # ~12 fps so the pulse/spinner advance
+            try:
+                self._live.refresh()
+            except Exception:
+                pass
 
     def __enter__(self):
+        from rich.live import Live
+        import threading
+        self._quiet.__enter__()
+        self._live = Live(
+            get_renderable=self._p._board,
+            console=self._p._console,
+            screen=True,               # alternate screen — always fits, no red dots, no duplicates
+            refresh_per_second=12,
+            auto_refresh=True,
+            transient=True,            # leave the alt screen clean on exit (we reprint below)
+            redirect_stdout=True,
+            redirect_stderr=True,
+        )
+        self._p._live = self._live
         try:
-            self._p._console.print(_section_header(
-                "SCANNING", f"{self._p._total} sources"
-                + (f" · {self._p._target}" if self._p._target else "")
-                + " · results printed when the scan finishes"))
+            self._live.__enter__()
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._animate, daemon=True)
+            self._thread.start()
         except Exception:
-            pass
+            self._live = None
+            self._p._live = None
+            self._quiet.__exit__(None, None, None)
         return self
 
     def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
         try:
-            self._p._console.print()
-            self._p._console.print(self._p._board())   # full grouped board, ONCE, as the result
+            if self._live is not None:
+                self._live.__exit__(*exc)
+        finally:
+            self._p._live = None
+            self._quiet.__exit__(*exc)
+        # Final full board into NORMAL scrollback — plain, natively scrollable text.
+        try:
+            self._p._console.print(self._p._board())
         except Exception:
             pass
         return False
@@ -780,15 +824,18 @@ class OsintProgress:
         return Group(*parts)
 
     def _refresh(self) -> None:
-        # No in-place live frame in the incremental model — each finished source prints its own
-        # scrollable line in hook(). No-op so set_progress()/mark_flagged() callers don't change.
-        return None
+        # Nudge the live board to repaint on a state change (start/finish/flag). The animation
+        # thread also repaints on a timer; this just makes changes show promptly. Safe if no board.
+        if self._live is not None:
+            try:
+                self._live.refresh()
+            except Exception:
+                pass
 
     def live(self):
-        """Context manager for the incremental, plain-scrollable display: one line per source as it
-        finishes (printed by :meth:`hook`), then the full grouped board once at the end. NO in-place
-        live frame, NO animation — so the output never truncates (no red dots), never duplicates,
-        and the terminal scrolls it natively with zero custom scroll code."""
+        """Context manager for the LIVE alt-screen board: the full grouped board updates in place
+        as sources finish (animated), always fitting the screen (no red dots, no duplicate copies),
+        and the final board is printed once into normal scrollback on exit (see :class:`_ScanDisplay`)."""
         return _ScanDisplay(self)
 
 

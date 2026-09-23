@@ -704,15 +704,17 @@ class OsintProgress:
 
     def _board(self):
         """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the top, then EVERY source (done, running AND queued) as a row under its OWN category
-        header, in canonical category order, with a BLANK LINE before each category block so
-        sections never run together. Running rows animate the green pulse inline; done/queued rows
-        are static. There is NO separate flat 'running sources' bucket — a running source appears
-        as its own animated row under its category, next to its completed siblings.
+        at the top, then every source under its OWN category header (canonical order, blank line
+        between blocks), running rows animating the green pulse inline.
 
-        This is a single in-place frame (screen=False): rich redraws it each refresh, which is what
-        lets running rows animate. The accepted tradeoff is that an in-place frame cannot be
-        natively scrolled and crops when taller than the terminal."""
+        HEIGHT-FIT: an in-place frame taller than the terminal gets CROPPED by rich (the "red
+        dots"). To avoid that, when the full board would exceed the terminal height, fully-COMPLETED
+        categories collapse to a one-line summary (e.g. "✔ INFRASTRUCTURE & DNS  6/6 done") while
+        categories that still have running/queued rows stay fully expanded — so the frame always
+        fits and NOTHING is cropped, and all active work stays visible. Grouping and order are
+        unchanged (data-driven), so no mis-grouping; it's still one in-place frame, so no reprint
+        spam. This is a single in-place frame (screen=False): rich redraws it each refresh, which
+        is what lets the running rows animate; it is not natively scrollable."""
         now = time.monotonic()
         sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
         done, total = self._finished, self._total
@@ -729,27 +731,95 @@ class OsintProgress:
                 (f" :: {done}/{total} done · {self._mmss(elapsed)}"
                  + (f" · {self._target}" if self._target else "")
                  + (f" · {n_running} running" if n_running else ""), MUTED))
-        parts: list = [header]
 
-        # Every source under its OWN category header, in canonical order, with a BLANK LINE before
-        # each category block. done / running / queued all sit together under their header; a
-        # running row animates the pulse via self._row (state == 'running').
+        # Gather the categories present, in canonical order, each with its rows.
+        groups: list[tuple[str, list[tuple[str, "_SourceState"]]]] = []
         placed: set[str] = set()
-
-        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
-            parts.append(Text(""))                       # blank line BEFORE each category header
-            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-            for n, st in rows:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
-
         for title, names in _SOURCE_CATEGORIES:
             rows = [(n, self._states[n]) for n in names if n in self._states]
             if rows:
-                emit_group(title, rows)
+                groups.append((title, rows))
                 placed.update(n for n, _ in rows)
         leftover = [(n, st) for n, st in self._states.items() if n not in placed]
         if leftover:
-            emit_group("OTHER", leftover)
+            groups.append(("OTHER", leftover))
+
+        # A category is "done" (collapsible) when NONE of its rows are running/queued.
+        def is_done(rows) -> bool:
+            return all(st.state not in ("running", "queued") for _, st in rows)
+
+        # Height budget: leave 1 line of slack so rich never crops the frame.
+        try:
+            avail = self._console.size.height - 1
+        except Exception:
+            avail = 40
+        avail = max(4, avail)
+
+        # Fit strategy, applied in escalating order until the frame fits `avail`:
+        #   (a) show everything, blank line between categories;
+        #   (b) collapse fully-DONE categories to a one-line summary (keep active ones expanded);
+        #   (c) drop the inter-category blank lines;
+        #   (d) HIDE the fully-done collapsed categories entirely, replacing them with one tally
+        #       line, keeping only categories that still have running/queued rows.
+        # Each level loses the least useful information first; nothing active is ever hidden.
+        collapse: set[int] = set()          # category indices rendered as a one-line summary
+        spacing = True                       # blank line before each category
+        hide_done = False                    # replace done categories with a single tally line
+
+        def cost() -> int:
+            t = 1                            # header
+            gap = 1 if spacing else 0
+            shown_done_collapsed = 0
+            for i, (_, rows) in enumerate(groups):
+                if hide_done and i in collapse and is_done(rows):
+                    shown_done_collapsed += 1
+                    continue                 # hidden; counted into the tally line instead
+                t += gap + (1 if i in collapse else (1 + len(rows)))
+            if hide_done and shown_done_collapsed:
+                t += gap + 1                 # the "N categories complete" tally line
+            return t
+
+        if cost() > avail:                   # (b) collapse done categories
+            for i, (_, rows) in enumerate(groups):
+                if is_done(rows):
+                    collapse.add(i)
+        if cost() > avail:                   # (b') collapse the rest too if still over
+            collapse = set(range(len(groups)))
+        if cost() > avail:                   # (c) drop blank-line spacing
+            spacing = False
+        if cost() > avail:                   # (d) hide done collapsed categories, show a tally
+            hide_done = True
+
+        parts: list = [header]
+        hidden_done = 0
+        for i, (title, rows) in enumerate(groups):
+            if hide_done and i in collapse and is_done(rows):
+                hidden_done += 1
+                continue
+            if spacing:
+                parts.append(Text(""))
+            if i in collapse:
+                d = sum(1 for _, st in rows if st.state not in ("running", "queued"))
+                run = sum(1 for _, st in rows if st.state == "running")
+                flags = sum(1 for _, st in rows if getattr(st, "flagged", False))
+                done_all = d == len(rows)
+                summary = Text("  ")
+                summary.append(("✔ " if done_all else "~ "),
+                               style="bold green" if done_all else "bold cyan")
+                summary.append(f"{title}", style=f"bold {ACCENT}")
+                summary.append(f"  {d}/{len(rows)} done"
+                               + (f" · {run} running" if run else "")
+                               + (f" · {flags} flagged" if flags else ""), style=MUTED)
+                parts.append(summary)
+            else:
+                parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+                for n, st in rows:
+                    parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+        if hide_done and hidden_done:
+            if spacing:
+                parts.append(Text(""))
+            parts.append(Text(f"  ✔ {hidden_done} categories complete (hidden to fit)",
+                              style="green"))
         return Group(*parts)
 
     def _refresh(self) -> None:

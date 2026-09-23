@@ -704,15 +704,14 @@ class OsintProgress:
 
     def _board(self):
         """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the top, then every source under its OWN category header (canonical order, blank line
-        between blocks). Running rows animate the green pulse inline; done/queued rows are static.
+        at the top, then EVERY source (done, running AND queued) as a row under its OWN category
+        header, in canonical category order, with a BLANK LINE before each category block. Running
+        rows animate the green pulse inline; done/queued rows are static.
 
-        HEIGHT-FIT (only kicks in when the full board would exceed the terminal height — on a tall
-        terminal the board is unchanged): compact ONLY categories that are 100% DONE to a one-line
-        summary (e.g. "✔ INFRASTRUCTURE & DNS  6/6 done"). Any category that has a running OR queued
-        source keeps its FULL per-source detail and animation — active work is never compacted. This
-        keeps the same single animated in-place frame (no reprint spam) and data-driven grouping
-        (no mis-grouping); it only compacts finished categories to make room."""
+        ALWAYS shows ALL sources — no height-fit, no compacting, no hiding. Every one of the ~35
+        sources is rendered every frame. Consequence (chosen behavior): on a terminal SHORTER than
+        the board, the terminal itself crops the bottom of this in-place frame — make the terminal
+        window tall enough (or reduce its font size) to see all rows at once."""
         now = time.monotonic()
         sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
         done, total = self._finished, self._total
@@ -729,122 +728,24 @@ class OsintProgress:
                 (f" :: {done}/{total} done · {self._mmss(elapsed)}"
                  + (f" · {self._target}" if self._target else "")
                  + (f" · {n_running} running" if n_running else ""), MUTED))
+        parts: list = [header]
 
-        # Gather categories present, in canonical order, each with its rows.
-        groups: list[tuple[str, list[tuple[str, "_SourceState"]]]] = []
         placed: set[str] = set()
+
+        def emit_group(title: str, rows: list[tuple[str, "_SourceState"]]):
+            parts.append(Text(""))                       # blank line BEFORE each category header
+            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
+            for n, st in rows:
+                parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+
         for title, names in _SOURCE_CATEGORIES:
             rows = [(n, self._states[n]) for n in names if n in self._states]
             if rows:
-                groups.append((title, rows))
+                emit_group(title, rows)
                 placed.update(n for n, _ in rows)
         leftover = [(n, st) for n, st in self._states.items() if n not in placed]
         if leftover:
-            groups.append(("OTHER", leftover))
-
-        def is_fully_done(rows) -> bool:
-            # Fully done = no running AND no queued source. Only such categories are compacted to a
-            # one-line summary (a category with any active/queued work is never fully compacted).
-            return all(st.state not in ("running", "queued") for _, st in rows)
-
-        try:
-            avail = self._console.size.height - 1        # 1 line of slack so rich never crops
-        except Exception:
-            avail = 40
-        avail = max(4, avail)
-
-        # Per-category detail level. "summary" = one line (fully-done cats). "active" = title +
-        # running rows (kept animated) + one "N done · M queued" line for the rest — used as a
-        # fallback so a category with active work still shows its RUNNING sources even when the full
-        # per-source view won't fit. "full" = title + every row.
-        def cat_cost(rows, level: str) -> int:
-            if level == "summary":
-                return 1                                 # tight, no leading blank
-            n_run = sum(1 for _, st in rows if st.state == "running")
-            if level == "active":
-                rest = len(rows) - n_run
-                return 2 + n_run + (1 if rest else 0)    # blank + title + running rows + rest line
-            return 2 + len(rows)                          # full: blank + title + all rows
-
-        # Start everyone at their natural level: done → summary-eligible, else full.
-        levels: list[str] = ["full"] * len(groups)
-
-        def total() -> int:
-            return 1 + sum(cat_cost(rows, levels[i]) for i, (_, rows) in enumerate(groups))
-
-        # Escalate ONLY while over budget, least-information-loss first:
-        # (1) compact 100%-done categories to a one-line summary (top-down).
-        if total() > avail:
-            for i, (_, rows) in enumerate(groups):
-                if total() <= avail:
-                    break
-                if is_fully_done(rows):
-                    levels[i] = "summary"
-        # (2) still over → drop still-active categories to "active" detail (keep RUNNING rows,
-        #     collapse their done/queued rows to one line), bottom-up so the earliest active
-        #     categories keep full detail longest.
-        if total() > avail:
-            for i in range(len(groups) - 1, -1, -1):
-                if total() <= avail:
-                    break
-                if levels[i] == "full":
-                    levels[i] = "active"
-
-        parts: list = [header]
-        # (3) hard cap: never emit more than `avail` body lines, so rich can never clip. If even the
-        #     active view overflows (a very short terminal with many simultaneous running sources),
-        #     stop adding rows and print one "+N more active/queued not shown" line so nothing is
-        #     ever silently invisible — there is always a visible indicator of the overflow.
-        used = 1                                          # header
-        overflow_hidden = 0
-
-        for i, (title, rows) in enumerate(groups):
-            level = levels[i]
-            if level == "summary":
-                d = len(rows)
-                flags = sum(1 for _, st in rows if getattr(st, "flagged", False))
-                if used + 1 > avail - 1:
-                    overflow_hidden += d
-                    continue
-                summary = Text("  ")
-                summary.append("✔ ", style="bold green")
-                summary.append(f"{title}", style=f"bold {ACCENT}")
-                summary.append(f"  {d}/{d} done" + (f" · {flags} flagged" if flags else ""),
-                               style=MUTED)
-                parts.append(summary); used += 1
-                continue
-
-            # Expanded (full or active): decide which rows to show.
-            if level == "active":
-                shown = [(n, st) for n, st in rows if st.state == "running"]
-                rest = [st for _, st in rows if st.state != "running"]
-            else:
-                shown, rest = rows, []
-            block = 2 + len(shown) + (1 if rest else 0)   # blank + title + rows + rest line
-            if used + block > avail - 1:
-                # Not enough room for this whole block — account it as overflow and stop expanding.
-                overflow_hidden += len(rows)
-                continue
-            parts.append(Text(""))
-            parts.append(Text(f"  {title}", style=f"bold {ACCENT}"))
-            used += 2
-            for n, st in shown:
-                parts.append(self._row(st, _display_name(n, st.label), now, sweep)); used += 1
-            if rest:
-                nd = sum(1 for st in rest if st.state not in ("running", "queued"))
-                nq = sum(1 for st in rest if st.state == "queued")
-                tail = Text("    ")
-                bits = []
-                if nd:
-                    bits.append(f"{nd} done")
-                if nq:
-                    bits.append(f"{nq} queued")
-                tail.append("… " + " · ".join(bits), style=MUTED)
-                parts.append(tail); used += 1
-
-        if overflow_hidden:
-            parts.append(Text(f"  … +{overflow_hidden} more not shown (terminal too short)",
-                              style="yellow"))
+            emit_group("OTHER", leftover)
         return Group(*parts)
 
     def _refresh(self) -> None:

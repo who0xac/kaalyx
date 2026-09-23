@@ -473,52 +473,38 @@ class _SourceState:
     flagged: bool = False
 
 
-class _PeriodicBoard:
-    """Context manager that PRINTS the full grouped board into normal scrollback on a slow cadence
-    — the no-alt-screen, no-custom-scroll, fully-scrollable model.
+class _ScanDisplay:
+    """Context manager for the INCREMENTAL, append-only, fully-scrollable display.
 
-    Instead of holding a ``rich.Live`` in-place frame (which cannot be natively scrolled), a daemon
-    thread calls ``console.print(progress.board_group())`` roughly every ``interval`` seconds. Each
-    print is permanent, natively-scrollable history — no cursor-up, so no reprint/desync bug and no
-    cropping. A board is printed on enter, whenever the completion count changes (so the user sees
-    progress promptly), on the cadence otherwise, and once more on exit (the final state)."""
+    There is no live in-place frame and no periodic full-board reprint. Instead, each source's
+    state change prints exactly ONE line as it happens (done by :meth:`OsintProgress.hook`), in the
+    order events occur, each tagged with the source's category — plain ``console.print`` appended to
+    normal scrollback, so native mouse-wheel scroll reaches everything and nothing is ever redrawn
+    or duplicated. On enter it prints a short banner; on exit it prints the full, correctly-grouped
+    board ONCE as the final summary."""
 
-    def __init__(self, progress: "OsintProgress", interval: float = 1.5) -> None:
+    def __init__(self, progress: "OsintProgress") -> None:
         self._p = progress
-        self._interval = interval
-        self._stop = None
-        self._thread = None
-
-    def _print_board(self) -> None:
-        try:
-            self._p._console.print(self._p.board_group())
-            self._p._console.print()          # a blank line between successive snapshots
-        except Exception:
-            pass
-
-    def _loop(self) -> None:
-        last_done = -1
-        # Print promptly whenever the number of finished sources changes; otherwise on the cadence.
-        while not self._stop.wait(self._interval):
-            done = self._p._finished
-            if done != last_done:
-                last_done = done
-            self._print_board()
 
     def __enter__(self):
-        import threading
-        self._stop = threading.Event()
-        self._print_board()                   # initial board so the user sees all sources at once
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        try:
+            self._p._console.print(Text.assemble(
+                ("[◆] ", "bold orange1"), ("SCANNING", "bold orange1"),
+                (f" :: {self._p._total} sources"
+                 + (f" · {self._p._target}" if self._p._target else ""), MUTED)))
+            self._p._console.print()
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc):
-        if self._stop is not None:
-            self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._interval + 0.5)
-        self._print_board()                   # final board reflecting the finished state
+        # Final grouped board once, as the summary — correctly grouped by category (possible now
+        # because the scan is over and all states are known).
+        try:
+            self._p._console.print()
+            self._p._console.print(self._p.board_group())
+        except Exception:
+            pass
         return False
 
 
@@ -564,16 +550,18 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``. Updates a source's state only; the full
-        grouped board (:meth:`_board`) reflects every source — done, running AND queued — under its
-        category on the next refresh. Nothing is printed per source; the whole board is the live
-        renderable, redrawn in place."""
+        """The progress hook passed to ``run_sources``. Prints EXACTLY ONE incremental line per
+        state change (start → running, finish → done/skipped/failed/flagged), tagged with the
+        source's category, appended to normal scrollback. Append-only: no cursor-up, no full-board
+        reprint, no duplicates — native mouse-wheel scroll reaches every line. The final grouped
+        board is printed once at the end by :class:`_ScanDisplay`."""
         st = self._states.get(name)
         if st is None:
             return
         if event == "start":
             st.state = "running"
             st.started = time.monotonic()
+            self._print_event(name, st)       # "[~] CATEGORY  NAME  running"
         elif event == "finish":
             st.finished = time.monotonic()
             st.items = getattr(result, "total", 0)
@@ -592,7 +580,54 @@ class OsintProgress:
             if result is not None and self._result_is_flagged(result):
                 st.flagged = True
             self._finished += 1
-        self._refresh()
+            self._print_event(name, st)       # "[✔/!/○/✘] CATEGORY  NAME  result"
+
+    _CAT_W = 20   # category-tag column width so the NAME columns line up across events
+
+    def _print_event(self, name: str, st: "_SourceState") -> None:
+        """Append ONE incremental event line to scrollback: an ``[icon]`` for the state, the
+        source's CATEGORY (so grouping is always clear even in completion order), the source name,
+        and its result. Plain console.print — permanent, natively-scrollable, never redrawn."""
+        state = st.state
+        flagged = getattr(st, "flagged", False)
+        if state == "running":
+            icon, istyle = "~", "bold cyan"
+            result, rstyle = "running", "cyan"
+        elif flagged and state in ("done", "skipped", "no_key"):
+            icon, istyle = "!", "bold yellow"
+            result = f"{st.items} hits" if state == "done" else (_skip_note(st.note) or "skipped")
+            rstyle = "green" if state == "done" else "yellow"
+        elif state == "done":
+            icon, istyle = "✔", "bold green"
+            result, rstyle = f"{st.items} hits", "green"
+        elif state in ("skipped", "no_key", "not_installed"):
+            icon, istyle = "○", "grey50"
+            result, rstyle = (_skip_note(st.note) or "skipped"), "yellow"
+        elif state == "failed":
+            icon, istyle = "✘", "bold red"
+            result, rstyle = "failed", "bold red"
+        else:
+            icon, istyle, result, rstyle = " ", MUTED, state, MUTED
+        cat = _category_of(name)
+        line = Text("  ")
+        line.append("[", style=MUTED)
+        line.append(icon, style=istyle)
+        line.append("] ", style=MUTED)
+        line.append(f"{cat:<{self._CAT_W}}", style=ACCENT)
+        line.append(" ")
+        line.append(f"{_display_name(name, st.label):<{self._NAME_W}}", style="white")
+        line.append(" ")
+        line.append(result, style=rstyle)
+        # Keep every event on ONE physical line so the stream stays a clean, aligned column.
+        try:
+            width = self._console.size.width
+        except Exception:
+            width = 80
+        line.truncate(max(20, width - 1), overflow="ellipsis")
+        try:
+            self._console.print(line)
+        except Exception:
+            pass
 
     @staticmethod
     def _result_is_flagged(result) -> bool:
@@ -765,22 +800,17 @@ class OsintProgress:
         return Group(*parts)
 
     def _refresh(self) -> None:
-        # No live frame to refresh in the scrollback-reprint model; the periodic printer redraws
-        # the whole board on its cadence. Kept as a no-op so existing callers (hook/set_progress)
-        # don't need to change.
+        # No live frame in the incremental model — each state change prints its own line in hook().
+        # Kept as a no-op so existing callers (set_progress / mark_flagged) don't need to change.
         return None
 
     def live(self):
-        """Context manager that PRINTS the full grouped board into normal scrollback on a slow
-        cadence — no rich.Live in-place frame, no alt-screen, no custom scroll code.
-
-        This is the model that keeps native terminal scrolling working: the board is emitted with
-        plain ``console.print`` (which becomes permanent, natively-scrollable history) roughly
-        every 1.5s and once more at the end. Because nothing is ever redrawn in place (no cursor-up),
-        there is no reprint/desync bug and no cropping — the whole 34-35 source board is always
-        scrollable. The trade-off (the user's final choice) is that there is no per-row animation
-        and the board repeats down the scrollback as it updates."""
-        return _PeriodicBoard(self)
+        """Context manager for the INCREMENTAL, append-only, fully-scrollable display: one line per
+        state change (printed by :meth:`hook`), each tagged with its category, plus a final grouped
+        board printed once at the end. No live frame, no periodic full-board reprints, no alt-screen,
+        no custom scroll — everything is plain scrollback the terminal scrolls natively, and the
+        scan produces a clean chronological stream of events rather than duplicated boards."""
+        return _ScanDisplay(self)
 
 
 # --- Result tables ----------------------------------------------------------------------

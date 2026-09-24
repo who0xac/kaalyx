@@ -713,7 +713,9 @@ class OsintProgress:
             name_style = "bold white"
             result = (Text(f"{st.prog_done}/{st.prog_total}", style="cyan")
                       if st.prog_total > 0 else Text("running", style="cyan"))
-            show_time = False
+            # Show elapsed time on a counted running row (e.g. LEAKSEARCH 26/48 :: 32.1s) so both
+            # query progress AND runtime are visible, consistent with every finished row's time.
+            show_time = st.prog_total > 0
         elif flagged and state in ("done", "skipped", "no_key"):
             # A flagged outcome (data-integrity concern / verified secret): [!] overrides the icon.
             icon = Text("!", style="bold yellow")

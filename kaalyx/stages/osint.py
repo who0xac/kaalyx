@@ -159,7 +159,12 @@ class OsintStage(Stage):
         sources = {name: fn for name, (enabled, fn) in candidates.items() if enabled}
         disabled = [name for name, (enabled, _) in candidates.items() if not enabled]
 
-        osint_ui.print_banner(ctx.domain, len(sources))
+        # The full ASCII banner prints exactly ONCE per invocation, at the first stage that runs.
+        # In --all (OSINT → Subdomains → …) OSINT prints it and sets the shared flag; later stages
+        # see the flag and print only their own [◆] KAALYX::<STAGE> header, never a second banner.
+        show_banner = not ctx.get_shared("banner_printed")
+        osint_ui.print_banner(ctx.domain, len(sources), show_banner=show_banner)
+        ctx.set_shared("banner_printed", True)
         if disabled:
             self.log.info("OSINT sources disabled by config/flags: %s", ", ".join(disabled))
 

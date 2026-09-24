@@ -327,18 +327,24 @@ def format_duration(seconds: float) -> str:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
-def print_banner(domain: str, source_count: int) -> None:
-    """Print the OSINT stage header in the PERMANENT ``[◆] KAALYX::<STAGE>`` format, preceded by
-    the main banner. Only the stage name/subtitle and the TARGET/SOURCES/MODE values differ
-    between stages — the format and palette are locked (see :func:`ui.stage_header`)."""
+def print_banner(domain: str, source_count: int, show_banner: bool = True) -> None:
+    """Print the OSINT stage header in the PERMANENT ``[◆] KAALYX::<STAGE>`` format, optionally
+    preceded by the main ASCII banner. Only the stage name/subtitle and the TARGET/SOURCES/MODE
+    values differ between stages — the format and palette are locked (see :func:`ui.stage_header`).
+
+    *show_banner* controls the full ASCII banner: the banner prints exactly ONCE per invocation, at
+    the very first stage that runs. In a multi-stage run (``--all``) later stages pass
+    ``show_banner=False`` so only their ``[◆] KAALYX::<STAGE>`` header prints, never a second banner.
+    """
     from . import (print_main_banner, stage_header,
                    STAGE_DOMAIN, STAGE_COUNT, STAGE_MODE)
 
     console = get_console()
 
-    # Main banner + one blank line precede the stage header (the confirmed sequence).
-    print_main_banner()
-    console.print()
+    # Main banner + one blank line precede the stage header (the confirmed sequence) — once only.
+    if show_banner:
+        print_main_banner()
+        console.print()
 
     console.print(stage_header(
         "OSINT",

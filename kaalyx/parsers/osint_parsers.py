@@ -809,8 +809,11 @@ def parse_leaksearch(stdout_or_json: str, source: str = "LeakSearch",
                          + (f" in {db}" if db else "")
                          + (": password recovered." if has_pw else " (no plaintext password in this record).")
                          + _relevance_note(relevance, target)),
-            evidence=(f"{user}:{password}" if has_pw else user)[:300],
-            raw=str(rec)[:500],
+            # Keep the COMPLETE recovered credential — never truncate a leaked password. The full
+            # user:password is the actionable OSINT; length caps are deliberately omitted here so
+            # the whole value flows intact through Finding → SourceResult → raw file → terminal.
+            evidence=(f"{user}:{password}" if has_pw else user),
+            raw=str(rec),
         ))
     return findings
 

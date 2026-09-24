@@ -314,8 +314,8 @@ OSINT_TOOLS=(
 )
 # Part 2 — Subdomains.
 SUBDOMAIN_TOOLS=(
-    subfinder findomain assetfinder sublist3r chaos subdominator crtsh shodan
-    censys github-subdomains alterx puredns massdns dnsx dnsreaper
+    subfinder findomain assetfinder sublist3r subdominator
+    github-subdomains amass alterx puredns massdns dnsx
 )
 # Part 3 — Hosts.
 HOST_TOOLS=(naabu httpx nmap wafw00f)
@@ -863,6 +863,59 @@ install_sublist3r() {
     git_venv_tool sublist3r https://github.com/aboul3la/Sublist3r.git sublist3r.py req
 }
 
+# amass (OWASP) — installed via `go install` at the v5 module path. Unlike the @latest tools,
+# amass v5 publishes from @main and needs CGO disabled for a static build; go_install can't express
+# that, so it has its own function. Kaalyx runs it capped by the external `timeout` command.
+install_amass() {
+    if command -v amass >/dev/null 2>&1 || [[ -x "${GOBIN_DIR}/amass" ]]; then
+        info "amass already installed."
+        return
+    fi
+    log "Installing amass (OWASP)..."
+    export PATH="/usr/local/go/bin:${GOBIN_DIR}:${CARGO_BIN}:${BIN_DIR}:${PATH}"
+    if ! CGO_ENABLED=0 go install -v github.com/owasp-amass/amass/v5/cmd/amass@main; then
+        warn "go install amass failed; skipping."
+        return
+    fi
+    [[ -x "${GOBIN_DIR}/amass" ]] || { warn "amass did not appear in ${GOBIN_DIR}"; return; }
+    ln -sf "${GOBIN_DIR}/amass" "${BIN_DIR}/amass"
+}
+
+# Download the Subdomains-stage local assets ONCE at install time (never at scan time):
+#   * the two puredns bruteforce wordlists (SecLists 110k default, Jhaddix all.txt opt-in)
+#   * a maintained public DNS resolver list (Trickest — actively regenerated via dnsvalidator)
+# Existing files are left in place (an existing wordlist/resolver set is not re-downloaded).
+install_subdomain_assets() {
+    local wl_dir="${HOME}/.config/kaalyx/wordlists"
+    local rs_dir="${HOME}/.config/kaalyx/resolvers"
+    mkdir -p "${wl_dir}" "${rs_dir}"
+
+    _fetch_if_missing() {  # <dest> <url> <label>
+        local dest="$1" url="$2" label="$3"
+        if [[ -s "${dest}" ]]; then
+            info "${label} already present (${dest})."
+            return 0
+        fi
+        log "Downloading ${label}..."
+        if curl -fsSL "${url}" -o "${dest}.tmp" && [[ -s "${dest}.tmp" ]]; then
+            mv -f "${dest}.tmp" "${dest}"
+        else
+            rm -f "${dest}.tmp"
+            warn "Could not download ${label} from ${url}; ${dest} left unset."
+        fi
+    }
+
+    _fetch_if_missing "${wl_dir}/seclists-110k.txt" \
+        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-110000.txt" \
+        "SecLists subdomains-top1million-110000 wordlist"
+    _fetch_if_missing "${wl_dir}/jhaddix-all.txt" \
+        "https://gist.githubusercontent.com/jhaddix/86a06c5dc309d08580a018c66354a056/raw/all.txt" \
+        "Jhaddix all.txt wordlist"
+    _fetch_if_missing "${rs_dir}/resolvers.txt" \
+        "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" \
+        "Trickest public DNS resolver list"
+}
+
 install_crtsh() {
 
     if wrapper_runnable crtsh; then
@@ -1332,6 +1385,7 @@ MANIFEST=(
   "osint|repo|swaggerspy|install_swaggerspy"
   "osint|repo|gato|install_gato"
   "subdomains|repo|massdns|install_massdns"
+  "subdomains|repo|amass|install_amass"
   "subdomains|repo|findomain|install_findomain"
   "subdomains|repo|sublist3r|install_sublist3r"
   "subdomains|repo|crtsh|install_crtsh"
@@ -1382,6 +1436,7 @@ install_group repo "Repositories" "ready"
 
 # Supporting side-steps that aren't counted tools (a headless browser for screenshots, the gf
 # pattern set, and the nuclei template DB refresh). Run only for the stages that need them.
+if want_stage subdomains; then try install_subdomain_assets; fi
 if want_stage web;  then try install_chromium; try install_gf_patterns; fi
 if want_stage vuln; then try update_nuclei_templates; fi
 
@@ -1491,6 +1546,7 @@ print_apikey_reminder() {
     printf '  %sCENSYS_API_ID%s     Censys subdomain search (+ CENSYS_API_SECRET)\n' "${C_YELLOW}" "${C_NC}"
     printf '  %sCHAOS_API_KEY%s     ProjectDiscovery Chaos dataset\n' "${C_YELLOW}" "${C_NC}"
     printf '  %sIPINFO_TOKEN%s      IP geolocation / ASN (host stage)\n' "${C_YELLOW}" "${C_NC}"
+    printf '  %sJSMON_API_KEY%s     subdomains.jsmon.sh (subdomains stage; free tier: 3 queries/day)\n' "${C_YELLOW}" "${C_NC}"
     printf '  %sTELEGRAM_BOT_TOKEN%s  scan alerts (+ TELEGRAM_CHAT_ID)\n' "${C_YELLOW}" "${C_NC}"
     printf '  %sH8MAIL_CONFIG / BREACH_COMP_PATH / LOCAL_BREACH_PATH%s  optional: h8mail leaked-credential recovery\n' "${C_DIM}" "${C_NC}"
     printf '  %sMissing keys simply disable their source — Kaalyx never crashes for an absent key.%s\n' "${C_DIM}" "${C_NC}"

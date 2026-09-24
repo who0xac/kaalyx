@@ -223,6 +223,34 @@ class OsintConfig:
 
 
 @dataclass
+class SubdomainsConfig:
+    """Per-source enable/disable toggles for the Subdomains stage (Part 2).
+
+    STAGE 1 · passive (concurrent) + STAGE 2 · active (sequential). Every source can be turned
+    off here or via a matching ``--no-<source>`` CLI flag (which takes precedence). Default is
+    all-on; a source with no tool/key installed skips itself gracefully regardless. ``wordlist``
+    picks the puredns bruteforce list: ``"seclists-110k"`` (default) or ``"jhaddix-all"`` (deep).
+    """
+
+    # STAGE 1 · passive
+    subfinder: bool = True           # aggregator; reads its OWN provider-config.yaml for API keys
+    findomain: bool = True           # CT-log + API sources (standalone)
+    assetfinder: bool = True         # lightweight passive source (standalone)
+    subdominator: bool = True        # aggregator; reads its OWN provider config for API sources
+    sublist3r: bool = True           # search-engine + Netcraft/VirusTotal based (standalone)
+    crtsh: bool = True               # crt.sh CT-log API — direct in-process HTTP (keyless)
+    jsmon: bool = True               # subdomains.jsmon.sh direct API (needs JSMON_API_KEY; 3/day free)
+    github_subdomains: bool = True   # GitHub code search (shared GITHUB_TOKEN pool + org pre-step)
+    amass: bool = True               # OWASP amass passive (capped with external `timeout 2h`)
+    # STAGE 2 · active (run in order on the merged passive results)
+    alterx: bool = True              # permutation candidate generation from the passive list
+    puredns: bool = True             # puredns bruteforce (wordlist) + resolve (massdns + wildcard)
+    dnsx: bool = True                # final structuring/enrichment of the validated results
+    # puredns bruteforce wordlist choice: "seclists-110k" (default) | "jhaddix-all" (deep-pass)
+    wordlist: str = "seclists-110k"
+
+
+@dataclass
 class FlaggingConfig:
     interesting_keywords: list[str] = field(
         default_factory=lambda: [
@@ -245,6 +273,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     flagging: FlaggingConfig = field(default_factory=FlaggingConfig)
     osint: OsintConfig = field(default_factory=OsintConfig)
+    subdomains: SubdomainsConfig = field(default_factory=SubdomainsConfig)
 
 
 # --------------------------------------------------------------------------------------
@@ -359,6 +388,7 @@ class Secrets:
     chaos_api_key: str | None = None
     github_tokens: list[str] = field(default_factory=list)
     ipinfo_token: str | None = None
+    jsmon_api_key: str | None = None   # subdomains.jsmon.sh API (Subdomains stage; free tier 3/day)
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
@@ -493,6 +523,7 @@ def load_secrets(env_path: str | Path | None = None) -> Secrets:
         chaos_api_key=_get("CHAOS_API_KEY"),
         github_tokens=_collect_github_tokens(file_values),
         ipinfo_token=_get("IPINFO_TOKEN"),
+        jsmon_api_key=_get("JSMON_API_KEY"),
         telegram_bot_token=_get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_get("TELEGRAM_CHAT_ID"),
         h8mail_config=_get("H8MAIL_CONFIG"),
@@ -597,6 +628,24 @@ osint:
   exposed_git: true
   github_actions: true
   google_dorks: true
+
+# Subdomains stage (Part 2) — set any source to false to skip it (a --no-<source> CLI flag also
+# works). STAGE 1 is passive (concurrent); STAGE 2 is active (sequential). wordlist selects the
+# puredns bruteforce list: seclists-110k (default) or jhaddix-all (deeper, opt-in).
+subdomains:
+  subfinder: true
+  findomain: true
+  assetfinder: true
+  subdominator: true
+  sublist3r: true
+  crtsh: true
+  jsmon: true                   # needs JSMON_API_KEY in config.env (free tier: 3 queries/day)
+  github_subdomains: true
+  amass: true                   # capped with external `timeout 2h`; partial results kept
+  alterx: true
+  puredns: true
+  dnsx: true
+  wordlist: seclists-110k       # or: jhaddix-all
 """
 
 _ENV_TEMPLATE = """\
@@ -626,6 +675,11 @@ CHAOS_API_KEY=
 # ipinfo.io (used by: host stage — IP geolocation / ASN)
 # Get a token at: https://ipinfo.io/account/token
 IPINFO_TOKEN=
+
+# JSMON (used by: Subdomains stage — subdomains.jsmon.sh direct API)
+# Get a key at: https://jsmon.sh   NOTE: the FREE tier allows only 3 queries/day, so this source
+# skips cleanly (or reports a quota message) once exhausted — leave blank to disable it entirely.
+JSMON_API_KEY=
 
 # Telegram notifications (used by: --notify scan alerts)
 # Create a bot via @BotFather, then get your numeric chat id (e.g. via @userinfobot).

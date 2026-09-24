@@ -29,6 +29,7 @@ from .core.target import TargetType, parse_target
 from .core import tools as tool_registry
 from .stages import make_factory
 from .stages.osint import OsintStage
+from .stages.subdomains import SubdomainsStage
 
 app = typer.Typer(
     add_completion=False,
@@ -187,20 +188,21 @@ def main(
 # is real and ready as Parts 2–5 land. `_build_stage_factories` maps names to the stage
 # classes that actually exist and silently omits not-yet-built ones.
 _MODE_STAGES: dict[str, list[str]] = {
-    "osint-only": ["osint"],
-    "full":       ["subdomains", "hosts", "web", "vuln"],   # DEFAULT
-    "no-vuln":    ["subdomains", "hosts", "web"],
-    "all":        ["osint", "subdomains", "hosts", "web", "vuln"],
+    "osint-only":      ["osint"],
+    "subdomains-only": ["subdomains"],
+    "full":            ["subdomains", "hosts", "web", "vuln"],   # DEFAULT
+    "no-vuln":         ["subdomains", "hosts", "web"],
+    "all":             ["osint", "subdomains", "hosts", "web", "vuln"],
 }
 
-# Stage name → factory, for stages that are implemented. As Parts 2–5 are built, add them
+# Stage name → factory, for stages that are implemented. As Parts 3–5 are built, add them
 # here; the mode selection above already references them.
 _STAGE_REGISTRY = {
     "osint": lambda: make_factory(OsintStage),
-    # "subdomains": lambda: make_factory(SubdomainsStage),   # Part 2 (pending)
-    # "hosts":      lambda: make_factory(HostsStage),        # Part 3 (pending)
-    # "web":        lambda: make_factory(WebStage),          # Part 4 (pending)
-    # "vuln":       lambda: make_factory(VulnStage),         # Part 5 (pending)
+    "subdomains": lambda: make_factory(SubdomainsStage),       # Part 2
+    # "hosts":      lambda: make_factory(HostsStage),          # Part 3 (pending)
+    # "web":        lambda: make_factory(WebStage),            # Part 4 (pending)
+    # "vuln":       lambda: make_factory(VulnStage),           # Part 5 (pending)
 }
 
 
@@ -250,6 +252,41 @@ def _apply_osint_selection(
         for src in names:
             if src in valid and hasattr(config.osint, src):
                 setattr(config.osint, src, False)
+
+
+def _apply_subdomains_selection(config, only: Optional[str], skip: Optional[str]) -> None:
+    """Apply --only-sub / --skip-sub selections onto config.subdomains (CLI wins).
+
+    ``only`` disables every Subdomains source except those named; ``skip`` disables just the named
+    ones. Names are the source keys (subfinder, findomain, assetfinder, subdominator, sublist3r,
+    crtsh, jsmon, github_subdomains, amass, alterx, puredns, dnsx). Unknown names are reported and
+    ignored. ``wordlist`` is not a toggle and is never touched here."""
+    from dataclasses import fields as _fields
+    from .config import SubdomainsConfig
+
+    valid = {f.name for f in _fields(SubdomainsConfig) if f.type == "bool" or f.name != "wordlist"}
+    valid.discard("wordlist")
+
+    def _parse(value: str) -> list[str]:
+        return [v.strip() for v in value.split(",") if v.strip()]
+
+    if only:
+        names = _parse(only)
+        unknown = [n for n in names if n not in valid]
+        if unknown:
+            console.print(f"[yellow]Ignoring unknown Subdomains source(s):[/] {', '.join(unknown)}")
+        chosen = {n for n in names if n in valid}
+        for src in valid:
+            if hasattr(config.subdomains, src):
+                setattr(config.subdomains, src, src in chosen)
+    if skip:
+        names = _parse(skip)
+        unknown = [n for n in names if n not in valid]
+        if unknown:
+            console.print(f"[yellow]Ignoring unknown Subdomains source(s):[/] {', '.join(unknown)}")
+        for src in names:
+            if src in valid and hasattr(config.subdomains, src):
+                setattr(config.subdomains, src, False)
 
 
 def _scan_one(
@@ -321,6 +358,9 @@ def _run_scan(
     as_apex: bool = False,
     only_osint: Optional[str] = None,
     skip_osint: Optional[str] = None,
+    only_sub: Optional[str] = None,
+    skip_sub: Optional[str] = None,
+    wordlist: Optional[str] = None,
 ) -> None:
     import logging
 
@@ -339,6 +379,9 @@ def _run_scan(
     config = load_config(config_path)
     secrets = load_secrets()
     _apply_osint_selection(config, only_osint, skip_osint)
+    _apply_subdomains_selection(config, only_sub, skip_sub)
+    if wordlist:
+        config.subdomains.wordlist = wordlist
 
     # Opt-in Telegram: --notify turns it on; it still needs config.env credentials to actually
     # send (the notifier no-ops without them). Absent the flag, force it off.
@@ -414,6 +457,11 @@ def scan(
         help="Full chain but stop before Vuln (Subdomains → Hosts → Web).",
         rich_help_panel="Scan mode (default: --full)",
     ),
+    subdomains_only: bool = typer.Option(
+        False, "--subdomains-only", "-s",
+        help="Run subdomain enumeration only (standalone).",
+        rich_help_panel="Scan mode (default: --full)",
+    ),
     all_stages: bool = typer.Option(
         False, "--all", "-a",
         help="Everything: OSINT + the full chain.",
@@ -473,6 +521,22 @@ def scan(
         help="Skip these OSINT sources (see 'kaalyx osint-sources').",
         rich_help_panel="OSINT selection",
     ),
+    # --- Subdomains source selection ---
+    only_sub: Optional[str] = typer.Option(
+        None, "--only-sub", metavar="a,b,c",
+        help="Run ONLY these Subdomains sources (subfinder, crtsh, amass, …).",
+        rich_help_panel="Subdomains selection",
+    ),
+    skip_sub: Optional[str] = typer.Option(
+        None, "--skip-sub", metavar="a,b,c",
+        help="Skip these Subdomains sources.",
+        rich_help_panel="Subdomains selection",
+    ),
+    wordlist: Optional[str] = typer.Option(
+        None, "--wordlist", "-w", metavar="seclists-110k|jhaddix-all",
+        help="puredns bruteforce wordlist (default: seclists-110k; jhaddix-all = deep pass).",
+        rich_help_panel="Subdomains selection",
+    ),
     # --- Opt-in deep scans (off by default) ---
     full_nmap: bool = typer.Option(
         False, "--full-nmap", "-M",
@@ -509,13 +573,15 @@ def scan(
     # Resolve the scan mode from the mutually-exclusive mode flags.
     selected_modes = [
         name for name, on in (
-            ("osint-only", osint_only), ("full", full), ("no-vuln", no_vuln), ("all", all_stages),
+            ("osint-only", osint_only), ("subdomains-only", subdomains_only),
+            ("full", full), ("no-vuln", no_vuln), ("all", all_stages),
         ) if on
     ]
     if len(selected_modes) > 1:
         console.print(
             f"[red]Scan modes are mutually exclusive[/] — pick one of "
-            f"--osint-only / --full / --no-vuln / --all (got: {', '.join(selected_modes)})."
+            f"--osint-only / --subdomains-only / --full / --no-vuln / --all "
+            f"(got: {', '.join(selected_modes)})."
         )
         raise typer.Exit(code=2)
     # Default mode. TODO(parts 2-5): once Subdomains/Hosts/Web/Vuln land, change the
@@ -526,8 +592,9 @@ def scan(
     mode = selected_modes[0] if selected_modes else default_mode
     if not selected_modes:
         console.print(
-            "[dim]No scan mode given — running [cyan]--osint-only[/] "
-            "(the only stage implemented so far). Use --full/--all once more stages land.[/]"
+            "[dim]No scan mode given — running [cyan]--osint-only[/]. "
+            "Use [cyan]--subdomains-only[/] for enumeration, or --full/--all "
+            "(Hosts/Web/Vuln still land in later parts).[/]"
         )
 
     # Resolve the target source.
@@ -539,6 +606,12 @@ def scan(
     if only_osint and skip_osint:
         console.print("[red]--only-osint and --skip-osint are mutually exclusive.[/]")
         raise typer.Exit(code=2)
+    if only_sub and skip_sub:
+        console.print("[red]--only-sub and --skip-sub are mutually exclusive.[/]")
+        raise typer.Exit(code=2)
+    if wordlist and wordlist not in ("seclists-110k", "jhaddix-all"):
+        console.print("[red]--wordlist must be 'seclists-110k' or 'jhaddix-all'.[/]")
+        raise typer.Exit(code=2)
 
     _run_scan(
         chosen_target, config_path=config, verbose=verbose, resume=resume,
@@ -547,6 +620,7 @@ def scan(
         full_nmap=full_nmap, brutespray=brutespray, ipv6=ipv6, sqlmap=sqlmap,
         as_subdomain=as_subdomain, as_apex=as_apex,
         only_osint=only_osint, skip_osint=skip_osint,
+        only_sub=only_sub, skip_sub=skip_sub, wordlist=wordlist,
     )
 
 

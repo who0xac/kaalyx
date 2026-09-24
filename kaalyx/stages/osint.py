@@ -825,46 +825,11 @@ class OsintStage(Stage):
     async def _discover_github_org(self) -> None:
         """Identify the target's GitHub org(s) and stash the best one in ctx.shared.
 
-        Stores ``ctx.shared["github_org"]`` = the chosen org login (or ``None``), plus
-        ``["github_org_reason"]`` and ``["github_org_candidates"]`` for logging/notes. Uses a
-        token for the discovery API calls but never selects the token owner's own account.
-        """
-        target = self.ctx.target
-        token = self.ctx.secrets.next_github_token()
-        try:
-            candidates = await osint_inproc.discover_github_org(target, token)
-        except Exception as exc:  # never let discovery break the stage
-            self.log.warning("GitHub org discovery failed: %s", exc)
-            candidates = []
-
-        self.ctx.set_shared("github_org_candidates", candidates)
-        # DATA-INTEGRITY GATE: only a HIGH-confidence candidate may be auto-scanned by
-        # trufflehog/gato/workflow_logs. A medium/low match (a name-only collision, or an owner
-        # that merely *mentions* the domain in code — e.g. yt-dlp shipping a `lecturio.py`
-        # extractor for lecturio.com) is NOT the target's org and must never be scanned; those
-        # sources skip cleanly instead. This is the guard against the wrong-org scan.
-        best = next((c for c in candidates if c.confidence == "high"), None)
-        if best is not None:
-            self.ctx.set_shared("github_org", best.login)
-            self.ctx.set_shared("github_org_reason", f"{best.confidence}: {best.reason}")
-            others = [c for c in candidates if c is not best]
-            self.log.info(
-                "GitHub org for %s: %s (%s — %s)%s",
-                target.registrable, best.login, best.kind, best.confidence,
-                f"; NOT scanning weaker candidates: {', '.join(c.login for c in others[:5])}"
-                if others else "",
-            )
-        else:
-            self.ctx.set_shared("github_org", None)
-            weak = ", ".join(f"{c.login}({c.confidence})" for c in candidates[:5])
-            reason = (f"no HIGH-confidence GitHub org for {target.registrable}"
-                      + (f"; ignored weak matches: {weak}" if weak else ""))
-            self.ctx.set_shared("github_org_reason", reason)
-            self.log.info(
-                "No confident GitHub org for %s — trufflehog/gato/workflow_logs will SKIP "
-                "(refusing to scan a weak/unrelated match%s).", target.registrable,
-                f"; ignored: {weak}" if weak else "",
-            )
+        Delegates to the shared, cross-stage helper (:func:`stages.github_org.ensure_github_org`)
+        so OSINT and the Subdomains stage discover the org identically and it runs at most once per
+        pipeline. See that module for the data-integrity gate (HIGH-confidence only)."""
+        from .github_org import ensure_github_org
+        await ensure_github_org(self.ctx)
 
     async def _src_trufflehog(self) -> SourceResult:
         res = SourceResult(name="trufflehog")

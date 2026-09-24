@@ -763,7 +763,10 @@ def parse_leaksearch(stdout_or_json: str, source: str = "LeakSearch",
     if isinstance(doc, list):
         records = doc
     elif isinstance(doc, dict):
-        for key in ("results", "data", "leaks", "credentials"):
+        # LeakSearch's own output shape is {"lines": ["user:password", ...]} — the primary case.
+        # Other shapes wrap a list of record dicts under results/data/leaks/credentials. "output"
+        # is a defensive alias some versions use. Whichever list is present becomes the records.
+        for key in ("lines", "results", "data", "leaks", "credentials", "output"):
             if isinstance(doc.get(key), list):
                 records = doc[key]
                 break

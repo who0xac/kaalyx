@@ -193,34 +193,54 @@ class OsintStage(Stage):
             if event == "finish" and result is not None:
                 self._flush_source(result)
 
+        # SEQUENTIAL CATEGORY EXECUTION. Instead of fanning out all sources at once, we run one
+        # category at a time, in order (CLOUD & STORAGE last). Within a category the sources still
+        # run CONCURRENTLY with each other (one run_sources call); the categories themselves run in
+        # sequence. Each category gets its own small live block that animates while it runs and then
+        # stays as static, natively-scrollable scrollback text — so the live region is never taller
+        # than one category and always fits the terminal (no alt-screen, no red-dot truncation).
+        # TRADEOFF: categories no longer overlap, so total time is the SUM of each category's slowest
+        # source, not the single slowest source overall. The post-steps (breach_lookup, leak_search)
+        # run at the END of the PEOPLE & EMAIL block, since they consume that category's harvested
+        # emails; they show as two extra rows in that block.
         interrupt_exc: BaseException | None = None
-        results = []
+        results: list[SourceResult] = []
+        # Group by ALL board rows (labels) so the post-steps appear as rows in PEOPLE & EMAIL, but
+        # only the fan-out sources (present in `sources`) are actually run by run_sources — the
+        # post-steps are driven manually below.
+        blocks = osint_ui.categories_in_run_order(list(labels.keys()))
         try:
-            with progress.live():
-                try:
-                    results = await run_sources(sources, _hook)
-                    # Breach lookup + LeakSearch run AFTER harvesting (they consume harvested
-                    # emails), but INSIDE the board so their rows update live in place.
-                    if ctx.config.osint.breach_lookup:
-                        _hook("start", "breach_lookup", None)
-                        await self._enrich_breaches(results)
-                        _hook("finish", "breach_lookup",
-                              self._result_for("breach_lookup", results))
-                    if ctx.config.osint.leak_search:
-                        _hook("start", "leak_search", None)
-                        await self._run_leak_search(results)
-                        _hook("finish", "leak_search",
-                              self._result_for("leak_search", results))
-                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
-                    # Ctrl+C: show a clean interrupted frame, then RE-RAISE. Re-raising is what
-                    # keeps the scan RESUMABLE: the orchestrator only marks a stage complete when
-                    # it returns ok+not-skipped, so returning normally here would (wrongly) mark
-                    # OSINT complete with partial data — and a resume would then SKIP it, showing
-                    # "0 sources · 0 findings". By propagating the interrupt, OSINT stays NOT
-                    # complete, so `kaalyx resume` re-runs the whole stage and recovers everything.
-                    interrupt_exc = exc
-                    progress.set_interrupted()
-                    await asyncio.sleep(0.4)
+            for title, names in blocks:
+                cat_sources = {n: sources[n] for n in names if n in sources}
+                with progress.category_live(title, names):
+                    try:
+                        cat_results = await run_sources(cat_sources, _hook)
+                        results.extend(cat_results)
+                        # Post-steps run inside the PEOPLE & EMAIL block, after its fan-out, so the
+                        # harvested emails they consume already exist. Their rows update in place.
+                        if title == "PEOPLE & EMAIL":
+                            if ctx.config.osint.breach_lookup:
+                                _hook("start", "breach_lookup", None)
+                                await self._enrich_breaches(results)
+                                _hook("finish", "breach_lookup",
+                                      self._result_for("breach_lookup", results))
+                            if ctx.config.osint.leak_search:
+                                _hook("start", "leak_search", None)
+                                await self._run_leak_search(results)
+                                _hook("finish", "leak_search",
+                                      self._result_for("leak_search", results))
+                    except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                        # Ctrl+C: show a clean interrupted frame, then RE-RAISE. Re-raising is what
+                        # keeps the scan RESUMABLE: the orchestrator only marks a stage complete when
+                        # it returns ok+not-skipped, so returning normally here would (wrongly) mark
+                        # OSINT complete with partial data — and a resume would then SKIP it, showing
+                        # "0 sources · 0 findings". By propagating the interrupt, OSINT stays NOT
+                        # complete, so `kaalyx resume` re-runs the whole stage and recovers everything.
+                        interrupt_exc = exc
+                        progress.set_interrupted()
+                        await asyncio.sleep(0.4)
+                if interrupt_exc is not None:
+                    break        # stop launching further categories on Ctrl+C
         finally:
             set_console_logging(True)
             self._progress = None

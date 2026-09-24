@@ -346,8 +346,7 @@ def print_banner(domain: str, source_count: int) -> None:
         info=[
             ("TARGET", domain, STAGE_DOMAIN),
             ("SOURCES", f"{source_count} registered", STAGE_COUNT),
-            ("MODE", "passive · queries third-party data, no packets to the target",
-             STAGE_MODE),
+            ("MODE", "passive", STAGE_MODE),
         ],
     ))
     console.print()
@@ -505,25 +504,33 @@ class _SourceState:
     flagged: bool = False
 
 
-class _ScanDisplay:
-    """Context manager for the LIVE OSINT board, shown in the ALTERNATE SCREEN.
+class _CategoryDisplay:
+    """Context manager for the live board of ONE category, in NORMAL scrollback (``screen=False``).
 
-    During the scan a rich.Live renders the full grouped board (:meth:`OsintProgress._board`) in the
-    alternate screen (``screen=True``) and updates it in place as sources finish — animated running
-    rows. Because the alt screen owns the whole terminal and clips to its real height, the board
-    ALWAYS fits: it can never show red-dot truncation and never stacks duplicate copies (both were
-    caused by a too-tall in-place frame in normal scrollback). A dedicated refresh thread drives the
-    animation so it moves even while the async scan is busy. On exit the alt screen is torn down and
-    the final full board is printed ONCE into normal scrollback, so it stays as plain, natively
-    scrollable text. Trade-off (chosen): no mouse-wheel scroll DURING the scan — the user watches it
-    live instead; the final board scrolls freely."""
+    Sequential-category model: categories run one at a time, in order. While a category runs, a
+    small ``rich.Live`` renders JUST that category's block — a header plus one row per source —
+    and updates it in place as those sources finish; running rows animate the ·•●•· pulse. Because
+    the live region is never more than one category (~7 rows at most), the frame ALWAYS fits any
+    terminal — no alt-screen is needed, so there is no red-dot truncation and no duplicate stacking
+    (both were symptoms of a too-tall in-place frame). When the category finishes, its final frame
+    is left in place (``transient=False``): it becomes plain, static, NATIVELY-SCROLLABLE text in
+    normal history, and the NEXT category's Live starts fresh below it. So completed categories
+    scroll like ordinary terminal output while only the current one animates.
 
-    def __init__(self, progress: "OsintProgress") -> None:
+    A dedicated refresh thread drives the animation so the pulse keeps moving even while the async
+    scan keeps the event loop busy (rich's own auto-refresh gets starved otherwise)."""
+
+    def __init__(self, progress: "OsintProgress", title: str, names: list[str]) -> None:
         self._p = progress
+        self._title = title
+        self._names = names
         self._live = None
         self._quiet = _QuietTerminal()
         self._stop = None
         self._thread = None
+
+    def _renderable(self):
+        return self._p._category_board(self._title, self._names)
 
     def _animate(self) -> None:
         while not self._stop.wait(1.0 / 12):             # ~12 fps so the pulse/spinner advance
@@ -537,12 +544,12 @@ class _ScanDisplay:
         import threading
         self._quiet.__enter__()
         self._live = Live(
-            get_renderable=self._p._board,
+            get_renderable=self._renderable,
             console=self._p._console,
-            screen=True,               # alternate screen — always fits, no red dots, no duplicates
+            screen=False,              # normal scrollback — the block is small, so it always fits
             refresh_per_second=12,
             auto_refresh=True,
-            transient=True,            # leave the alt screen clean on exit (we reprint below)
+            transient=False,           # leave the finished block in place as static scrollback text
             redirect_stdout=True,
             redirect_stderr=True,
         )
@@ -568,29 +575,31 @@ class _ScanDisplay:
                 pass
         try:
             if self._live is not None:
+                # One last repaint so the final frame (all rows in their end state) is what stays.
+                try:
+                    self._live.refresh()
+                except Exception:
+                    pass
                 self._live.__exit__(*exc)
         finally:
             self._p._live = None
             self._quiet.__exit__(*exc)
-        # Final full board into NORMAL scrollback — plain, natively scrollable text.
-        try:
-            self._p._console.print(self._p._board())
-        except Exception:
-            pass
         return False
 
 
 class OsintProgress:
-    """A live, in-place status board for concurrently-running OSINT sources.
+    """A live, in-place status board for OSINT sources, run ONE CATEGORY AT A TIME.
 
-    Usage::
+    Usage (sequential categories — each block animates while it runs, then stays as scrollback)::
 
-        progress = OsintProgress({name: human_label, ...})
-        with progress.live():
-            results = await run_sources(sources, progress.hook)
+        progress = OsintProgress({name: human_label, ...}, target=domain)
+        for title, names in categories_in_run_order(sources):
+            with progress.category_live(title, names):
+                await run_sources({n: sources[n] for n in names}, progress.hook)
 
-    The status board re-renders as sources start and finish, so the user sees every
-    sub-check's state at a glance rather than a silent wait.
+    Each category's small block re-renders as its sources start and finish, so the user sees every
+    sub-check's state at a glance; the live region is never taller than one category, so it always
+    fits and completed categories scroll natively.
     """
 
     def __init__(self, labels: dict[str, str], target: str = "") -> None:
@@ -603,13 +612,15 @@ class OsintProgress:
         self._start = time.monotonic()
         self._total = len(self._states)
         self._finished = 0          # how many sources have completed (drives [N/total])
-        # FULL grouped live board (locked model): every source renders as a row under its OWN
-        # category header — done, running AND queued together — with a blank line between category
-        # blocks; running rows animate the pulse inline. It is ONE live in-place frame redrawn each
-        # refresh (screen=False). ACCEPTED TRADEOFF of this choice: because it is an in-place frame,
-        # native mouse-wheel scroll does NOT work during the scan and rows crop when the board is
-        # taller than the terminal — animation and native-scroll are mutually exclusive, and here
-        # animation-under-category won.
+        # SEQUENTIAL-CATEGORY live board (locked model): categories run one at a time, in order
+        # (see :func:`categories_in_run_order`). While a category runs, a SMALL rich.Live renders
+        # just that category's rows in NORMAL scrollback (screen=False) and animates them; when the
+        # category finishes its block is left in place as static, natively-scrollable text and the
+        # next category's Live starts below it. The live region is thus never more than one
+        # category (~7 rows), so it always fits any terminal — no alt-screen, no red-dot truncation,
+        # no duplicate stacking, and completed categories scroll natively. TRADEOFF: categories no
+        # longer overlap, so total wall-clock time is the SUM of each category's slowest source
+        # rather than the single slowest source overall.
         self._interrupted = False        # set on Ctrl+C so the board header shows a clean note
 
     def set_progress(self, name: str, done: int, total: int) -> None:
@@ -622,11 +633,11 @@ class OsintProgress:
         self._refresh()
 
     def hook(self, event: str, name: str, result) -> None:
-        """The progress hook passed to ``run_sources``. Records each source's state ONLY — nothing
-        is printed during the scan. The full grouped board (every source in the per-source format)
-        is printed ONCE at the end by :class:`_ScanDisplay`, as plain scrollable text: no in-place
-        frame, so it can never truncate (no red dots) or duplicate, and the terminal scrolls it
-        natively."""
+        """The progress hook passed to ``run_sources``. Records each source's state (queued →
+        running → done/skipped/failed) so the CURRENTLY-RUNNING category's small live block
+        (:meth:`_category_board`) reflects it in place. Nothing is printed directly here; the live
+        block is small enough (one category) that it always fits and completed blocks stay as
+        static, natively-scrollable scrollback text."""
         st = self._states.get(name)
         if st is None:
             return
@@ -778,15 +789,11 @@ class OsintProgress:
         self._refresh()
 
     def _board(self):
-        """The full grouped live board — the single in-place renderable. ONE progress header line
-        at the top, then EVERY source (done, running AND queued) as a row under its OWN category
-        header, in canonical category order, with a BLANK LINE before each category block. Running
-        rows animate the green pulse inline; done/queued rows are static.
-
-        ALWAYS shows ALL sources — no height-fit, no compacting, no hiding. Every one of the ~35
-        sources is rendered every frame. Consequence (chosen behavior): on a terminal SHORTER than
-        the board, the terminal itself crops the bottom of this in-place frame — make the terminal
-        window tall enough (or reduce its font size) to see all rows at once."""
+        """The FULL grouped board (all categories at once) — retained as a one-shot renderable for a
+        complete snapshot, but NO LONGER the live path: the scan now animates one category at a time
+        via :meth:`_category_board` / :class:`_CategoryDisplay`. ONE progress header line, then EVERY
+        source as a row under its OWN category header in canonical order, blank line between blocks.
+        Running rows animate the green pulse; done/queued rows are static."""
         now = time.monotonic()
         sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
         done, total = self._finished, self._total
@@ -832,11 +839,31 @@ class OsintProgress:
             except Exception:
                 pass
 
-    def live(self):
-        """Context manager for the LIVE alt-screen board: the full grouped board updates in place
-        as sources finish (animated), always fitting the screen (no red dots, no duplicate copies),
-        and the final board is printed once into normal scrollback on exit (see :class:`_ScanDisplay`)."""
-        return _ScanDisplay(self)
+    def _category_board(self, title: str, names: list[str]):
+        """The live renderable for ONE category block: a header line for the category, then one row
+        per source in it (done, running AND queued together), running rows animating the pulse. This
+        is small by construction (a single category, ~7 rows max), so it always fits the terminal and
+        needs no alt-screen. Used by :class:`_CategoryDisplay` for the currently-running category."""
+        now = time.monotonic()
+        sweep = (now * 0.9) % 1.0                       # 0..1 pulse cycle from wall-clock
+        rows = [(n, self._states[n]) for n in names if n in self._states]
+        n_running = sum(1 for _, st in rows if st.state == "running")
+        n_done = sum(1 for _, st in rows if st.state != "queued" and st.state != "running")
+        header = Text.assemble(
+            ("  ", ""), (title, f"bold {ACCENT}"),
+            (f"  ·  {n_done}/{len(rows)}" + (f" · {n_running} running" if n_running else ""),
+             MUTED))
+        parts: list = [Text(""), header]
+        for n, st in rows:
+            parts.append(self._row(st, _display_name(n, st.label), now, sweep))
+        return Group(*parts)
+
+    def category_live(self, title: str, names: list[str]):
+        """Context manager for the live board of ONE category (see :class:`_CategoryDisplay`): the
+        category's rows update in place as its sources finish (animated), always fitting the screen
+        (small block, no alt-screen), and the finished block is left in place as static, natively-
+        scrollable scrollback text while the next category runs below it."""
+        return _CategoryDisplay(self, title, names)
 
 
 # --- Result tables ----------------------------------------------------------------------
@@ -879,6 +906,48 @@ _SOURCE_CATEGORIES: list[tuple[str, list[str]]] = [
     ("RECON AIDS",
      ["google_dorks"]),
 ]
+
+# EXECUTION order for the sequential-category board (distinct from the report grouping above).
+# Categories run ONE AT A TIME in this order — CLOUD & STORAGE is moved to run LAST (after every
+# other category) per the operator's choice; everything else keeps its canonical relative order.
+# The live/animating region is thus never more than one category's rows, so it always fits.
+_RUN_CATEGORY_ORDER: list[str] = [
+    "INFRASTRUCTURE & DNS",
+    "CODE & SECRETS",
+    "IDENTITY & TENANT",
+    "PEOPLE & EMAIL",
+    "APPS & PRESENCE",
+    "API & THIRD-PARTY",
+    "ATTACK SURFACE (SHODAN)",
+    "RECON AIDS",
+    "CLOUD & STORAGE",     # moved last
+]
+
+
+def categories_in_run_order(enabled_names) -> list[tuple[str, list[str]]]:
+    """Group the ENABLED source names into ``(category_title, [names])`` blocks in execution order.
+
+    Only sources present in *enabled_names* are included, and only non-empty blocks are returned,
+    so a category with no enabled sources is skipped entirely (its block never appears). A source
+    not listed in :data:`_SOURCE_CATEGORIES` falls into a trailing "OTHER" block so it is never
+    dropped. Within each block, source order follows the canonical category definition. Post-steps
+    (breach_lookup, leak_search) are included in PEOPLE & EMAIL when enabled, but the stage runs
+    them AFTER that category's fan-out (they consume harvested emails) — same block, later timing."""
+    enabled = set(enabled_names)
+    by_title = {title: names for title, names in _SOURCE_CATEGORIES}
+    blocks: list[tuple[str, list[str]]] = []
+    placed: set[str] = set()
+    for title in _RUN_CATEGORY_ORDER:
+        names = [n for n in by_title.get(title, []) if n in enabled]
+        if names:
+            blocks.append((title, names))
+            placed.update(names)
+    leftover = [n for n in enabled_names if n not in placed]
+    if leftover:
+        blocks.append(("OTHER", list(leftover)))
+    return blocks
+
+
 # One-line description per source for its detailed [◆] block header.
 _SOURCE_DESC = {
     "whois": "registration & ownership", "dns": "DNS records",

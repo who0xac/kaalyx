@@ -107,6 +107,19 @@ class OsintStage(Stage):
         # Map each source name to (enabled?, coroutine). Disabled ones are dropped before
         # running; the toggle comes from config (a --no-<source> CLI flag overrides config
         # by mutating ctx.config.osint before the stage runs).
+        # OSINT source registry. Only the sources listed here run under `--osint-only`.
+        #
+        # SCOPE REDUCTION: 15 sources were moved OUT of OSINT (they are being reassigned to later
+        # stages). Their source methods (`self._src_*`) and parsers are DELIBERATELY LEFT INTACT —
+        # they are simply not wired into this registry, so they don't run in OSINT, and are ready to
+        # be assigned to their future stages later. The removed set is:
+        #   github_subdomains, gitgraber, trufflehog, github_actions, workflow_logs,
+        #   cloud_enum, s3scanner, firebase, exposed_git, badsecrets, retirejs,
+        #   api_leaks (porch-pirate + swaggerspy), third_party_misconfig,
+        #   shodan_vulns, shodan_host
+        # ("grep_app" was never a distinct OSINT source, so there is nothing to remove for it;
+        #  "porch-pirate" is one of the two tools inside api_leaks, removed with it.)
+        # KEPT post-steps (added to the board separately, below): breach_lookup, leak_search.
         candidates = {
             "whois": (osint_cfg.whois, self._src_whois),
             "dns": (osint_cfg.dns, self._src_dnsx),
@@ -115,24 +128,10 @@ class OsintStage(Stage):
             "m365": (osint_cfg.m365, self._src_m365),
             "email_harvest": (osint_cfg.email_harvest, self._src_email_harvest),
             "social": (osint_cfg.social, self._src_social),
-            "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
-            "gitgraber": (osint_cfg.gitgraber, self._src_gitgraber),
-            "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
-            "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
-            "s3scanner": (osint_cfg.s3scanner, self._src_s3scanner),
-            "badsecrets": (osint_cfg.badsecrets, self._src_badsecrets),
-            "retirejs": (osint_cfg.retirejs, self._src_retirejs),
             "theharvester": (osint_cfg.theharvester, self._src_theharvester),
-            "third_party_misconfig": (osint_cfg.third_party_misconfig, self._src_misconfig),
-            "api_leaks": (osint_cfg.api_leaks, self._src_api_leaks),
-            "exposed_git": (osint_cfg.exposed_git, self._src_exposed_git),
-            "firebase": (osint_cfg.firebase, self._src_firebase),
-            "github_actions": (osint_cfg.github_actions, self._src_github_actions),
             "google_dorks": (osint_cfg.google_dorks, self._src_google_dorks),
             "shodan_org": (osint_cfg.shodan_org, self._src_shodan_org),
             "shodan_favicon": (osint_cfg.shodan_favicon, self._src_shodan_favicon),
-            "shodan_vulns": (osint_cfg.shodan_vulns, self._src_shodan_vulns),
-            "shodan_host": (osint_cfg.shodan_host, self._src_shodan_host),
             "internetdb": (osint_cfg.internetdb, self._src_internetdb),
             "tls_cert": (osint_cfg.tls_cert, self._src_tls_cert),
             "gitlab": (osint_cfg.gitlab, self._src_gitlab),
@@ -140,7 +139,22 @@ class OsintStage(Stage):
             "mobile_apps": (osint_cfg.mobile_apps, self._src_mobile_apps),
             "affiliate_domains": (osint_cfg.affiliate_domains, self._src_affiliate_domains),
             "dnstwist": (osint_cfg.dnstwist, self._src_dnstwist),
-            "workflow_logs": (osint_cfg.workflow_logs, self._src_workflow_logs),
+            # --- MOVED OUT OF OSINT (code kept; not wired so they don't run here) ---
+            # "github_subdomains": (osint_cfg.github_subdomains, self._src_github_subdomains),
+            # "gitgraber": (osint_cfg.gitgraber, self._src_gitgraber),
+            # "trufflehog": (osint_cfg.trufflehog, self._src_trufflehog),
+            # "github_actions": (osint_cfg.github_actions, self._src_github_actions),
+            # "workflow_logs": (osint_cfg.workflow_logs, self._src_workflow_logs),
+            # "cloud_enum": (osint_cfg.cloud_enum, self._src_cloud_enum),
+            # "s3scanner": (osint_cfg.s3scanner, self._src_s3scanner),
+            # "firebase": (osint_cfg.firebase, self._src_firebase),
+            # "exposed_git": (osint_cfg.exposed_git, self._src_exposed_git),
+            # "badsecrets": (osint_cfg.badsecrets, self._src_badsecrets),
+            # "retirejs": (osint_cfg.retirejs, self._src_retirejs),
+            # "api_leaks": (osint_cfg.api_leaks, self._src_api_leaks),
+            # "third_party_misconfig": (osint_cfg.third_party_misconfig, self._src_misconfig),
+            # "shodan_vulns": (osint_cfg.shodan_vulns, self._src_shodan_vulns),
+            # "shodan_host": (osint_cfg.shodan_host, self._src_shodan_host),
         }
         sources = {name: fn for name, (enabled, fn) in candidates.items() if enabled}
         disabled = [name for name, (enabled, _) in candidates.items() if not enabled]
@@ -149,13 +163,16 @@ class OsintStage(Stage):
         if disabled:
             self.log.info("OSINT sources disabled by config/flags: %s", ", ".join(disabled))
 
-        # Identify the TARGET's GitHub org BEFORE the fan-out so the GitHub-scanning sources
-        # (trufflehog, gato) scan the target — never the token owner's account. Runs as a
-        # pre-step because those sources need its result and the fan-out is concurrent. If no
-        # org is confidently identified, those sources skip cleanly (see their methods).
-        # Only runs when a token-gated consumer is enabled and a token is present — org
-        # discovery has no purpose otherwise (nothing would consume the result).
-        token_consumer = (osint_cfg.trufflehog or osint_cfg.github_actions or osint_cfg.workflow_logs)
+        # Identify the TARGET's GitHub org BEFORE the fan-out, ONLY when an org-consuming source is
+        # actually part of THIS run. The org-scanning sources (trufflehog, gato/github_actions,
+        # workflow_logs) have all been moved OUT of OSINT, so nothing in the remaining set consumes
+        # the org — and this pre-step therefore does NOT run during OSINT anymore. Gating on the
+        # live `sources` set (not the raw config toggles) is what makes that correct: even though
+        # those toggles still default on, the sources aren't wired into `candidates`, so they're
+        # absent from `sources` and the pre-step is skipped. It will run again automatically if/when
+        # an org-consuming source is reassigned back into the OSINT registry.
+        ORG_CONSUMERS = ("trufflehog", "github_actions", "workflow_logs")
+        token_consumer = any(name in sources for name in ORG_CONSUMERS)
         if token_consumer and ctx.secrets.has_github:
             await self._discover_github_org()
 
@@ -176,12 +193,12 @@ class OsintStage(Stage):
         self._progress = progress
         # Flag the org-scanning sources on the live board (⚠) when no GitHub org was confidently
         # identified in the pre-step — so the data-integrity concern is visible on their rows from
-        # the start, not only after they skip. Depends on the org result, which is set above.
-        token_consumer = any(getattr(osint_cfg, s)
-                             for s in ("trufflehog", "github_actions", "workflow_logs"))
-        if token_consumer and ctx.secrets.has_github and not ctx.get_shared("github_org"):
-            for s in ("trufflehog", "github_actions", "workflow_logs"):
-                if getattr(osint_cfg, s):
+        # the start, not only after they skip. Gated on the org-consumers actually being in THIS run
+        # (they were moved out of OSINT, so this is currently a no-op); depends on the org result.
+        if any(s in sources for s in ORG_CONSUMERS) and ctx.secrets.has_github \
+                and not ctx.get_shared("github_org"):
+            for s in ORG_CONSUMERS:
+                if s in sources:
                     progress.mark_flagged(s)
         set_console_logging(False)
 
@@ -347,19 +364,22 @@ class OsintStage(Stage):
         items: list[str] = []
         sources: set[str] = set()
 
-        # Org-identification integrity: the guard against a silent wrong-org scan. The concern is
-        # attributed to the org-scanning sources so their rows carry the ⚠ on the board.
-        token_consumer = any(getattr(self.ctx.config.osint, s)
-                             for s in ("trufflehog", "github_actions", "workflow_logs"))
-        if token_consumer and self.ctx.secrets.has_github:
+        # Org-identification integrity: the guard against a silent wrong-org scan. Only relevant
+        # when an org-scanning source actually RAN in this stage — those sources (trufflehog,
+        # github_actions, workflow_logs) were moved out of OSINT, so this callout no longer fires
+        # during OSINT. Keyed on the sources present in `results` (self-contained) rather than the
+        # raw config toggles, so it re-activates automatically if one is reassigned back here.
+        org_consumers = {"trufflehog", "github_actions", "workflow_logs"}
+        ran_org_consumer = any(r.name in org_consumers for r in results)
+        if ran_org_consumer and self.ctx.secrets.has_github:
             org = self.ctx.get_shared("github_org")
             reason = self.ctx.get_shared("github_org_reason") or ""
             if not org:
                 items.append("GitHub org NOT confidently identified — org secret scanners "
                              "skipped (no wrong-org scan). " + reason)
-                for s in ("trufflehog", "github_actions", "workflow_logs"):
-                    if getattr(self.ctx.config.osint, s):
-                        sources.add(s)
+                for r in results:
+                    if r.name in org_consumers:
+                        sources.add(r.name)
 
         for r in results:
             for f in r.findings:

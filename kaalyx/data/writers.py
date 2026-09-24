@@ -56,6 +56,18 @@ class ResultWriter:
             logger.warning("Could not create stage dir %s: %s", path, exc)
         return path
 
+    def tool_output_dir(self, stage: str) -> Path:
+        """Return (creating if needed) ``<stage>/tool_output`` — the home for RAW per-source files
+        AND for a source's intermediate/working files (a tool's own ``-o``/``-f`` JSON output, the
+        input target lists we feed it, etc.). Keeping those out of the stage root leaves ``osint/``
+        holding only the readable per-source ``<source>.txt`` files and the cross-source rollups."""
+        path = self.stage_dir(stage) / "tool_output"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create tool_output dir %s: %s", path, exc)
+        return path
+
     def reset_stage_dir(self, stage: str) -> None:
         """Wipe and recreate *stage*'s output directory before the stage runs.
 

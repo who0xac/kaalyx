@@ -547,11 +547,12 @@ class OsintStage(Stage):
             _skip("skipped: h8mail not on PATH")
             return
 
-        # Feed emails via stdin file to avoid a huge argv.
+        # Feed emails via stdin file to avoid a huge argv. These are h8mail's own working files
+        # (input list + JSON output), not readable artifacts — keep them under tool_output/.
         email_list = "\n".join(sorted({e.address for e in emails}))
-        stage_dir = self.ctx.writer.stage_dir(self.name)
-        infile = stage_dir / "_h8mail_targets.txt"
-        outfile = stage_dir / "_h8mail_out.json"
+        tool_dir = self.ctx.writer.tool_output_dir(self.name)
+        infile = tool_dir / "_h8mail_targets.txt"
+        outfile = tool_dir / "_h8mail_out.json"
         try:
             infile.write_text(email_list, encoding="utf-8")
         except OSError:
@@ -671,11 +672,12 @@ class OsintStage(Stage):
         if prog is not None:
             prog.set_progress("leak_search", 0, len(keys))
 
-        stage_dir = self.ctx.writer.stage_dir(self.name)
+        # LeakSearch's per-key JSON outputs are working files, not readable artifacts → tool_output/.
+        tool_dir = self.ctx.writer.tool_output_dir(self.name)
         findings: list[Finding] = []
         combined_raw: list[str] = []
         for i, key in enumerate(keys):
-            outfile = stage_dir / f"_leaksearch_{i}.json"
+            outfile = tool_dir / f"_leaksearch_{i}.json"
             # -d ProxyNova = keyless online dump; -n 100 raises the default 20-result cap
             # (thoroughness over speed); -o writes JSON we parse.
             out = await self.ctx.runner.run(
@@ -975,8 +977,9 @@ class OsintStage(Stage):
 
     async def _src_theharvester(self) -> SourceResult:
         res = SourceResult(name="theharvester")
-        stage_dir = self.ctx.writer.stage_dir(self.name)
-        out_base = stage_dir / "_theharvester"
+        # theHarvester's own -f output files are working artifacts → tool_output/.
+        tool_dir = self.ctx.writer.tool_output_dir(self.name)
+        out_base = tool_dir / "_theharvester"
         cmd = ["theHarvester", "-d", self.ctx.target.registrable, "-b", "all",
                "-f", str(out_base)]
         out = await self.ctx.runner.run(cmd, timeout=900, label="theHarvester")
@@ -986,7 +989,7 @@ class OsintStage(Stage):
         # theHarvester writes <base>.json (and .xml). Read the JSON.
         data = ""
         for candidate in (out_base.with_suffix(".json"),
-                          stage_dir / "_theharvester.json"):
+                          tool_dir / "_theharvester.json"):
             try:
                 data = candidate.read_text(encoding="utf-8")
                 break
@@ -1266,7 +1269,7 @@ class OsintStage(Stage):
             res.skipped = True
             res.note = f"skipped: no GitHub org identified for {self.ctx.target.registrable}"
             return res
-        json_out = self.ctx.writer.stage_dir(self.name) / "_gato.json"
+        json_out = self.ctx.writer.tool_output_dir(self.name) / "_gato.json"
         gh = self.ctx.secrets.next_github_token() or ""
         out = await self.ctx.runner.run(
             ["gato", "enumerate", "-t", org, "--output-json", str(json_out)],

@@ -264,8 +264,9 @@ def _apply_subdomains_selection(config, only: Optional[str], skip: Optional[str]
     from dataclasses import fields as _fields
     from .config import SubdomainsConfig
 
-    valid = {f.name for f in _fields(SubdomainsConfig) if f.type == "bool" or f.name != "wordlist"}
-    valid.discard("wordlist")
+    # Only the per-source boolean toggles are selectable; wordlist (a str) and wordlist_explicit
+    # (an internal marker) are never treated as sources.
+    valid = {f.name for f in _fields(SubdomainsConfig)} - {"wordlist", "wordlist_explicit"}
 
     def _parse(value: str) -> list[str]:
         return [v.strip() for v in value.split(",") if v.strip()]
@@ -381,7 +382,9 @@ def _run_scan(
     _apply_osint_selection(config, only_osint, skip_osint)
     _apply_subdomains_selection(config, only_sub, skip_sub)
     if wordlist:
+        # An explicit --wordlist suppresses the stage's interactive wordlist prompt.
         config.subdomains.wordlist = wordlist
+        config.subdomains.wordlist_explicit = True
 
     # Opt-in Telegram: --notify turns it on; it still needs config.env credentials to actually
     # send (the notifier no-ops without them). Absent the flag, force it off.

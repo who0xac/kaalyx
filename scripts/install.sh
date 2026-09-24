@@ -163,9 +163,9 @@ build_version() {
     local sha=""
     sha="$(git -C "$(dirname "${BASH_SOURCE[0]:-$0}")/.." rev-parse --short HEAD 2>/dev/null || true)"
     if [[ -n "${sha}" ]]; then
-        printf 'main-v1.0.0-%s' "${sha}"
+        printf 'main-v1.2.0-%s' "${sha}"
     else
-        printf 'main-v1.0.0'
+        printf 'main-v1.2.0'
     fi
 }
 

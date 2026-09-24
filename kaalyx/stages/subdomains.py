@@ -17,7 +17,8 @@ Enumeration only — no takeover detection in this stage.
 from __future__ import annotations
 
 import asyncio
-import shutil
+import sys
+import time
 from pathlib import Path
 
 from ..core.stage import Stage, StageResult
@@ -55,6 +56,81 @@ _WORDLISTS = {
     "jhaddix-all": Path.home() / ".config" / "kaalyx" / "wordlists" / "jhaddix-all.txt",
 }
 _RESOLVERS = Path.home() / ".config" / "kaalyx" / "resolvers" / "resolvers.txt"
+
+#: How long after a first Ctrl+C a second press still counts as "abort the whole scan" (seconds).
+_DOUBLE_INTERRUPT_WINDOW = 2.0
+
+
+class _InterruptController:
+    """Two-stage Ctrl+C handling for the Subdomains stage.
+
+    * FIRST Ctrl+C  → "skip the current source(s)": set :attr:`skip_requested` and cancel the
+      in-flight source task(s). Already-finished sources keep their results; a cancelled source
+      keeps whatever partial output it wrote to disk (e.g. amass ``-o``), and the scan moves on.
+    * SECOND Ctrl+C within :data:`_DOUBLE_INTERRUPT_WINDOW` → "abort the whole scan": re-raise
+      KeyboardInterrupt so the stage propagates it (the orchestrator leaves the stage
+      un-checkpointed, so ``kaalyx resume`` re-runs it).
+
+    Installed for the scan's duration via :meth:`install` / :meth:`restore`. A no-op on platforms
+    without a usable SIGINT signal handler in the current thread (falls back to normal behaviour)."""
+
+    def __init__(self, console) -> None:
+        self._console = console
+        self._prev = None
+        self._installed = False
+        self._last_press = 0.0
+        self.skip_requested = False
+        #: The asyncio tasks currently in-flight; the handler cancels these on the first press.
+        self._active_tasks: set = set()
+
+    def track(self, task) -> None:
+        self._active_tasks.add(task)
+
+    def untrack(self, task) -> None:
+        self._active_tasks.discard(task)
+
+    def clear_skip(self) -> None:
+        """Reset the per-step skip flag before the next source/step so a stale press doesn't skip it."""
+        self.skip_requested = False
+
+    def _handle(self, signum, frame) -> None:
+        now = time.monotonic()
+        if self.skip_requested and (now - self._last_press) <= _DOUBLE_INTERRUPT_WINDOW:
+            # Second press in the window → abort the whole scan.
+            self.restore()
+            raise KeyboardInterrupt
+        # First press → request skip of the current source(s) and cancel their tasks.
+        self.skip_requested = True
+        self._last_press = now
+        try:
+            self._console.print(
+                "\n[yellow]Ctrl+C — skipping the current source"
+                " (press again within 2s to abort the whole scan).[/]")
+        except Exception:
+            pass
+        for t in list(self._active_tasks):
+            if not t.done():
+                t.cancel()
+
+    def install(self) -> None:
+        import signal
+        try:
+            self._prev = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._handle)
+            self._installed = True
+        except (ValueError, OSError, RuntimeError):
+            # Not the main thread / unsupported → leave default behaviour (a plain Ctrl+C aborts).
+            self._installed = False
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        import signal
+        try:
+            signal.signal(signal.SIGINT, self._prev if self._prev is not None else signal.SIG_DFL)
+        except (ValueError, OSError, RuntimeError):
+            pass
+        self._installed = False
 
 
 class SubdomainsStage(Stage):
@@ -107,13 +183,17 @@ class SubdomainsStage(Stage):
 
         interrupt_exc: BaseException | None = None
         passive_results: list[SourceResult] = []
+        # Two-stage Ctrl+C: 1st press skips the current source(s) & continues; 2nd (within 2s)
+        # aborts the whole scan (its handler raises KeyboardInterrupt, caught below → resumable).
+        interrupt = _InterruptController(subdomains_ui.get_console())
 
         try:
             set_console_logging(False)
+            interrupt.install()
             # ---- STAGE 1 · PASSIVE (concurrent) ----
             with progress.live_stage("STAGE 1 · PASSIVE DISCOVERY", list(passive.keys())):
                 try:
-                    passive_results = await run_sources(passive, _hook)
+                    passive_results = await self._run_passive_concurrent(passive, _hook, interrupt)
                 except (KeyboardInterrupt, asyncio.CancelledError) as exc:
                     interrupt_exc = exc
 
@@ -129,14 +209,26 @@ class SubdomainsStage(Stage):
             active_new_subs: list[Subdomain] = []
             active_bd = None
             if interrupt_exc is None and n_active:
+                # Let the operator pick the puredns bruteforce wordlist (unless --wordlist was
+                # given). Done here — after passive, before the STAGE 2 live block opens — so the
+                # prompt isn't fighting a live-rendering region for the terminal.
+                self._prompt_wordlist()
                 progress.print_static(progress.stage_block(
                     "", [], lead_note="Active enumeration ahead — bruteforce takes time, sit tight."))
                 # ---- STAGE 2 · ACTIVE (sequential) ----
-                active_new_subs, active_bd = await self._run_active(progress, passive_subs)
+                interrupt.clear_skip()
+                active_new_subs, active_bd = await self._run_active(progress, passive_subs, interrupt)
 
             # ---- FINAL ----
             final_subs = self._dedup_merge(passive_subs, active_new_subs)
+        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+            # A second Ctrl+C during STAGE 2 (or an abort) lands here.
+            interrupt_exc = exc
+            passive_subs = locals().get("passive_subs", [])
+            active_new_subs = locals().get("active_new_subs", [])
+            final_subs = self._dedup_merge(passive_subs, active_new_subs)
         finally:
+            interrupt.restore()
             set_console_logging(True)
             self._progress = None
 
@@ -154,6 +246,59 @@ class SubdomainsStage(Stage):
         progress.print_complete(folder)
 
         return self.result(ok=True, counts={"subdomains": len(final_subs)})
+
+    # -- concurrent passive runner (Ctrl+C-skip aware) ---------------------------------
+
+    async def _run_passive_concurrent(self, sources, hook, interrupt) -> list[SourceResult]:
+        """Run the passive sources concurrently, tolerant of a per-source Ctrl+C "skip".
+
+        Like :func:`run_sources` but each source runs as a task registered with the interrupt
+        controller, and results are gathered with ``return_exceptions=True`` so cancelling ONE
+        source (the first Ctrl+C — in practice the long amass) does NOT tear down the others:
+        already-finished sources keep their results, the cancelled one keeps whatever partial
+        output it harvested, and the scan proceeds to STAGE 2. A cancelled source that returns no
+        result is recorded as a clean "skipped (Ctrl+C)" row. A second Ctrl+C is raised by the
+        controller's handler as KeyboardInterrupt and propagates out of here to abort."""
+        import time as _t
+
+        async def _one(name: str, fn):
+            start = _t.monotonic()
+            try:
+                hook("start", name, None)
+            except Exception:
+                pass
+            try:
+                result = await fn()
+                result.name = name
+                result.duration_s = _t.monotonic() - start
+            except asyncio.CancelledError:
+                # First Ctrl+C skip: this source didn't finish on its own. Record a clean skip
+                # (amass already returns a partial result and won't reach here).
+                result = SourceResult(name=name, ok=True, skipped=True,
+                                      note="skipped: Ctrl+C (source cancelled)",
+                                      duration_s=_t.monotonic() - start)
+            except Exception as exc:  # isolate any source failure
+                result = SourceResult(name=name, ok=False, error=f"{type(exc).__name__}: {exc}",
+                                      duration_s=_t.monotonic() - start)
+            try:
+                hook("finish", name, result)
+            except Exception:
+                pass
+            return result
+
+        tasks = [asyncio.ensure_future(_one(n, fn)) for n, fn in sources.items()]
+        for t in tasks:
+            interrupt.track(t)
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for t in tasks:
+                interrupt.untrack(t)
+        # A second Ctrl+C (abort) surfaces as KeyboardInterrupt among the gathered exceptions.
+        for r in results:
+            if isinstance(r, KeyboardInterrupt):
+                raise r
+        return [r for r in results if isinstance(r, SourceResult)]
 
     # -- merge / dedup -----------------------------------------------------------------
 
@@ -193,8 +338,12 @@ class SubdomainsStage(Stage):
 
     # -- STAGE 2 · active steps (sequential) -------------------------------------------
 
-    async def _run_active(self, progress, passive_subs: list[Subdomain]):
+    async def _run_active(self, progress, passive_subs: list[Subdomain], interrupt):
         """Run the four active steps in sequence on the merged passive list, animating each row.
+
+        Ctrl+C-aware: the 1st press cancels the CURRENT step (it's skipped, keeping any partial
+        output, and the scan moves to the next step); a 2nd press within the window aborts. Each
+        step runs as a task registered with the interrupt controller so the handler can cancel it.
 
         Returns ``(new_subdomains, breakdown)`` where new_subdomains are validated names not
         already in the passive set."""
@@ -214,38 +363,55 @@ class SubdomainsStage(Stage):
         candidates_generated = 0
         resolved: list[str] = []
 
+        async def _step(name: str, coro, default):
+            """Run one active step as a cancellable task. On the 1st Ctrl+C the task is cancelled
+            → this step is marked skipped and *default* is returned so the sequence continues."""
+            interrupt.clear_skip()
+            progress.start(name)
+            task = asyncio.ensure_future(coro)
+            interrupt.track(task)
+            try:
+                return await task
+            except asyncio.CancelledError:
+                progress.set_done(name, 0, "skipped: Ctrl+C")
+                return default
+            finally:
+                interrupt.untrack(task)
+
         with progress.live_stage("STAGE 2 · ACTIVE ENUMERATION", names):
             # 1) alterx — permutation candidates from the passive list.
             alterx_out: list[str] = []
             if "alterx" in names:
-                progress.start("alterx")
-                alterx_out, r = await self._step_alterx(passive_names)
-                self._flush_source(r)
-                progress.set_done("alterx", len(alterx_out), r.note)
+                alterx_out, r = await _step("alterx", self._step_alterx(passive_names), ([], None))
+                if r is not None:
+                    self._flush_source(r)
+                    progress.set_done("alterx", len(alterx_out), r.note)
 
             # 2) puredns bruteforce — merge alterx guesses WITH the chosen wordlist into one pool.
             candidate_pool: list[str] = []
             if "puredns_bruteforce" in names:
-                progress.start("puredns_bruteforce")
-                candidate_pool, r = await self._step_puredns_bruteforce(alterx_out)
-                self._flush_source(r)
-                candidates_generated = len(candidate_pool)
-                progress.set_done("puredns_bruteforce", candidates_generated, r.note)
+                candidate_pool, r = await _step(
+                    "puredns_bruteforce", self._step_puredns_bruteforce(alterx_out), ([], None))
+                if r is not None:
+                    self._flush_source(r)
+                    candidates_generated = len(candidate_pool)
+                    progress.set_done("puredns_bruteforce", candidates_generated, r.note)
 
             # 3) puredns resolve — resolve the ENTIRE merged pool with wildcard validation.
             if "puredns_resolve" in names:
-                progress.start("puredns_resolve")
-                resolved, r = await self._step_puredns_resolve(candidate_pool)
-                self._flush_source(r)
-                progress.set_done("puredns_resolve", len(resolved), r.note)
+                resolved, r = await _step(
+                    "puredns_resolve", self._step_puredns_resolve(candidate_pool), ([], None))
+                if r is not None:
+                    self._flush_source(r)
+                    progress.set_done("puredns_resolve", len(resolved), r.note)
 
             # 4) dnsx — structure/enrich the validated results.
             enriched = resolved
             if "dnsx" in names:
-                progress.start("dnsx")
-                enriched, r = await self._step_dnsx(resolved)
-                self._flush_source(r)
-                progress.set_done("dnsx", len(enriched), r.note)
+                enriched, r = await _step("dnsx", self._step_dnsx(resolved), (resolved, None))
+                if r is not None:
+                    self._flush_source(r)
+                    progress.set_done("dnsx", len(enriched), r.note)
 
         # New = validated names not already known from the passive stage.
         passive_set = set(passive_names)
@@ -428,26 +594,42 @@ class SubdomainsStage(Stage):
         cmd = (["timeout", "2h"] if have_timeout else []) + [
             "amass", "enum", "-passive", "-d", self.ctx.target.registrable,
             "-norecursive", "-o", str(outfile)]
+        def _harvest(extra_note: str = "") -> "SourceResult":
+            # Read amass's -o file (written incrementally) — so a 2h-cap kill OR a Ctrl+C skip
+            # still keeps whatever it found up to that point.
+            data = ""
+            try:
+                data = outfile.read_text(encoding="utf-8")
+            except OSError:
+                data = ""
+            res.raw = data
+            subs = P.parse_subdomain_lines(data, "amass")
+            res.subdomains = [s for s in subs if SI.in_scope(s.hostname, self.ctx.target.registrable)]
+            res.note = f"{len(res.subdomains)} subdomain(s)" + (f" {extra_note}" if extra_note else "")
+            return res
+
         # 124 = the exit code `timeout` uses when it kills the process; treat it as success so we
         # still harvest the partial -o file rather than discarding a long run's work.
-        out = await self.ctx.runner.run(cmd, timeout=7500, label="amass",
-                                        acceptable_codes=(0, 124))
+        try:
+            out = await self.ctx.runner.run(cmd, timeout=7500, label="amass",
+                                            acceptable_codes=(0, 124))
+        except asyncio.CancelledError:
+            # Ctrl+C "skip" cancelled amass mid-run — keep the partial -o output and move on
+            # (do NOT re-raise; the skip must not tear down the concurrent gather).
+            return _harvest("(skipped via Ctrl+C — partial results kept)")
         if not out.started:
             res.skipped, res.note = True, "skipped: amass not on PATH"
             return res
-        data = out.stdout
-        try:
-            file_data = outfile.read_text(encoding="utf-8")
-            if file_data.strip():
-                data = file_data
-        except OSError:
-            pass
-        res.raw = data
-        subs = P.parse_subdomain_lines(data, "amass")
-        res.subdomains = [s for s in subs if SI.in_scope(s.hostname, self.ctx.target.registrable)]
-        capped = out.returncode == 124
-        res.note = (f"{len(res.subdomains)} subdomain(s)"
-                    + (" (2h cap hit — partial results kept)" if capped else ""))
+        if not out.stdout.strip():
+            _harvest()
+        else:
+            res.raw = out.stdout
+            subs = P.parse_subdomain_lines(out.stdout, "amass")
+            res.subdomains = [s for s in subs
+                              if SI.in_scope(s.hostname, self.ctx.target.registrable)]
+            res.note = f"{len(res.subdomains)} subdomain(s)"
+        if out.returncode == 124:
+            res.note += " (2h cap hit — partial results kept)"
         return res
 
     # -- active steps ------------------------------------------------------------------
@@ -470,6 +652,41 @@ class SubdomainsStage(Stage):
         res.raw = out.stdout
         res.note = f"{len(cands)} permutation candidate(s)"
         return cands, res
+
+    def _prompt_wordlist(self) -> None:
+        """Interactively ask the operator to pick the puredns bruteforce wordlist, unless it was set
+        explicitly with --wordlist. Prompts only on a real interactive TTY; a non-interactive/piped
+        run (or an explicit choice) keeps the current value silently. The choice is written back to
+        ``config.subdomains.wordlist`` so :meth:`_wordlist_path` and the board label reflect it."""
+        cfg = self.ctx.config.subdomains
+        if getattr(cfg, "wordlist_explicit", False):
+            return
+        try:
+            if not sys.stdin.isatty():
+                return
+        except Exception:
+            return
+        console = subdomains_ui.get_console()
+        current = cfg.wordlist if cfg.wordlist in _WORDLISTS else "seclists-110k"
+        # Show each option with its on-disk presence so the operator knows if it was downloaded.
+        console.print()
+        console.print("[bold bright_cyan]    Choose the puredns bruteforce wordlist:[/]")
+        opts = [("1", "seclists-110k", "SecLists subdomains-top1million-110000 (default)"),
+                ("2", "jhaddix-all", "Jhaddix all.txt (deeper, slower)")]
+        for key, name, desc in opts:
+            present = "" if _WORDLISTS[name].exists() else "  [yellow](not downloaded)[/]"
+            mark = " [green]←current[/]" if name == current else ""
+            console.print(f"      [cyan]{key}[/]) {desc}{present}{mark}")
+        default_key = "1" if current == "seclists-110k" else "2"
+        try:
+            raw = input(f"    Selection [1/2] (default {default_key}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("    [dim]No selection — keeping current wordlist.[/]")
+            return
+        choice = {"1": "seclists-110k", "2": "jhaddix-all"}.get(raw or default_key)
+        if choice:
+            cfg.wordlist = choice
+            console.print(f"    [green]Using {choice}.[/]")
 
     def _wordlist_path(self) -> Path:
         """The chosen bruteforce wordlist: config-selected (seclists-110k default / jhaddix-all

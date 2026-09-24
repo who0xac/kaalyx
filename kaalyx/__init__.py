@@ -6,4 +6,4 @@ web dashboard and Telegram alerts. It is an *orchestrator* — external tools ar
 invoked as subprocesses, never reimplemented.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"

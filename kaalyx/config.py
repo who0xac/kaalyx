@@ -248,6 +248,10 @@ class SubdomainsConfig:
     dnsx: bool = True                # final structuring/enrichment of the validated results
     # puredns bruteforce wordlist choice: "seclists-110k" (default) | "jhaddix-all" (deep-pass)
     wordlist: str = "seclists-110k"
+    # True when the wordlist was chosen explicitly (via --wordlist or a non-default config value),
+    # so the stage does NOT interactively prompt for it. When False on an interactive TTY, the
+    # stage asks the operator to pick a wordlist just before puredns bruteforce runs.
+    wordlist_explicit: bool = False
 
 
 @dataclass

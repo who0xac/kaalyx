@@ -772,8 +772,12 @@ class OsintProgress:
         if show_time and st.started > 0:
             end = st.finished if st.finished > 0 else now
             line.append(" :: ", style=MUTED)
-            line.append(self._mmss(max(0.0, end - st.started)),
-                        style="white" if state == "done" else "cyan")
+            # The time is WHITE for a completed row AND for a flagged row (a flagged source has a
+            # real finding to show — e.g. LEAKSEARCH with recovered creds — so its ":: time" reads
+            # as a result, matching every other finished source). Only a plain, still-running
+            # counted row keeps cyan to read as in-progress.
+            time_style = "white" if (state == "done" or flagged) else "cyan"
+            line.append(self._mmss(max(0.0, end - st.started)), style=time_style)
         # CRITICAL: every row must be exactly ONE physical line. A row that wrapped to two lines
         # would make the board's real line count exceed what Live rendered, and even in alt-screen
         # a wrapped row misaligns the grid. Hard-truncate to the console width so no row ever
